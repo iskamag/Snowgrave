@@ -1,0 +1,45 @@
+(require :asdf)
+(let* ((root (uiop:pathname-parent-directory-pathname (uiop:pathname-directory-pathname *load-truename*)))
+       (cache (merge-pathnames ".build/fresh-method-initializers-fasl/" root)))
+  (asdf:initialize-source-registry `(:source-registry (:directory ,root) :ignore-inherited-configuration))
+  (asdf:initialize-output-translations `(:output-translations (t ,cache) :ignore-inherited-configuration)))
+(asdf:load-system "snowgrave")
+(load (merge-pathnames "artifact-functions.lisp" *load-truename*))
+(assert (not (find-package "SNOWGRAVE.METHOD-INITIALIZER.FIXTURE")))
+(destructuring-bind (source metadata observations) (uiop:command-line-arguments)
+  (multiple-value-bind (artifact warnings failure)
+      (compile-file source :output-file (merge-pathnames ".build/fresh-method-initializers.fasl"
+                                                       (asdf:system-source-directory "snowgrave")))
+    (declare (ignore warnings)) (assert (not failure)) (load artifact))
+  (let* ((unit (with-open-file (stream metadata) (read stream)))
+         (expected (with-open-file (stream observations) (read stream)))
+         (package (find-package "SNOWGRAVE.METHOD-INITIALIZER.FIXTURE"))
+         (leaf (funcall (snowgrave.artifact-tests:artifact-function unit "BOOT-LEAF")))
+         (base (funcall (snowgrave.artifact-tests:artifact-function unit "BOOT-BASE"))))
+    (dolist (name '("BASE" "LEAF")) (assert (not (find-class (find-symbol name package) nil))))
+    (dolist (name '("OPTIONAL-CALL" "KEY-CALL" "AUX-CALL" "FLET-CALL" "LABELS-CALL"
+                    "LAMBDA-CALL" "NESTED-CALL" "LONE-CALL" "LONE-ERROR"
+                    "SPECIAL-CALL" "SPECIAL-ENTRY" "UNBOUND-SPECIAL-ENTRY"
+                    "BOOT-LEAF" "BOOT-BASE" "OPTIONAL-ENTRY" "KEY-ENTRY" "AUX-ENTRY"
+                    "FLET-ENTRY" "LABELS-ENTRY" "LAMBDA-ENTRY" "NESTED-ENTRY" "LONE-ENTRY" "ERROR-ENTRY"))
+      (assert (not (fboundp (find-symbol name package)))))
+    (dolist (entry expected)
+      (destructuring-bind (name basep cases) entry
+        (dolist (case cases)
+          (assert (equal (second case)
+                         (multiple-value-list (apply (snowgrave.artifact-tests:artifact-function unit name)
+                                                    (if basep base leaf) (first case))))))))
+    (let ((trace (find-symbol "*TRACE*" package)))
+      (setf (symbol-value trace) nil)
+      (assert (handler-case
+                  (progn (funcall (snowgrave.artifact-tests:artifact-function unit "ERROR-ENTRY") base nil 83) nil)
+                (sb-pcl::no-next-method-error () t)))
+      (assert (equal (symbol-value trace) '(:default))))
+    (let ((seed (find-symbol "*SEED*" package)))
+      (assert (= (symbol-value seed) 7))
+      (makunbound seed)
+      (assert (handler-case
+                  (progn (funcall (snowgrave.artifact-tests:artifact-function unit "UNBOUND-SPECIAL-ENTRY") base) nil)
+                (unbound-variable (condition) (eq (cell-error-name condition) seed)))))))
+(assert (not (fboundp 'snowgrave.sbcl:close-source)))
+(format t "Fresh method initializers executed.~%")

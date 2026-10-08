@@ -1,0 +1,27 @@
+(require :asdf)
+(let* ((root (uiop:pathname-parent-directory-pathname (uiop:pathname-directory-pathname *load-truename*)))
+       (cache (merge-pathnames ".build/fresh-indirect-equality-fasl/" root)))
+  (asdf:initialize-source-registry `(:source-registry (:directory ,root) :ignore-inherited-configuration))
+  (asdf:initialize-output-translations `(:output-translations (t ,cache) :ignore-inherited-configuration)))
+(asdf:load-system "snowgrave")
+(load (merge-pathnames "artifact-functions.lisp" *load-truename*))
+(assert (not (find-package "SNOWGRAVE.EQUALITY.FIXTURE")))
+(destructuring-bind (source metadata) (uiop:command-line-arguments)
+  (multiple-value-bind (artifact warnings failure)
+      (compile-file source :output-file (merge-pathnames ".build/fresh-indirect-equality.fasl" (asdf:system-source-directory "snowgrave")))
+    (declare (ignore warnings)) (assert (not failure)) (load artifact))
+  (let ((unit (with-open-file (stream metadata) (read stream))))
+    (loop for record in (getf unit :entries) for index from 0
+          for name = (getf record :name) for function = (snowgrave.artifact-tests:artifact-function unit name) do
+      (assert (not (fboundp name)))
+      (dolist (flag '(t nil))
+        (let ((actual (funcall function flag))
+              (expected
+                (case index
+                  ((0 1 2 3 4) '((nil) nil)) (5 '((t nil) nil))
+                  ((6 7 8 9 10) '((t) nil))
+                  (12 (list (list (if flag nil :other)) '(:callee :left :right :tail)))
+                  (otherwise (list (list (if flag nil :other)) '(:callee :left :right))))))
+          (assert (equal actual expected)))))))
+(assert (not (fboundp 'snowgrave.sbcl:close-source)))
+(format t "Fresh indirect record equality executed.~%")

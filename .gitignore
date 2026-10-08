@@ -1,0 +1,9 @@
+*.fasl
+.build/
+agent-board/
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.toc
