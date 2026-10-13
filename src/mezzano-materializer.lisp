@@ -1,11 +1,29 @@
 (in-package #:snowgrave)
 
+(defun audit-mezzano-reader-data (data)
+  ;; Target reading precedes macroexpansion. Even a quoted diagnostic or
+  ;; descriptor needs its symbol's package before a native mapper can run.
+  (let ((seen (make-hash-table :test #'eq)))
+    (labels ((walk (value)
+               (cond ((symbolp value)
+                      (let ((package (symbol-package value)))
+                        (when (and package (eql 0 (search "SB-" (package-name package))))
+                          (reject 'unsupported-definition :native-materialization :native-host-package
+                                  (format nil "Host symbol ~S has no target reader/package mapping." value)))))
+                     ((or (consp value) (simple-vector-p value))
+                      (unless (gethash value seen)
+                        (setf (gethash value seen) t)
+                        (if (consp value) (progn (walk (car value)) (walk (cdr value)))
+                            (map nil #'walk value)))))))
+      (walk data))))
+
 (defun write-mezzano-unit-source (unit stream &key (area :wired))
   "Prepare native record source from an audited portable unit.
 This is cold source preparation, NOT supervisor code/data/error admission.
 The target compiler finalizes the generated structures and validates every
 field against its actual native layout before compiling the original CEM.
-Unmapped implementation-specific executable conditions refuse preparation."
+Unmapped implementation-specific conditions and reader packages refuse
+preparation, including symbols carried in quoted forms and metadata."
   (unless (member area '(:wired :dynamic))
     (reject 'unsupported-definition :native-materialization :record-area
             "Only the target's ordinary :WIRED and :DYNAMIC areas are supported."))
@@ -51,6 +69,9 @@ Unmapped implementation-specific executable conditions refuse preparation."
                               :code-name (if (eq (car code) 'setf)
                                              (list 'setf (intern (second (second code)) (first (second code))))
                                              (intern (second code) (first code))))))
+    ;; Audit the complete target payload before writing anything. Quoting data
+    ;; cannot exempt it from the target reader's package requirements.
+    (audit-mezzano-reader-data (list forms metadata))
     ;; Reuse the portable serializer's package/reader-sharing rules. Its final
     ;; PROGN is replaced with one target macro; no builder survives in output.
     (let* ((text (with-output-to-string (out) (write-unit-source unit out)))

@@ -34,11 +34,38 @@
                :source '((defun native-missing () (error 'sb-pcl::no-next-method-error))))))
     (signals snowgrave:unsupported-definition
       (with-output-to-string (out) (snowgrave:write-mezzano-unit-source unit out))))
-  (let* ((type 'sb-kernel:complex-double-float)
+  (let* ((type '(complex double-float))
          (unit (snowgrave::%make-unit
                 :metadata '(:identity (:native-type-obligation))
                 :source `((defun native-partition (value) (typep value ',type)))))
          (metadata (with-open-stream (out (make-string-output-stream))
                      (snowgrave:write-mezzano-unit-source unit out))))
     (check (equal (getf metadata :native-type-obligations) (list type))))
+  ;; These symbols used to escape through quoted layout/error descriptors.
+  ;; Preparation must refuse before the first byte reaches the target stream.
+  (dolist (host '(sb-pcl::missing-slot sb-int:read-evaluated-form
+                  sb-ext:print-symbol-with-prefix sb-kernel:complex-double-float))
+    (dolist (unit (list (snowgrave::%make-unit
+                        :metadata `(:identity (:host-metadata) :record-layouts
+                                    ((:error-mapping (:missing-condition ,host))))
+                        :source '((defun native-entry () nil)))
+                       (snowgrave::%make-unit
+                        :metadata '(:identity (:host-quote))
+                        :source `((defun native-entry () ',(vector host))))))
+      (let ((out (make-string-output-stream)))
+        (check (handler-case
+                   (progn (snowgrave:write-mezzano-unit-source unit out) nil)
+                 (snowgrave:unsupported-definition (condition)
+                   (eq (snowgrave:error-feature condition) :native-host-package))))
+        (check (string= "" (get-output-stream-string out))))))
+  ;; Exercise the reported path with actual adapter-produced record metadata.
+  (let* ((entry 'native-reader-entry)
+         (unit (snowgrave:close-source-unit
+                (list :forms `((defclass native-reader-record () ()) (defun ,entry () nil)))
+                :unit-name '(:native-reader-record) :closed-classes '(native-reader-record)
+                :universe '(native-reader-record) :entries (list entry)
+                :external-domains (list (list entry nil))))
+         (out (make-string-output-stream)))
+    (signals snowgrave:unsupported-definition (snowgrave:write-mezzano-unit-source unit out))
+    (check (string= "" (get-output-stream-string out))))
   t)
