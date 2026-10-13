@@ -26,6 +26,7 @@
                (:file "tests/suite")
                (:file "tests/method-call-bindings")
                (:file "tests/vector-constants")
+               (:file "tests/literal-identity")
                (:file "tests/predicate-refinement")
                (:file "tests/partition-factorization")
                (:file "tests/external-results")

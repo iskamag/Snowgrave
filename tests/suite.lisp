@@ -4207,6 +4207,7 @@
     (source-owner-tests)
     (method-source-context-tests)
     (vector-constant-tests)
+    (literal-identity-tests)
     (predicate-refinement-tests)
     (partition-factorization-tests)
     (external-result-tests)

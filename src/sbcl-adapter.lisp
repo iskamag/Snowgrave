@@ -73,10 +73,17 @@
                      snowgrave::%record-boundp snowgrave::%record-unbind)
         collect (cons name (fdefinition name))))
 
+(defstruct literal-pool
+  name
+  (indices (make-hash-table :test #'eq))
+  (values (make-array 0 :adjustable t :fill-pointer 0)))
+
 (defstruct build
   identity source declaration open-package output-package
   layouts generated constructors method-names
   (sequence 0) (dependencies nil) (source-key nil)
+  (literal-pools nil)
+  (literal-states (make-hash-table :test #'eq))
   function-domains function-returns generic-call-shapes function-flow-evidence)
 
 (defun build-forms (build) (snowgrave:authored-source-forms (build-source build)))
@@ -302,6 +309,7 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
                              ;; for the audited ordinary operators. Their host
                              ;; runtime boundary is not target residency proof.
                              sb-kernel:%assoc-eq sb-kernel:%find-position sb-int:delq
+                             sb-kernel:two-arg-string-equal
                              sb-impl::vector-reverse
                              sb-impl::append2 sb-c::check-ds-list/&rest))
         when (fboundp name) collect (cons name (fdefinition name))))
@@ -1691,9 +1699,15 @@ reflection, lexical rebinding and class values still require their own ABI."
 (defun transform-body (build body package &key open next original local)
   (with-source-body-facts (body)
    (let ((*value-domain-local-functions* local))
-    (mapcar (lambda (form)
-            (transform-form build form package :open open :next next
-                            :original original :local local)) body))))
+    (multiple-value-bind (prefix executable) (snowgrave::source-body-parts body)
+      (append (mapcar (lambda (form)
+                        ;; Documentation is syntax, not a literal expression.
+                        (if (stringp form) form
+                            (transform-form build form package :open open :next next
+                                            :original original :local local))) prefix)
+              (mapcar (lambda (form)
+                        (transform-form build form package :open open :next next
+                                        :original original :local local)) executable))))))
 
 (defun declared-external-result-expression (build name expression)
   (let ((contract (assoc name (getf (build-declaration build) :external-return-domains) :test #'name=)))
@@ -1742,12 +1756,15 @@ reflection, lexical rebinding and class values still require their own ABI."
     (cond
       ((symbolp form)
        (if (member form (build-globals build)) (global-binding-name build form package open) form))
-      ((atom form) form)
+      ((atom form)
+       (if (or (stringp form) (simple-vector-p form))
+           (literal-reference build form package) form))
       ((eq (car form) 'quote)
        (unless (serializable-tree-p (cadr form))
          (fail build 'snowgrave:residual-metaobject :quoted-object
                "Only ordinary readable scalar/list constants are admitted."))
-       form)
+       (if (or (consp (cadr form)) (stringp (cadr form)) (simple-vector-p (cadr form)))
+           (literal-reference build (cadr form) package) form))
       ((eq (car form) 'function)
        (if (and (consp (cadr form)) (eq (caadr form) 'lambda))
            `(function ,(walk (cadr form)))
@@ -2432,6 +2449,51 @@ An unknown name makes that name and the remainder uncertain, never absent."
                 `(unless (boundp ',(cadr form)) (setf (symbol-value ',(cadr form)) ,(caddr form)))
                 '(values)))
     (t form)) form))
+
+(defun literal-reference (build value package)
+  ;; EQ is the source graph's authority, not structural equality. Separate
+  ;; pools keep the disposable CLOS pass and the installed unit independent.
+  (unless (serializable-tree-p value (build-literal-states build))
+    (fail build 'snowgrave:residual-metaobject :literal-object
+          "Literal graphs must contain only acyclic readable native data."))
+  (let* ((pool (or (cdr (assoc package (build-literal-pools build)))
+                   (let ((pool (make-literal-pool)))
+                     ;; Use an interned, private binding for fresh-file replay.
+                     (setf (literal-pool-name pool) (intern (symbol-name (gensym "LITERALS")) package))
+                     (push (cons package pool) (build-literal-pools build))
+                     pool)))
+         (index (or (gethash value (literal-pool-indices pool))
+                    (setf (gethash value (literal-pool-indices pool))
+                          (vector-push-extend value (literal-pool-values pool))))))
+    ;; Retain the literal's native type for ordinary array/string lowering;
+    ;; an opaque LOAD-TIME-VALUE would otherwise lose that compiler fact.
+    `(the ,(type-of value) (load-time-value (svref ,(literal-pool-name pool) ,index) t))))
+
+(defun literal-pool-definition (build package)
+  (let ((pool (cdr (assoc package (build-literal-pools build)))))
+    (when pool
+      (let ((seen (make-hash-table :test #'eq)) (bindings nil))
+        (labels ((construct (value)
+                   (if (or (consp value) (stringp value) (simple-vector-p value))
+                       (or (gethash value seen)
+                           (let* ((name (gensym "LITERAL"))
+                                  (initializer
+                                    (cond ((consp value) `(cons ,(construct (car value)) ,(construct (cdr value))))
+                                          ((stringp value) `(copy-seq ,value))
+                                          (t `(vector ,@(map 'list #'construct value))))))
+                             (setf (gethash value seen) name)
+                             (push (list name initializer) bindings)
+                             name))
+                       `',value)))
+          (let ((roots (map 'list #'construct (literal-pool-values pool))))
+            ;; Allocate once at load time. Only scalar leaves reach the FASL
+            ;; constant dumper, so it cannot merge distinct mutable nodes.
+            `(defparameter ,(literal-pool-name pool)
+               (let* ,(nreverse bindings) (vector ,@roots)))))))))
+
+(defun with-literal-pool (build forms package)
+  (let ((definition (literal-pool-definition build package)))
+    (if definition (cons definition forms) forms)))
 
 (defun compile-forms (build forms phase &key stage-specials)
   (flet ((run ()
@@ -3902,8 +3964,9 @@ implemented here. A nominal native class is never an imported graph proof."
            (validate-external-value-contracts build)
            (validate-external-return-domains build)
            (compile-forms build
-                          (mapcar (lambda (form) (declare-closed-specials (open-definition build form) (source-specials build)))
-                                  (build-forms build))
+                          (with-literal-pool build
+                            (mapcar (lambda (form) (declare-closed-specials (open-definition build form) (source-specials build)))
+                                    (build-forms build)) open)
                           :open-pass :stage-specials (source-specials build))
            (obtain-layouts build)
            (setf (build-output-package build) (make-package output-name :use '(:cl)))
@@ -3912,9 +3975,11 @@ implemented here. A nominal native class is never an imported graph proof."
                                     (getf declaration :closed-generics)))
                   (entries (emit-functions build))
                   (specials (source-specials build))
-                  (forms (order-closed-definitions
-                          build (mapcar (lambda (form) (declare-closed-specials form specials))
-                                        (nreverse (build-generated build)))))
+                  (forms (with-literal-pool build
+                           (order-closed-definitions
+                            build (mapcar (lambda (form) (declare-closed-specials form specials))
+                                          (nreverse (build-generated build))))
+                           (build-output-package build)))
                   (metadata (list :abi-version 3 :identity identity :entries entries
                                   :record-layouts (build-layouts build) :dispatch dispatch
                                   :definitions (loop for form in forms when (eq (car form) 'defun)
