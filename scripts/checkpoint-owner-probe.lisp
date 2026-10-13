@@ -7,7 +7,22 @@
 (defpackage #:clamsara (:use #:cl) (:export #:checkpoint-owner-supported-p))
 (let* ((*package* (find-package :clamsara))
        (root (asdf:system-source-directory "snowgrave"))
-       (ordinary (with-open-file (stream (merge-pathnames "agent-board/checkpoint-owner-source-snapshot.lisp" root)) (read stream)))
+       ;; Freeze the owner-local support method here: the probe must run from
+       ;; a source checkout without an audit scratch directory or Clamsara.
+       (ordinary (read-from-string
+                  "((defclass composed-barrier () ())
+                    (defclass checkpoint-proof-child (composed-barrier) ())
+                    (defgeneric checkpoint-owner-supported-p (owner configuration mode))
+                    (defmethod checkpoint-owner-supported-p ((owner t) configuration mode)
+                      (declare (ignore owner configuration mode)) nil)
+                    (defmethod checkpoint-owner-supported-p ((owner composed-barrier) configuration mode)
+                      (declare (ignore configuration))
+                      (and (eq mode :settled)
+                           (eq (class-of owner) (find-class 'composed-barrier))))
+                    (defun checkpoint-proof-entry (owner mode)
+                      (checkpoint-owner-supported-p owner nil mode))
+                    (defun checkpoint-proof-boot () (make-instance 'composed-barrier))
+                    (defun checkpoint-proof-boot-child () (make-instance 'checkpoint-proof-child)))"))
        (base (intern "COMPOSED-BARRIER")) (child (intern "CHECKPOINT-PROOF-CHILD"))
        (generic (intern "CHECKPOINT-OWNER-SUPPORTED-P"))
        (entry (intern "CHECKPOINT-PROOF-ENTRY")) (boot (intern "CHECKPOINT-PROOF-BOOT"))
