@@ -540,10 +540,14 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
   ;; Direct calls, FUNCTION captures and generalized SETF places share the
   ;; same binding decision. A declared external or lexical operation retains
   ;; its real identity; only authored closed cohort definitions are renamed.
-  (unless (function-target-p build name local)
-    (fail build 'snowgrave:unclosed-call :call-target
-          (format nil "Call or function capture of undeclared operation ~S." name)))
-  (pushnew (snowgrave::function-name-key name) (build-dependencies build) :test #'equal)
+  ;; Open code runs only in the disposable host world. Its binding isolation
+  ;; is still required, but deployed target admission and dependencies belong
+  ;; to the closed cohort discovered afterward, including non-entry roots.
+  (unless open
+    (unless (function-target-p build name local)
+      (fail build 'snowgrave:unclosed-call :call-target
+            (format nil "Call or function capture of undeclared operation ~S." name)))
+    (pushnew (snowgrave::function-name-key name) (build-dependencies build) :test #'equal))
   (if (and (not (member-name name local))
            (or (member-name name (build-functions build))
                (member-name name (getf (build-declaration build) :closed-generics))))
@@ -3729,10 +3733,15 @@ An unknown name makes that name and the remainder uncertain, never absent."
   ;; The MOP chooses the initializer function. Recover only that actual
   ;; function's authored expression, retaining its owned literal graph.
   ;; Equality of freshly read initforms cannot prove literal alias identity.
-  (unless (and candidates (every (lambda (candidate) (eq candidate (car candidates))) candidates))
+  (unless (and candidates
+               (every (lambda (candidate)
+                        (eq (getf candidate :form) (getf (car candidates) :form))) candidates))
     (fail build 'snowgrave:nonreproducible-source feature
           "The actual finalized initializer lacks unambiguous authored constant provenance." :materialization))
-  (car candidates))
+  ;; Candidates were pushed in CPL order. If the actual host initfunction is
+  ;; shared by identical owned expressions, retain the most specific source
+  ;; owner without changing the initializer/literal chosen by the MOP.
+  (car (last candidates)))
 
 (defun class-initializer-provenance (build class)
   "Index actual direct initializer functions once per finalized layout.
@@ -3749,16 +3758,18 @@ not a second inheritance or initialization algorithm."
               (when (sb-mop:slot-definition-initfunction direct)
                 (let ((source (gethash (sb-mop:slot-definition-name direct) source-slots)))
                   (when (and (consp source) (member :initform (cdr source)))
-                    (push (getf (cdr source) :initform)
+                    (push (list :form (getf (cdr source) :initform)
+                                :source-key (authored-source-key build form))
                           (gethash (list (sb-mop:slot-definition-name direct)
                                          (sb-mop:slot-definition-initfunction direct)) slots)))))))
           (let ((source-defaults (make-hash-table :test #'eq)))
             (loop for (key value) on (cdr (assoc :default-initargs (cddddr form))) by #'cddr
-                  do (setf (gethash key source-defaults) (list value)))
+                  do (setf (gethash key source-defaults)
+                           (list :form value :source-key (authored-source-key build form))))
           (dolist (direct (sb-mop:class-direct-default-initargs ancestor))
               (let ((source (gethash (car direct) source-defaults)))
                 (when source
-                  (push (car source) (gethash (list (car direct) (third direct)) defaults)))))))))
+                  (push source (gethash (list (car direct) (third direct)) defaults)))))))))
     (values slots defaults)))
 
 (defun obtain-layouts (build)
@@ -3786,14 +3797,16 @@ not a second inheritance or initialization algorithm."
                     :slot-initargs (mapcar #'sb-mop:slot-definition-initargs slots)
                     :slot-initforms (mapcar (lambda (slot)
                                              (when (sb-mop:slot-definition-initfunction slot)
-                                               (list :form (unique-authored-initializer build
+                                               (unique-authored-initializer build
                                                  (gethash (list (sb-mop:slot-definition-name slot)
                                                                 (sb-mop:slot-definition-initfunction slot)) slot-provenance)
-                                                 :slot-initform-provenance)))) slots)
+                                                 :slot-initform-provenance))) slots)
                     :default-initargs (mapcar (lambda (default)
-                                               (list (car default) (unique-authored-initializer build
-                                                 (gethash (list (car default) (third default)) default-provenance)
-                                                 :default-initform-provenance)))
+                                               (let ((initializer (unique-authored-initializer build
+                                                        (gethash (list (car default) (third default)) default-provenance)
+                                                        :default-initform-provenance)))
+                                                 (list (car default) (getf initializer :form)
+                                                       :source-key (getf initializer :source-key))))
                                              (sb-mop:class-default-initargs class))
                     :ancestors (remove-if-not
                                 (lambda (ancestor) (member-name ancestor (build-classes build)))
@@ -3941,7 +3954,8 @@ not a second inheritance or initialization algorithm."
                                           (not (snowgrave::%record-boundp ,record ',slot '(,class))))
                                     (snowgrave::%record-write
                                      ,record ',slot
-                                     ,(transform-form build (getf initform :form) (build-output-package build)) '(,class))))))))
+                                     ,(with-build-source-key (build (getf initform :source-key))
+                                        (transform-form build (getf initform :form) (build-output-package build))) '(,class))))))))
                   (getf description :slots) (getf description :slot-initargs) (getf description :slot-initforms))
                ,record))
           (build-generated build))
@@ -4055,7 +4069,8 @@ not a second inheritance or initialization algorithm."
                         `(unless (nth-value 2 (get-properties ,arguments '(,(car default))))
                            (setf ,defaults (append ,defaults
                                                   (list ,(car default)
-                                                        ,(transform-form build (cadr default) (build-output-package build)))))))
+                                                        ,(with-build-source-key (build (getf (cddr default) :source-key))
+                                                           (transform-form build (cadr default) (build-output-package build))))))))
                       (getf description :default-initargs))
                    (let ((,arguments (append ,arguments ,defaults)))
                      ,@(unless allow
@@ -4080,7 +4095,8 @@ not a second inheritance or initialization algorithm."
                                    ,@(when initform
                                        `((t (snowgrave::%record-write
                                              ,record ',slot
-                                             ,(transform-form build (getf initform :form) (build-output-package build)) '(,class))))))))
+                                             ,(with-build-source-key (build (getf initform :source-key))
+                                                (transform-form build (getf initform :form) (build-output-package build))) '(,class))))))))
                         (getf description :slots) (getf description :slot-initargs) (getf description :slot-initforms)))
                      ,record))))
               (build-generated build))
@@ -4630,8 +4646,9 @@ and class audits with the fixed point. Unknown captures poison the proof."
              (dolist (name (getf (build-declaration build) :closed-generics)) (emit-generic build name))
              (dolist (form (build-forms build))
                (when (and (eq (defining-kind form) :global) (> (length form) 2))
-                 (let ((*immediate-lambda-domains* nil))
-                   (transform-form build (caddr form) (build-output-package build)))))
+                 (with-build-source-key (build (authored-source-key build form))
+                   (let ((*immediate-lambda-domains* nil))
+                     (transform-form build (caddr form) (build-output-package build))))))
              (dolist (form (build-forms build))
                (when (eq (defining-kind form) :function)
                  (multiple-value-bind (domains reachedp) (gethash (cadr form) (build-function-domains build))

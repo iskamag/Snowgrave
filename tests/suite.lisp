@@ -188,7 +188,8 @@
     (let ((before (remove-if-not (lambda (p) (search "SNOWGRAVE.BUILDER." (package-name p))) (list-all-packages))))
       (signals snowgrave:unclosed-call
         (close-fixture '(rejected :version 1)
-                       (append (fixture-forms)
+                       (append (replace-entry-body (fixture-forms) "RUN"
+                                                   (list (intern "ESCAPE" :snowgrave.fixture)))
                                (list (list 'defun (intern "ESCAPE" :snowgrave.fixture) nil '(eval '(+ 1 2)))))))
       (check (equal before (remove-if-not (lambda (p) (search "SNOWGRAVE.BUILDER." (package-name p))) (list-all-packages)))))))
 
@@ -4332,6 +4333,7 @@
     (lambda-opaque-input-tests)
     (local-function-flow-tests)
     (pending-multiple-value-tests)
+    (cold-source-boundary-tests)
     (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)

@@ -48,6 +48,7 @@
                (:file "tests/lambda-opaque-inputs")
                (:file "tests/local-function-flow")
                (:file "tests/pending-multiple-values")
+               (:file "tests/cold-source-boundary")
                (:file "tests/native-materialization"))
   :perform (asdf:test-op (operation component)
              (declare (ignore operation component))
