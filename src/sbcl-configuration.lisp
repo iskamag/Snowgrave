@@ -548,6 +548,107 @@ The existing literal pool consumes these cold node recipes for shell/fill."
       (graph-private-container-domain-p build domain)
       (graph-private-callable-domain-p build domain)))
 
+(defun lowered-callable-target-p (build domain)
+  (let ((name (domain-function-target domain)))
+    (and name (or (member-name name (build-functions build))
+                  (member-name name (getf (build-declaration build) :closed-generics))))))
+
+(defun lowered-type-input-p (build domain type)
+  "Whether a checked native type could observe a changed representation."
+  (cond ((relational-value-domain-p domain) (lowered-type-input-p build (third domain) type))
+        ((and (consp domain) (eq (first domain) 'or))
+         (some (lambda (part) (lowered-type-input-p build part type)) (rest domain)))
+        ((graph-node-domain-p domain)
+         (let ((row (graph-node-row build domain)))
+           (or (null row) (getf row :class)
+               (getf row :record-edge-p))))
+        ((or (owned-record-domain-p domain) (initializing-record-domain-p domain)
+             (record-domain-p build domain) (lowered-callable-target-p build domain)) t)
+        ;; These targets retain their actual native identity. A surrounding
+        ;; cohort does not change their type or their error payload.
+        ((or (domain-function-target domain) (external-value-domain-p build domain)) nil)
+        ((and (graph-state-profile-p build) (graph-private-payload-domain-p build domain)) t)
+        ;; Nominal supertypes and forgotten facts can still carry a lowered
+        ;; class or source function. Do not grant them the native CLOS ABI.
+        (t
+         ;; Outside a private installation, an unknown ordinary native
+         ;; operand may legitimately fail its check. Only a source-accepted
+         ;; lowered alternative can turn that native success into failure.
+         (let ((unknownp (member domain '(:unknown :pending :external-result))))
+           (or (some (lambda (class)
+                       (and (or unknownp (subtype-domain-p build class domain))
+                            (subtype-domain-p build class type)))
+                     (build-classes build))
+               (some (lambda (name)
+                       (let ((target (list :function-target name)))
+                         (and (or unknownp (subtype-domain-p build target domain))
+                              (subtype-domain-p build target type))))
+                     (append (build-functions build)
+                             (getf (build-declaration build) :closed-generics))))))))
+
+(defun physical-type-acceptance-p (build domain type)
+  "Prove acceptance of the lowered value, independently of its source type.
+CLOSED-RECORD is the actual runtime ABI. Relocated functions use FUNCTION as
+an intentionally conservative physical supertype; source generic-function
+classification remains the separate logical subtype owner's responsibility."
+  (labels ((accepts (physical)
+             (multiple-value-bind (yes certainp) (subtypep physical type)
+               (and yes certainp)))
+           (walk (fact)
+             (cond ((relational-value-domain-p fact) (walk (third fact)))
+                   ((and (consp fact) (eq (first fact) 'or)) (every #'walk (rest fact)))
+                   ((graph-node-domain-p fact)
+                    (let ((row (graph-node-row build fact)))
+                      (if (and row (not (getf row :class)))
+                          (walk (third fact))
+                          (accepts 'snowgrave::closed-record))))
+                   ((or (owned-record-domain-p fact) (initializing-record-domain-p fact)
+                        (record-domain-p build fact))
+                    (accepts 'snowgrave::closed-record))
+                   ((domain-function-target fact)
+                    (if (lowered-callable-target-p build fact)
+                        (accepts 'function)
+                        ;; The same native function reaches the host check.
+                        (subtype-domain-p build fact type)))
+                   ((shaped-domain-p fact) (accepts (second fact)))
+                   ((external-value-domain-p build fact) t)
+                   ((member fact '(:unknown :pending :external-result)) (accepts t))
+                   (t
+                    (and (subtype-domain-p build fact type)
+                         (or (not (some (lambda (class) (subtype-domain-p build class fact))
+                                        (build-classes build)))
+                             (accepts 'snowgrave::closed-record))
+                         (or (not (some (lambda (name)
+                                          (subtype-domain-p build (list :function-target name) fact))
+                                        (append (build-functions build)
+                                                (getf (build-declaration build) :closed-generics))))
+                             (accepts 'function)))))))
+    (walk domain)))
+
+(defun audit-private-type-input (build type domain feature)
+  ;; Native checks retain their actual operand in TYPE-ERROR. Source TYPEP
+  ;; semantics cannot prove acceptance of a record/function representation.
+  (when (and (not *collect-function-flow*) (lowered-type-input-p build domain type)
+             (not (and (subtype-domain-p build domain type)
+                       (physical-type-acceptance-p build domain type))))
+    (fail build 'snowgrave:unclosed-class-operation feature
+          "A checked type needs both source and physical acceptance for a lowered or private datum."
+          :reachability)))
+
+(defun audit-declaration-payloads (build declarations)
+  (unless *collect-function-flow*
+    (dolist (declaration declarations)
+      (when (and (consp declaration)
+                 (not (member (first declaration)
+                              '(special dynamic-extent ignore ignorable inline notinline ftype optimize declaration))))
+        (let* ((explicitp (eq (first declaration) 'type))
+               (type (if explicitp (second declaration) (first declaration)))
+               (names (if explicitp (cddr declaration) (cdr declaration))))
+          (dolist (name names)
+            (when (symbolp name)
+              (audit-private-type-input build type (binding-value-domain name)
+                                        :private-type-declaration-error))))))))
+
 (defun prepare-graph-state-proof (build)
   ;; Inventory the complete source obligation before caller inference. Finite
   ;; captured fields may close inductively; unresolved writes retain the old

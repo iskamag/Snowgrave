@@ -72,6 +72,7 @@
                (:file "tests/private-containers")
                (:file "tests/constructor-state")
                (:file "tests/callable-payloads")
+               (:file "tests/physical-type-inputs")
                (:file "tests/generic-error-authority")
                (:file "tests/place-update-inputs")
                (:file "tests/parser-inputs")

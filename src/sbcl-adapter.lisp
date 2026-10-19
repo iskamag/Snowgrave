@@ -3392,6 +3392,7 @@ reflection, lexical rebinding and class values still require their own ABI."
                    (cdr form))
          (fail build 'snowgrave:unclosed-class-operation :class-type-declaration
                "Use a closed TYPEP check; class type declarations need a target representation mapping."))
+       (unless open (audit-declaration-payloads build (cdr form)))
        form)
       ((eq (car form) 'call-next-method)
        (cond (open form)
@@ -3510,15 +3511,18 @@ reflection, lexical rebinding and class values still require their own ABI."
                  "GO needs an enclosing normalized TAGBODY target."))
          `(go ,(cdr target))))
       ((eq (car form) 'the)
-       (when (and (not open) (not *collect-function-flow*) (graph-state-profile-p build)
-                  (graph-private-payload-domain-p build (value-domain build (third form)))
-                  (not (subtype-domain-p build (value-domain build (third form)) (second form))))
-         (fail build 'snowgrave:unclosed-class-operation :private-type-assertion-error
-               "A checked assertion could publish private record payload as its failing TYPE-ERROR datum." :reachability))
        (unless (or (native-value-type-p (second form)) (member (second form) '(t list cons)))
          (fail build 'snowgrave:unclosed-class-operation :type-assertion
                "THE needs an admitted native type or explicit closed representation mapping."))
-       `(the ,(second form) ,(walk (third form))))
+       (multiple-value-bind (code receipt) (walk (third form))
+         ;; The child's saved value precedes its cleanup/other operand effects.
+         ;; A fresh query of mutable state could authorize a different datum.
+         (unless open
+           (audit-private-type-input build (second form)
+                                     (return-summary-primary
+                                      (or receipt (flow-receipt-summary build (third form))))
+                                     :private-type-assertion-error))
+         `(the ,(second form) ,code)))
       ((member (car form) '(block return-from catch throw))
        (when (and (eq (car form) 'throw) (not open) (graph-state-profile-p build)
                   (not *collect-function-flow*))
