@@ -23,6 +23,7 @@
                (:file "src/sbcl-initialization")
                (:file "src/sbcl-relational")
                (:file "src/sbcl-deployment")
+               (:file "src/sbcl-parser-inputs")
                (:file "src/sbcl-cold-source")))
 
 (asdf:defsystem "snowgrave/tests"
@@ -71,6 +72,7 @@
                (:file "tests/callable-payloads")
                (:file "tests/generic-error-authority")
                (:file "tests/place-update-inputs")
+               (:file "tests/parser-inputs")
                (:file "tests/initialization-phase")
                (:file "tests/relational-state")
                (:file "tests/native-materialization"))

@@ -144,26 +144,33 @@
                                         (subtype-domain-p build part earlier))))))))
    (domain-alternatives domain)))
 
-(defun generic-miss-has-program-caller-p (build generic)
+(defun map-generic-program-call-inputs (build generic process)
   ;; Capture rows are retained arbitrary-body obligations, not evidence that
   ;; this error executes. Keep raw actual tuples: projected method bindings
   ;; have already forgotten arity and dispatch alternatives.
   (let ((shapes (gethash generic (build-generic-call-shapes build))))
     (when shapes
       (loop for key being the hash-keys of shapes using (hash-value input)
-            thereis
+            do
             (destructuring-bind (capture variable-tail count literal-names) key
               (declare (ignore literal-names))
-              (and (not capture)
-                   (or variable-tail (>= count (length *cell-domains*)))
-                   (or (null *cell-axis-domains*)
-                       (let ((domains (if (record-flow-input-p input)
-                                          (record-flow-positional-inputs input) input)))
-                         (loop for cell in *cell-domains* for axis in *cell-axis-domains*
-                               for position from 0
-                               always (generic-error-axis-possible-p
-                                       build (if (< position count) (nth position domains) :unknown)
-                                       cell axis))))))))))
+              (let ((domains (if (record-flow-input-p input) (record-flow-positional-inputs input) input)))
+                (when (and (not capture)
+                           (or variable-tail (>= count (length *cell-domains*)))
+                           (or (null *cell-axis-domains*)
+                               (loop for cell in *cell-domains* for axis in *cell-axis-domains*
+                                     for position from 0
+                                     always (generic-error-axis-possible-p
+                                             build (if (< position count) (nth position domains) :unknown)
+                                             cell axis))))
+                  (funcall process domains variable-tail))))))))
+
+(defun generic-miss-has-program-caller-p (build generic)
+  (block found
+    (map-generic-program-call-inputs build generic
+                                    (lambda (domains variable-tail)
+                                      (declare (ignore domains variable-tail))
+                                      (return-from found t)))))
 
 (defun audit-generic-minimum-arity (build generic required count capture)
   (when (and (graph-state-profile-p build) (not *collect-function-flow*)

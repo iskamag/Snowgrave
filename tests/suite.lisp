@@ -4350,6 +4350,7 @@
     (callable-payload-tests)
     (generic-error-authority-tests)
     (place-update-input-tests)
+    (parser-input-tests)
     (initialization-phase-tests)
     (relational-state-tests)
     (native-materialization-tests)

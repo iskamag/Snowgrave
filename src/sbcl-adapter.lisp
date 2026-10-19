@@ -981,6 +981,8 @@ The stable key names its owner obligation, never a class or slot type."
   ;; proof and is rejected at the existing computed-callee boundary.
   (let (domains summary)
     (loop
+      (audit-lambda-parser-inputs build (lambda-contract build (second lambda))
+                                 (make-list arity :initial-element origin) nil :literal-callback)
       (setf domains (call-lambda-domains build (second lambda)
                                          (make-list arity :initial-element origin) nil :lexical t
                                          :specials (body-special-domains (cddr lambda)))
@@ -1038,6 +1040,9 @@ The stable key names its owner obligation, never a class or slot type."
                     (domains (call-in-local-function-environment
                               build (local-function-binding-frame name) t
                               (lambda ()
+                                (audit-lambda-parser-inputs build (lambda-contract build (second definition))
+                                                           (make-list arity :initial-element origin) nil
+                                                           (local-function-binding-name name))
                                 (call-lambda-domains build (second definition)
                                                      (make-list arity :initial-element origin) nil :lexical t
                                                      :specials (body-special-domains (cddr definition)))))))
@@ -1509,10 +1514,12 @@ The stable key names its owner obligation, never a class or slot type."
           (fail build 'snowgrave:incomplete-domain :immediate-lambda-arguments
                 "A literal lambda call needs a complete producer tuple or a proved APPLY prefix." :reachability))
         (return-from immediate-lambda-call-domains (values nil nil)))
-      (let ((*argument-domains* (append bindings *argument-domains*)))
+      (let* ((*argument-domains* (append bindings *argument-domains*))
+             (supplied (mapcar (lambda (argument) (value-domain build argument)) arguments)))
+        (audit-lambda-parser-inputs build contract supplied variable-tail :literal-lambda)
         (values (call-lambda-domains
                  build (second lambda)
-                 (mapcar (lambda (argument) (value-domain build argument)) arguments)
+                 supplied
                  variable-tail :lexical t :specials (body-special-domains (cddr lambda)))
                 t)))))
 
@@ -1866,6 +1873,7 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
         (return-from local-call-return-summary :pending))
       (let* ((*argument-domains* (append bindings *argument-domains*))
              (supplied (mapcar (lambda (argument) (value-domain build argument)) arguments)))
+        (audit-lambda-parser-inputs build contract supplied variable-tail (local-function-binding-name binding))
         (when (< (length supplied) (length (getf contract :required)))
           ;; The ordinary local lambda parser owns this runtime arity error.
           ;; Retain its lexical definition even when no body tuple can run.
@@ -2864,9 +2872,11 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
   "Derive effective argument bindings through the shared lambda scope owner."
   (let ((lambda-list (caddr form)))
     (if capture (capture-lambda-domains build lambda-list :specials (body-special-domains (cdddr form)))
-        (call-lambda-domains build lambda-list
-                             (mapcar (lambda (argument) (value-domain build argument)) arguments)
-                             variable-tail :specials (body-special-domains (cdddr form))))))
+        (let ((supplied (mapcar (lambda (argument) (value-domain build argument)) arguments)))
+          (audit-lambda-parser-inputs build (lambda-contract build lambda-list)
+                                     supplied variable-tail (cadr form))
+          (call-lambda-domains build lambda-list supplied variable-tail
+                               :specials (body-special-domains (cdddr form)))))))
 
 (defun audit-generic-call-shape (build name arguments capture variable-tail)
   (when (and *initialization-phase* *flow-defer-source-call* (not capture) (not *flow-deferred-call-p*))
@@ -3192,12 +3202,18 @@ reflection, lexical rebinding and class values still require their own ABI."
                      (remove form *flow-value-receipts* :key #'car :test #'eq))))
       (return-from transform-form (values code summary))))
   (flet ((emit ()
-           (if (and *initialization-phase* (not open))
-               (let ((*flow-defer-source-call* (record-flow-owned-call-p build form)))
-                (transform-initialization-form
-                build form
-                (lambda () (transform-form-code build form package :open open :next next :original original :local local))))
-               (transform-form-code build form package :open open :next next :original original :local local))))
+           (let ((code
+                   (if (and *initialization-phase* (not open))
+                       (let ((*flow-defer-source-call* (record-flow-owned-call-p build form)))
+                         (transform-initialization-form
+                          build form
+                          (lambda () (transform-form-code build form package :open open :next next :original original :local local))))
+                       (transform-form-code build form package :open open :next next :original original :local local))))
+             ;; Child receipts preserve the final APPLY operand at its value
+             ;; point, including earlier argument effects and PROG1 cleanup.
+             (when (and (not open) (consp form) (eq (car form) 'apply))
+               (audit-apply-parser-tail build form))
+             code)))
     (if (and *initialization-phase* (not open))
         (call-with-transformed-value-receipt build form #'emit)
         (emit))))
@@ -5236,18 +5252,13 @@ class whitelist replaces their actual applicability behavior."
     (if (consp head) (car head) (intern (symbol-name head) :keyword))))
 
 (defun emit-argument-validator (build generic gf applicable)
-  (let* ((contract (lambda-contract build (sb-mop:generic-function-lambda-list gf)))
+  (let* ((contract (generic-parser-contract build gf applicable))
          (name (fresh-name build "CONTRACT"))
          (required (mapcar (lambda (x) (declare (ignore x)) (fresh-name build "CHECK-ARG")) (getf contract :required)))
          (optional (mapcar (lambda (x) (declare (ignore x)) (fresh-name build "CHECK-OPT")) (getf contract :optional)))
          (rest (when (or (getf contract :rest) (getf contract :keyp)) (fresh-name build "CHECK-REST")))
-         (keywords (mapcar #'keyword-name (getf contract :keys)))
+         (keywords (getf contract :accepted-keywords))
          (allow (getf contract :allow)))
-    (when (getf contract :keyp)
-      (dolist (method applicable)
-        (let ((method-contract (lambda-contract build (sb-mop:method-lambda-list method))))
-          (dolist (key (getf method-contract :keys)) (pushnew (keyword-name key) keywords))
-          (when (getf method-contract :allow) (setf allow t)))))
     (let* ((key-specs (when (getf contract :keyp)
                         (mapcar (lambda (key) (list (list key (fresh-name build "CHECK-KEY")))) keywords)))
            (all-variables (append required optional (when rest (list rest))
@@ -5260,7 +5271,7 @@ class whitelist replaces their actual applicability behavior."
                ,@(when all-variables (list `(declare (ignore ,@all-variables))))
                (values)) (build-generated build))
       (values name (list :generic generic :keywords keywords :allow-other-keys allow
-                         :lambda-list lambda-list)))))
+                         :lambda-list lambda-list) contract))))
 
 (defun emit-minimum-arity-check (build generic gf required established arguments)
   (when (plusp required)
@@ -5352,9 +5363,10 @@ class whitelist replaces their actual applicability behavior."
           (when options
             (fail build 'snowgrave:unsupported-definition :effective-method-options
                   "The normalized source emitter does not ignore MOP options." :materialization))
-          (multiple-value-bind (validator argument-contract)
+          (multiple-value-bind (validator argument-contract parser-contract)
               (if fixed-arity (values-list fixed-validator)
                   (emit-argument-validator build generic gf applicable))
+          (audit-generic-parser-inputs build generic parser-contract)
           (multiple-value-bind (code proof)
               (let* ((*fixed-effective-arguments* (not (null fixed-arity)))
                      (input (nth-value 1 (method-binding-domains build generic lambda-list nil))))
