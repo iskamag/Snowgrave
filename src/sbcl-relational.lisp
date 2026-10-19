@@ -296,13 +296,18 @@
                 (or (ordinary-function-form build (first form))
                     (member-name (first form) (getf (build-declaration build) :closed-generics))))
            (and (member (first form) '(funcall apply multiple-value-call))
-                (multiple-value-bind (targets globals) (known-function-targets build (second form))
-                  (and targets (every (lambda (target)
-                                        (and (not (local-function-binding-p target))
-                                             (member-name target globals)
-                                             (not (initialization-generic-p target))
-                                             (or (ordinary-function-form build target)
-                                                 (member-name target (getf (build-declaration build) :closed-generics))))) targets)))))))
+                (multiple-value-bind (targets globals callee-domain) (known-function-targets build (second form))
+                  ;; A callback producer still at bottom needs the same
+                  ;; pending receipt as an unsolved direct source callee.
+                  (or (eq (relational-base callee-domain) :pending)
+                      (and targets
+                           (every (lambda (target)
+                                    (and (not (local-function-binding-p target))
+                                         (member-name target globals)
+                                         (not (initialization-generic-p target))
+                                         (or (ordinary-function-form build target)
+                                             (member-name target (getf (build-declaration build) :closed-generics)))))
+                                  targets))))))))
 
 (defun pending-record-flow-state ()
   (when (listp (initialization-phase-slots *initialization-phase*))
@@ -368,9 +373,12 @@
 
 (defun record-flow-call-receipt (build form)
   "Apply the settled contract after actual arguments, branching finite callees."
-  (multiple-value-bind (targets globals)
+  (multiple-value-bind (targets globals callee-domain)
       (if (member (first form) '(funcall apply multiple-value-call))
           (known-function-targets build (second form)) (values (list (first form)) nil))
+    (when (eq (relational-base callee-domain) :pending)
+      (pending-record-flow-state)
+      (return-from record-flow-call-receipt :pending))
     (multiple-value-bind (arguments bindings completep variable-tail)
         (if (member (first form) '(funcall apply multiple-value-call))
             (ordinary-call-argument-plan build form) (values (rest form) nil t nil))
@@ -540,6 +548,15 @@
 (defun independent-record-flow-result-domain (build domain)
   (cond ((or (eq domain :pending) (native-data-domain-p build domain)
              (independent-record-flow-domain-p build domain)) domain)
+        ;; A proved global function identity does not depend on the removed
+        ;; record-state carrier. Keeping it proves neither native data nor
+        ;; permission to publish the callable at an observable boundary.
+        ((let ((name (domain-function-target domain)))
+           (and name (snowgrave::source-name-p name) (function-target-p build name nil))) domain)
+        ((and (consp domain) (eq (first domain) 'or))
+         (reduce (lambda (left right) (merge-value-domains build left right))
+                 (mapcar (lambda (part) (independent-record-flow-result-domain build part)) (rest domain))
+                 :initial-value :pending))
         ;; A normal-return geometry proof is independent of native contents.
         ;; Keep only that product; never bless aggregate elements or aliases.
         ((subtype-domain-p build domain '(or list vector)) (qualify-domain-origin domain :external-result))

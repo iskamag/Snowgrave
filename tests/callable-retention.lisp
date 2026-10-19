@@ -83,13 +83,13 @@
    "(defun run (object callback count)
       (if (zerop count) (funcall callback object) (run object callback (1- count))))"
    "(run object #'operation 2)")
-  ;; Unresolved callback defaults cannot prove that the numeric cell is
-  ;; unreachable. The existing opaque-default limitation stays conservative.
-  (callable-retention-case :unresolved-default-target
+  ;; A named callable returned by the default's helper is independent of
+  ;; record-state snapshots, so it retains the same finite invocation proof.
+  (callable-retention-case :helper-default-target
    "(defmethod operation ((object number)) (class-of object))
     (defun target () #'operation)
     (defun run (object &optional (callback (target))) (funcall callback object))"
-   "(run object)" :refusal 'class-of)
+   "(run object)" :actual-only t)
   ;; Finite defaults, helper returns and a method/helper recursive component
   ;; revisit cells after an earlier scratch omission.
   (callable-retention-case :finite-default-target
@@ -169,6 +169,52 @@
    "(parse object) 17" :refusal :graph-state-generic-authority)
   (callable-retention-case :no-next-method "" "(operation object)"
    :operation-body "(call-next-method)" :refusal :graph-state-generic-authority))
+
+(defun independent-callable-result-tests ()
+  (callable-retention-case :helper-default-union
+   "(defun other (object) (slot-value object 'data))
+    (defun target (flag) (if flag #'operation #'other))
+    (defun run (object flag &optional (callback (target flag))) (funcall callback object))"
+   "(values (run object t) (run object nil))" :expected '(17 17))
+  (callable-retention-case :helper-default-effects
+   "(defun target () #'operation)
+    (defun run (object &optional (callback (target)))
+      (values (funcall callback object) (slot-value object 'data)))"
+   "(run object)" :operation-body "(setf (slot-value object 'data) 23)"
+   :expected '(23 23))
+  (callable-retention-case :helper-default-setf-target
+   "(defgeneric (setf data) (value object))
+    (defmethod (setf data) (value (object holder)) (setf (slot-value object 'data) value))
+    (defun target () #'(setf data))
+    (defun run (object &optional (callback (target)))
+      (funcall callback 23 object) (slot-value object 'data))"
+   "(run object)" :expected '(23))
+  ;; Independent identity never means native data or publication authority.
+  (dolist (spec '((:result "callback" :graph-state-result)
+                  (:aggregate "(list callback) 17" :graph-state-operation-input)
+                  (:assertion "(the fixnum callback) 17" :private-type-assertion-error)
+                  (:declaration "(locally (declare (type (and function (not compiled-function)) callback))
+                                    (funcall callback object))" :private-type-declaration-error)
+                  (:short-call "(funcall callback) 17" :graph-state-generic-authority)))
+    (callable-retention-case
+     (list :helper-default-boundary (first spec))
+     (format nil "(defun target () #'operation)
+                  (defun run (object &optional (callback (target)))
+                    (declare (ignorable object)) ~A)" (second spec))
+     "(run object)" :operation-body "17" :refusal (third spec)))
+  (callable-retention-case :helper-default-late-unsafe-caller
+   "(defmethod operation ((object number)) (class-of object))
+    (defun target () #'operation)
+    (defun run (object &optional (callback (target))) (funcall callback object))"
+   "(run object) (run 0) 17" :refusal 'class-of)
+  (callable-retention-case :helper-default-unsolved-component
+   "(defun target () (target))
+    (defun run (object &optional (callback (target))) (funcall callback object))"
+   "(run object)" :operation-body "17" :refusal :computed-function)
+  (callable-retention-case :helper-default-mixed-target
+   "(defun target (flag object) (if flag #'operation object))
+    (defun run (object flag &optional (callback (target flag object))) (funcall callback object))"
+   "(run object t) (run object nil) 17" :operation-body "17" :refusal :computed-function))
 
 (defun callable-retention-dormant-tests ()
   ;; The complete caller proof can omit a cell, including one sharing its

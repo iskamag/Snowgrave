@@ -138,9 +138,11 @@
                         "(operation 0 :flag 17) (setf (slot-value object 'data) nil)
                          (apply #'operation (progn (setf (slot-value object 'data) #'other) 0)
                            (slot-value object 'data))")
-              for index from 0 do
+              do
           (parser-input-case :tail-value-point definition body :generic kind
-           :refusal (if (and kind (< index 2)) :external-result-dispatch :graph-state-apply-tail)
+           ;; The saved named-function identity survives the early binder
+           ;; projection, so APPLY's own payload owner now rejects this tail.
+           :refusal :graph-state-apply-tail
            :native-error 'type-error :callable-error t))
         (dolist (body '("(setf (slot-value object 'data) nil)
                          (operation 0 (progn (setf (slot-value object 'data) #'other)

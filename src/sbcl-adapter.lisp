@@ -2114,6 +2114,11 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
 
 (defun indirect-call-return-summary (build form targets global-targets callee-domain)
   "Compose source return contracts, retaining opaque inputs of unowned targets."
+  ;; A helper's unsolved callback result has not supplied an arbitrary target.
+  ;; The shared fixed point must discover it (or settle it to UNKNOWN) before
+  ;; its result can contribute an opaque normal-return envelope.
+  (when (eq (relational-base callee-domain) :pending)
+    (return-from indirect-call-return-summary :pending))
   (let* ((summaries (mapcar (lambda (name)
                               (if (local-function-binding-p name) (local-call-return-summary build name form)
                                   (source-call-return-summary build name global-targets))) targets))
@@ -2402,9 +2407,13 @@ Unknown/native operations retain only their existing primary fact."
     ((and (eq (first form) 'make-instance) (graph-state-profile-p build))
      (let ((domain (source-construction-domain build form)))
        (make-return-summary (list domain) (owned-record-domain-p domain))))
-    ((and (member (car form) '(slot-value snowgrave::%record-read))
-          (nth-value 1 (record-slot-read-domain build (second form) (third form))))
-     (make-return-summary (list (value-domain build form)) t))
+    ((member (car form) '(slot-value snowgrave::%record-read))
+     (multiple-value-bind (domain boundp) (record-slot-read-domain build (second form) (third form))
+       ;; A pending incoming state supplies no normal return/count yet. It
+       ;; must not permanently widen an eventual bound single-value read.
+       (cond ((eq domain :pending) :pending)
+             (boundp (make-return-summary (list (value-domain build form)) t))
+             (t (make-return-summary (list (value-domain build form)) nil)))))
     ((or (ordinary-single-value-result-p build (car form))
          (and (member (car form) '(typep slot-boundp))
               (standard-operation-meaning-p build (car form))))
