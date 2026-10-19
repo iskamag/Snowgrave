@@ -38,8 +38,11 @@
               (error "~S expected ~S, got ~A" tag refusal condition))
             (check (eq refusal (snowgrave:error-feature condition))))
           (progn
+            (when condition (error "~S unexpectedly refused: ~A" tag condition))
             (check (null condition))
-            (check (eq :whole-sealed-partition-of-each-retained-generic
+            (check (eq (if (eq policy :entries)
+                           :sealed-partition-minus-proved-unreachable-cells
+                           :whole-sealed-partition-of-each-retained-generic)
                        (getf (getf (snowgrave:unit-metadata unit) :deployment) :cell-coverage)))
             (when actual-only
               (let* ((flow (getf (snowgrave:unit-metadata unit) :ordinary-function-flow))
@@ -80,6 +83,39 @@
    "(defun run (object callback count)
       (if (zerop count) (funcall callback object) (run object callback (1- count))))"
    "(run object #'operation 2)")
+  ;; Unresolved callback defaults cannot prove that the numeric cell is
+  ;; unreachable. The existing opaque-default limitation stays conservative.
+  (callable-retention-case :unresolved-default-target
+   "(defmethod operation ((object number)) (class-of object))
+    (defun target () #'operation)
+    (defun run (object &optional (callback (target))) (funcall callback object))"
+   "(run object)" :refusal 'class-of)
+  ;; Finite defaults, helper returns and a method/helper recursive component
+  ;; revisit cells after an earlier scratch omission.
+  (callable-retention-case :finite-default-target
+   "(defmethod operation ((object number)) (class-of object))
+    (defun run (object &optional (callback #'operation)) (funcall callback object))"
+   "(run object)")
+  (callable-retention-case :late-helper-return
+   "(defmethod operation ((object number)) (class-of object))
+    (defun identity-through-call (object) object)
+    (defun run (object callback) (funcall callback (identity-through-call object)))"
+   "(run object #'operation)")
+  (callable-retention-case :recursive-method-component
+   "(defmethod operation ((object number)) (class-of object))
+    (defgeneric recur (object count))
+    (defmethod recur ((object holder) count)
+      (if (zerop count) (operation object) (again object (1- count))))
+    (defmethod recur ((object number) count)
+      (declare (ignore count)) (class-of object))
+    (defun again (object count) (recur object count))"
+   "(recur object 2)")
+  (callable-retention-case :late-numeric-caller
+   "(defmethod operation ((object number)) (class-of object))
+    (defun numeric () 0)
+    (defun run (object callback) (funcall callback object))"
+   "(run object #'operation) (run (numeric) #'operation)"
+   :refusal 'class-of)
   ;; The general profile retains its existing arbitrary-capture obligation.
   (callable-retention-case :selected-profile
    "(defun run (object callback) (funcall callback object))"
@@ -135,10 +171,11 @@
    :operation-body "(call-next-method)" :refusal :graph-state-generic-authority))
 
 (defun callable-retention-dormant-tests ()
-  ;; An unused cell is retained and conservatively audited, even when another
-  ;; cell has an actual bound caller. It may not borrow that caller's state.
+  ;; The complete caller proof can omit a cell, including one sharing its
+  ;; method with the live subclass. A real caller must restore its obligation.
   (dolist (disjoint '(nil t))
-    (let* ((*package* (make-package (format nil "SNOWGRAVE.CALLABLE.DORMANT.~S" disjoint) :use '("CL")))
+   (dolist (bad-caller '(nil t))
+    (let* ((*package* (make-package (format nil "SNOWGRAVE.CALLABLE.DORMANT.~S.~S" disjoint bad-caller) :use '("CL")))
            (forms (read-from-string
                    (format nil "((defclass base () ((data :initarg :data)))
                                  (defclass child ~A ~A)
@@ -146,22 +183,39 @@
                                  (defgeneric operation (object))
                                  (defmethod operation ((object base)) (slot-value object 'data)) ~A
                                  (defun run (object callback) (funcall callback object))
-                                 (defun entry (root) (run (slot-value root 'live) #'operation)))"
+                                 (defun entry (root) (run (slot-value root '~A) #'operation)))"
                            (if disjoint "()" "(base)") (if disjoint "((data :initarg :data))" "()")
-                           (if disjoint "(defmethod operation ((object child)) (slot-value object 'data))" "")))))
+                           (if disjoint "(defmethod operation ((object child)) (slot-value object 'data))" "")
+                           (if bad-caller "dormant" "live")))))
       (dolist (form forms) (eval form))
       (let* ((root (make-instance (intern "ROOTS")
                                   :live (make-instance (intern "CHILD") :data 17)
                                   :dormant (make-instance (intern "BASE"))))
+             (unit nil)
              (condition (handler-case
-                            (snowgrave:close-source-unit
-                             (list :forms forms) :unit-name (list :callable-dormant disjoint)
+                            (progn (setf unit (snowgrave:close-source-unit
+                             (list :forms forms) :unit-name (list :callable-dormant disjoint bad-caller)
                              :closed-classes (mapcar #'intern '("BASE" "CHILD" "ROOTS"))
                              :closed-generics (list (intern "OPERATION"))
                              :universe (append (mapcar #'intern '("BASE" "CHILD" "ROOTS")) '(t))
                              :entries (list (intern "ENTRY")) :deployment-roots :entries
-                             :external-domains (list (list (intern "ENTRY") (list (list 'eql root)))))
+                             :external-domains (list (list (intern "ENTRY") (list (list 'eql root)))))) nil)
                           (snowgrave:snowgrave-error (condition) condition))))
-        (check (= 17 (funcall (intern "ENTRY") root)))
-        (check (typep condition 'snowgrave:snowgrave-error))
-        (check (eq :graph-state-slot-read (snowgrave:error-feature condition)))))))
+        (if bad-caller
+            (progn
+              (check (handler-case (progn (funcall (intern "ENTRY") root) nil) (unbound-slot () t)))
+              (check (typep condition 'snowgrave:snowgrave-error))
+              (unless (eq :graph-state-slot-read (snowgrave:error-feature condition))
+                (error "Dormant real caller expected private slot refusal, got ~A" condition))
+              (check (eq :graph-state-slot-read (snowgrave:error-feature condition))))
+            (progn
+              (check (= 17 (funcall (intern "ENTRY") root)))
+              (when condition (error "Dormant-cell proof refused: ~A" condition))
+              (check (= 17 (funcall (snowgrave:unit-function unit (intern "ENTRY") :bind-configuration t))))
+              (let* ((dispatch (getf (snowgrave:unit-metadata unit) :dispatch))
+                     (operation (find (intern "OPERATION") dispatch :key (lambda (row) (getf row :generic)))))
+                (check (some (lambda (cell)
+                               (and (equal (getf cell :classes) (list (intern "BASE")))
+                                    (eq (getf cell :behavior) :unreachable-from-admitted-calls)
+                                    (eq (getf cell :proof) :settled-ordered-call-inputs)))
+                             (getf operation :cells)))))))))))

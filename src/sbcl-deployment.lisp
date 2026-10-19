@@ -102,7 +102,9 @@
                   collect (list :name-key (snowgrave::function-name-key name)
                                 :reason :unreachable-from-deployment-roots))
           :proof :shared-call-capture-and-construction-fixed-point
-          :cell-coverage :whole-sealed-partition-of-each-retained-generic)))
+          :cell-coverage (if (configured-callable-retention-p build)
+                             :sealed-partition-minus-proved-unreachable-cells
+                             :whole-sealed-partition-of-each-retained-generic))))
 
 ;;;; Implicit callable authority in native generic errors.
 

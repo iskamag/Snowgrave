@@ -82,9 +82,14 @@
                         (if configured
                             (funcall (snowgrave:unit-function unit entry :bind-configuration t))
                             (funcall (snowgrave:unit-function unit entry) closed-root)))))
-         ;; No missing cells were removed to obtain the accepted proof.
+         ;; Entry-rooted configured units may omit cells with no compatible
+         ;; settled caller. Other profiles retain their native miss cells.
          (check (some (lambda (description)
-                        (some (lambda (cell) (eq (getf cell :behavior) :standard-no-applicable-method))
+                        (some (lambda (cell)
+                                (if (and configured (eq policy :entries))
+                                    (and (eq (getf cell :behavior) :unreachable-from-admitted-calls)
+                                         (eq (getf cell :proof) :settled-ordered-call-inputs))
+                                    (eq (getf cell :behavior) :standard-no-applicable-method)))
                               (getf description :cells)))
                       (getf (snowgrave:unit-metadata unit) :dispatch)))))))))
 

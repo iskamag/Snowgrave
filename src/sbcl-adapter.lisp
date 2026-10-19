@@ -5508,70 +5508,78 @@ class whitelist replaces their actual applicability behavior."
           (incf uniformity-replays
                 (verify-universal-axes build gf cell applicable axis-evidence concrete-axes))
           (setf (gethash applicable verified-lists) t))
-        (if (null applicable)
-            (progn
-              ;; A shared fixed miss function can serve several cells; each
-              ;; call site still needs its own actual-row feasibility proof.
-              (audit-standard-generic-authority build generic)
-              (when (and fixed-arity (null fixed-miss))
-                (setf fixed-miss (fresh-name build "STANDARD-MISS"))
-                (push fixed-miss (build-method-names build))
-                (push `(defun ,fixed-miss (,arguments)
-                         ,(emit-standard-miss build 'no-applicable-method generic nil arguments))
-                      (build-generated build)))
-              (let* ((contract (lambda-contract build lambda-list))
-                     (validator (if fixed-arity (unless optionalp (first fixed-validator))
-                                    (unless (or (getf contract :rest) (getf contract :keyp))
-                                      (emit-argument-validator build generic gf nil)))))
-                (push `(,(cons 'and (mapcar (lambda (class parameter) (cell-test build class parameter)) cell parameters))
-                         (progn
-                           ,@(when validator `((when ,(if fixed-arity `(and ,arguments ,established) established)
-                                                 (apply #',validator ,arguments))))
-                           ,(if fixed-miss `(,fixed-miss ,error-arguments)
-                                (emit-standard-miss build 'no-applicable-method generic nil error-arguments)))) clauses))
+        (cond
+          ((not (generic-cell-has-admitted-input-p build generic))
+           (push (list :classes (mapcar (lambda (class) (source-class build class)) cell)
+                       :behavior :unreachable-from-admitted-calls
+                       :proof :settled-ordered-call-inputs
+                       :methods (mapcar (lambda (method) (method-logical-key build generic method)) applicable))
+                 descriptions))
+          (t
+            (if (null applicable)
+                (progn
+                  ;; A shared fixed miss function can serve several cells; each
+                  ;; call site still needs its own actual-row feasibility proof.
+                  (audit-standard-generic-authority build generic)
+                  (when (and fixed-arity (null fixed-miss))
+                    (setf fixed-miss (fresh-name build "STANDARD-MISS"))
+                    (push fixed-miss (build-method-names build))
+                    (push `(defun ,fixed-miss (,arguments)
+                             ,(emit-standard-miss build 'no-applicable-method generic nil arguments))
+                          (build-generated build)))
+                  (let* ((contract (lambda-contract build lambda-list))
+                         (validator (if fixed-arity (unless optionalp (first fixed-validator))
+                                        (unless (or (getf contract :rest) (getf contract :keyp))
+                                          (emit-argument-validator build generic gf nil)))))
+                    (push `(,(cons 'and (mapcar (lambda (class parameter) (cell-test build class parameter)) cell parameters))
+                             (progn
+                               ,@(when validator `((when ,(if fixed-arity `(and ,arguments ,established) established)
+                                                     (apply #',validator ,arguments))))
+                               ,(if fixed-miss `(,fixed-miss ,error-arguments)
+                                    (emit-standard-miss build 'no-applicable-method generic nil error-arguments)))) clauses))
+                  (push (list :classes (mapcar (lambda (class) (source-class build class)) cell)
+                              :methods nil :behavior :standard-no-applicable-method) descriptions))
+            (multiple-value-bind (effective options)
+                (sb-mop:compute-effective-method gf (sb-mop:generic-function-method-combination gf) applicable)
+              (when options
+                (fail build 'snowgrave:unsupported-definition :effective-method-options
+                      "The normalized source emitter does not ignore MOP options." :materialization))
+              (multiple-value-bind (validator argument-contract parser-contract)
+                  (if (and fixed-arity (not optionalp)) (values-list fixed-validator)
+                      (emit-argument-validator build generic gf applicable))
+              (audit-generic-parser-inputs build generic parser-contract)
+              (multiple-value-bind (code proof)
+                  (let* ((*fixed-effective-arguments* fixed-convention)
+                         (input (nth-value 1 (method-binding-domains build generic lambda-list nil))))
+                    (call-with-record-flow-input
+                     build input
+                     (lambda (domains)
+                       (declare (ignore domains))
+                       (multiple-value-bind (code proof)
+                           (if *initialization-phase*
+                               (emit-initialization-plan build generic effective (if fixed-arity effective-parameters (list arguments)))
+                               (emit-effective build generic effective (if fixed-arity effective-parameters (list arguments))))
+                         (let* ((*effective-return-proof* t)
+                                (result (form-return-summary build proof)))
+                           (values code (if *initialization-phase* (publish-record-flow-summary result) result)))))))
+                ;; The cell wrapper above has already consumed the CEM proof
+                ;; tree. Merge its typed result once; bottom is not source syntax
+                ;; and an authored literal :PENDING remains an ordinary value.
+                (setf summary (merge-return-summaries build summary proof))
+                (push `(,(cons 'and (mapcar (lambda (class parameter) (cell-test build class parameter))
+                                           cell parameters))
+                         (progn (setf ,established t)
+                                ,@(when validator
+                                    (list (if fixed-arity `(when ,arguments (apply #',validator ,arguments))
+                                              `(apply #',validator ,arguments))))
+                                ,code)) clauses))
               (push (list :classes (mapcar (lambda (class) (source-class build class)) cell)
-                          :methods nil :behavior :standard-no-applicable-method) descriptions))
-        (multiple-value-bind (effective options)
-            (sb-mop:compute-effective-method gf (sb-mop:generic-function-method-combination gf) applicable)
-          (when options
-            (fail build 'snowgrave:unsupported-definition :effective-method-options
-                  "The normalized source emitter does not ignore MOP options." :materialization))
-          (multiple-value-bind (validator argument-contract parser-contract)
-              (if (and fixed-arity (not optionalp)) (values-list fixed-validator)
-                  (emit-argument-validator build generic gf applicable))
-          (audit-generic-parser-inputs build generic parser-contract)
-          (multiple-value-bind (code proof)
-              (let* ((*fixed-effective-arguments* fixed-convention)
-                     (input (nth-value 1 (method-binding-domains build generic lambda-list nil))))
-                (call-with-record-flow-input
-                 build input
-                 (lambda (domains)
-                   (declare (ignore domains))
-                   (multiple-value-bind (code proof)
-                       (if *initialization-phase*
-                           (emit-initialization-plan build generic effective (if fixed-arity effective-parameters (list arguments)))
-                           (emit-effective build generic effective (if fixed-arity effective-parameters (list arguments))))
-                     (let* ((*effective-return-proof* t)
-                            (result (form-return-summary build proof)))
-                       (values code (if *initialization-phase* (publish-record-flow-summary result) result)))))))
-            ;; The cell wrapper above has already consumed the CEM proof
-            ;; tree. Merge its typed result once; bottom is not source syntax
-            ;; and an authored literal :PENDING remains an ordinary value.
-            (setf summary (merge-return-summaries build summary proof))
-            (push `(,(cons 'and (mapcar (lambda (class parameter) (cell-test build class parameter))
-                                       cell parameters))
-                     (progn (setf ,established t)
-                            ,@(when validator
-                                (list (if fixed-arity `(when ,arguments (apply #',validator ,arguments))
-                                          `(apply #',validator ,arguments))))
-                            ,code)) clauses))
-          (push (list :classes (mapcar (lambda (class) (source-class build class)) cell)
-                      :argument-contract argument-contract
-                      :methods (mapcar (lambda (method)
-                                         (list (source-method-qualifiers build generic method)
-                                               (mapcar (lambda (specializer) (source-class build specializer))
-                                                       (sb-mop:method-specializers method)))) applicable))
-                descriptions)))))))
+                          :argument-contract argument-contract
+                          :methods (mapcar (lambda (method)
+                                             (list (source-method-qualifiers build generic method)
+                                                   (mapcar (lambda (specializer) (source-class build specializer))
+                                                           (sb-mop:method-specializers method)))) applicable))
+                    descriptions)))))))))
     (when *collect-function-flow*
       (let* ((previous (gethash generic (build-function-returns build) :pending))
              (merged (merge-return-summaries build previous summary)))

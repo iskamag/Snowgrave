@@ -15,8 +15,8 @@
                     *function-flow-changed* t)
               (fail build 'snowgrave:incomplete-domain :callable-value-reachability
                     "A named callable lacks its cold retention proof." :reachability)))
-        ;; Table presence retains the generic's whole partition. An empty
-        ;; actual tuple set is not an arbitrary call or a dead-cell proof.
+        ;; Table presence retains the generic identity. Only the complete
+        ;; caller fixed point can decide which runtime cells it requires.
         (when (and *collect-function-flow*
                    (member-name name (getf (build-declaration build) :closed-generics))
                    (not (nth-value 1 (gethash name (build-generic-call-shapes build)))))
@@ -33,3 +33,26 @@
                (zerop (hash-table-count (gethash name (build-generic-call-shapes build)))))
        (audit-function-capture build name))))
 
+(defun generic-cell-has-admitted-input-p (build generic)
+  ;; Analysis may provisionally visit fewer cells, then revisit them as inputs
+  ;; widen. Deployment uses the settled table and repeats all call coverage
+  ;; checks. Unknown/capture rows stay possible; no source writer is declared
+  ;; unreachable merely because its body has not been visited.
+  (or (not (configured-callable-retention-p build))
+      (initialization-generic-p generic)
+      (let ((shapes (gethash generic (build-generic-call-shapes build))))
+        (when shapes
+          (loop for key being the hash-keys of shapes using (hash-value input)
+                thereis
+                (destructuring-bind (capture variable-tail count literal-names &optional native-payloads) key
+                  (declare (ignore literal-names native-payloads))
+                  (or capture
+                      (let ((domains (record-flow-positional-inputs input)))
+                        ;; PENDING is bottom during the scratch solve. Its
+                        ;; producer has not returned a value yet; it is not an
+                        ;; arbitrary caller. Unsolved components are widened
+                        ;; by the existing settlement owner before deployment.
+                        (and (not (and *collect-function-flow*
+                                       (some (lambda (domain) (eq (relational-base domain) :pending))
+                                             (subseq domains 0 (min count (length *cell-domains*))))))
+                             (generic-call-row-possible-p build domains variable-tail count))))))))))
