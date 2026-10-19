@@ -129,6 +129,23 @@
        (defmethod initialize-instance :after ((n node) &rest args)
          (declare (ignore args)) (zap n (progn (setf (slot-value n 'data) 17) nil)) (slot-value n 'data)))"
     "(declare (ignore root)) (typep (make-instance 'node) 'node)" :refusal :graph-state-slot-read)
+  (initialization-phase-case :phase-native-results-after-effects
+    "((defclass node () ((data :initform 17)))
+       (defun clear-and-values (n) (slot-makunbound n 'data) (values 17 :ok))
+       (defmethod initialize-instance :after ((n node) &rest args)
+         (declare (ignore args))
+         (multiple-value-bind (value status) (clear-and-values n)
+           (snowgrave.tests::constructor-state-event value)
+           (snowgrave.tests::constructor-state-event (eq status :ok)))
+         (snowgrave.tests::constructor-state-event (eql (clear-and-values n) 17))
+         (snowgrave.tests::constructor-state-event (slot-boundp n 'data))))"
+    "(declare (ignore root)) (typep (make-instance 'node) 'node)")
+  (initialization-phase-case :phase-private-result-after-effects
+    "((defclass node () ((data :initform 17)))
+       (defun clear-and-return (n) (slot-makunbound n 'data) n)
+       (defmethod initialize-instance :after ((n node) &rest args)
+         (declare (ignore args)) (snowgrave.tests::constructor-state-event (clear-and-return n))))"
+    "(declare (ignore root)) (typep (make-instance 'node) 'node)" :refusal :graph-state-external-argument)
   (initialization-phase-case :phase-before-read
     "((defclass node () ((data :initform 17)))
        (defmethod initialize-instance :before ((n node) &rest args)

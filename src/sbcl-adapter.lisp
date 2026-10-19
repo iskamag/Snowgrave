@@ -2055,12 +2055,15 @@ This proves a branch, not a field declaration or arbitrary external alias ABI."
   (if (and *initialization-phase* (initialization-effectful-form-p build form))
       ;; Binder queries precede actual source evaluation. A phase-dependent
       ;; effectful value cannot borrow the receiver's earlier/later row. Keep
-      ;; tuple bottom/count proof, but retain a conservative origin envelope.
+      ;; tuple bottom/count proof and independently native results. Only a
+      ;; phase-dependent value needs the conservative origin envelope.
       (let* ((*initialization-phase* nil)
              (summary (form-return-summary-code build form)))
         (if (return-summary-p summary)
             (make-return-summary
-             (mapcar (lambda (domain) (if (eq domain :pending) :pending :external-result))
+             (mapcar (lambda (domain)
+                       (if (or (eq domain :pending) (native-data-domain-p build domain))
+                           domain :external-result))
                      (return-summary-domains summary))
              (return-summary-completep summary)) summary))
       (form-return-summary-code build form)))
@@ -2360,7 +2363,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
 (defun value-domain (build form)
   (when (and *initialization-phase* (initialization-effectful-form-p build form)
              (not (eq (first form) 'make-instance)))
-    (return-from value-domain :external-result))
+    (return-from value-domain (return-summary-primary (form-return-summary build form))))
   ;; One return lattice carries unclassified native results through ordinary
   ;; constructors/projections as well as helpers and joins. A proved native
   ;; result (for example a predicate boolean) ends this dependence. UNKNOWN
