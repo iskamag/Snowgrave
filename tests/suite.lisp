@@ -1468,16 +1468,32 @@
                       closed-effects (copy-tree (symbol-value log))))
               (check (equal open-observation closed-observation))
               (check (equal open-effects closed-effects)))))))
-    (dolist (body '("(keyword-call)" "(apply #'keyword-call tail)"))
-      (signals snowgrave:incomplete-domain
-        (snowgrave:close-source-unit
-         (list :forms (replace-entry-body forms "KEYWORD-ENTRY" (read-from-string body)))
-         :unit-name (list 'missing-required-contract body)
-         :closed-classes (read-from-string "(argument-policy argument-fast)")
-         :universe (read-from-string "(argument-policy argument-fast)")
-         :closed-generics (read-from-string "(keyword-call bounded-call rest-call allow-call)")
-         :entries (read-from-string "(keyword-entry)")
-         :external-domains (read-from-string "((keyword-entry (argument-policy)))"))))
+    (labels ((close-case (body)
+               (snowgrave:close-source-unit
+                (list :forms (replace-entry-body forms "KEYWORD-ENTRY" (read-from-string body)))
+                :unit-name (list 'missing-required-contract body)
+                :closed-classes (read-from-string "(argument-policy argument-fast)")
+                :universe (read-from-string "(argument-policy argument-fast)")
+                :closed-generics (read-from-string "(keyword-call bounded-call rest-call allow-call)")
+                :entries (read-from-string "(keyword-entry)")
+                :external-domains (read-from-string "((keyword-entry (argument-policy)))"))))
+      ;; A statically incomplete call has a host arity-error path before
+      ;; dispatch. Uncalled ordinary entries do not add caller obligations.
+      (let* ((short (close-case "(keyword-call)"))
+             (layout (first (getf (snowgrave:unit-metadata short) :record-layouts)))
+             (record (snowgrave:sg-make-record
+                      (snowgrave:make-layout (getf layout :identity) (getf layout :class)
+                                            (getf layout :ancestors) (getf layout :slots)
+                                            :error-mapping (getf layout :error-mapping))))
+             (entry (intern "KEYWORD-ENTRY")) (generic (intern "KEYWORD-CALL")))
+        (dolist (form (replace-entry-body forms "KEYWORD-ENTRY" (read-from-string "(keyword-call)")))
+          (eval form))
+        (check (equal (contract-observation (fdefinition entry) (list (make-instance (getf layout :class)))
+                                           (list (cons (fdefinition generic) :generic)))
+                      (contract-observation (test-unit-function short entry) (list record)
+                                            (list (cons (test-code-function short generic) :generic))))))
+      ;; An unknown APPLY tail can instead supply an unproved required tuple.
+      (signals snowgrave:incomplete-domain (close-case "(apply #'keyword-call tail)")))
     (let* ((root (asdf:system-source-directory "snowgrave"))
            (source (merge-pathnames ".build/fresh-contracts.lisp" root))
            (metadata (merge-pathnames ".build/fresh-contracts.metadata" root)))
@@ -3088,7 +3104,19 @@
       (check (equal (first (getf invoke :required-domains)) (list :function-target generic)))
       (check (equal (getf pass :primary-return-domain) (list :function-target generic)))
       (check (equal flow (getf (snowgrave:unit-metadata unit) :ordinary-function-flow))))
-    (dolist (body '("(invoke (if x #'value 17) x)" "(funcall (if x #'value #'identity) x)"
+    ;; This complete finite target set needs no arbitrary callable helper.
+    ;; Exercise both branches; an uncalled INVOKE must not cause rejection.
+    (let* ((mixed-forms (replace-entry-body forms "ENTRY"
+                         (read-from-string "(funcall (if (eql x 0) #'value #'identity) x)")))
+           (mixed (snowgrave:close-source-unit
+                   (list :forms mixed-forms) :unit-name '(known-generic-and-ordinary-targets)
+                   :closed-generics (list generic) :universe '(number)
+                   :entries (list entry) :external-domains (list (list entry '(number))))))
+      (dolist (form mixed-forms) (eval form))
+      (dolist (argument '(0 17 #c(2 3)))
+        (check (equal (multiple-value-list (funcall entry argument))
+                      (multiple-value-list (funcall (snowgrave:unit-function mixed entry) argument))))))
+    (dolist (body '("(invoke (if x #'value 17) x)"
                     "(let ((f #'value)) (locally (declare (special f)) (invoke f x)))"))
       (signals snowgrave:unclosed-call
         (snowgrave:close-source-unit
@@ -3653,7 +3681,39 @@
       (refused "(let ((function #'amount)) (multiple-value-bind (object function) (variable-primary r n) (funcall function object n)))")
       (refused "(multiple-value-call #'amount (variable-primary r n))")
       (refused "(multiple-value-call #'amount (boot n) (values n))")
-      (refused "(flet ((argument-pack (object number) (values number object))) (multiple-value-call #'amount (argument-pack r n)))")
+      ;; A complete lexical tuple proves the reversed argument order, including
+      ;; its ordinary MOP miss. Compare the condition, not just acceptance.
+      (let* ((entry (intern "LOCAL-REORDERED-MISS"))
+             (changed (append prefix
+                              (list `(defun ,entry (,(intern "R") ,(intern "N"))
+                                       ,(read-from-string
+                                         "(flet ((argument-pack (object number) (values number object))) (multiple-value-call #'amount (argument-pack r n)))")))))
+             (miss-unit (snowgrave:close-source-unit
+                         (list :forms changed) :unit-name '(local-multiple-value-reordered-miss)
+                         :closed-classes (list class) :closed-generics (list generic)
+                         :universe (list class 'number) :entries (list (intern "BOOT") entry)
+                         :external-domains (list (list (intern "BOOT") '(number))
+                                                 (list entry (list class 'number)))))
+             (miss-record (funcall (snowgrave:unit-function miss-unit (intern "BOOT")) 17)))
+        (unwind-protect
+             (progn
+               (dolist (form changed) (eval form))
+               (let ((native (make-instance class :payload 17))
+                     (closed-generic (test-code-function miss-unit generic)))
+                 (dolist (n '(3 -2))
+                   (let ((observation
+                           (contract-observation entry (list native n)
+                                                 (list (cons native :record)
+                                                       (cons (fdefinition generic) :amount)))))
+                     (check (eq (first observation) :condition))
+                     (check (eq (second observation) 'sb-pcl::no-applicable-method-error))
+                     (check (equal observation
+                                   (contract-observation
+                                    (snowgrave:unit-function miss-unit entry) (list miss-record n)
+                                    (list (cons miss-record :record)
+                                          (cons closed-generic :amount)))))))))
+          ;; Keep the original native fixture aligned with its artifact below.
+          (dolist (form forms) (eval form))))
       (refused "(multiple-value-call #'amount (unwind-protect (argument-pack r n) (setq r n)))")
       (refused "(multiple-value-bind (tag object function) (if (plusp n) (values :tag r #'amount) (values :tag r)) (declare (ignore tag)) (funcall function object n))")
       (refused "(multiple-value-bind (tag object) (if (plusp n) (values :tag r) (values :tag n :extra)) (declare (ignore tag)) (slot-value object 'payload))"))
@@ -3778,7 +3838,40 @@
                     :entries (list entry) :external-domains (list (list entry (list base 'number))))))))
       (refused "(multiple-value-call #'amount (vary r n))")
       (refused "(multiple-value-bind (object callback) (empty r) (funcall callback object n))")
-      (refused "(flet ((pack (x) (declare (ignore x)) (values :tag n #'amount))) (multiple-value-bind (tag object callback) (pack r) (declare (ignore tag)) (funcall callback object n)))")
+      ;; The lexical producer proves a numeric receiver, so invoking its
+      ;; returned callback has an ordinary no-applicable-method condition.
+      (let* ((entry (intern "LOCAL-PACK-NUMERIC-MISS"))
+             (changed (append prefix
+                              (list `(defun ,entry (,(intern "R") ,(intern "N"))
+                                       ,(read-from-string
+                                         "(flet ((pack (x) (declare (ignore x)) (values :tag n #'amount))) (multiple-value-bind (tag object callback) (pack r) (declare (ignore tag)) (funcall callback object n)))")))))
+             (miss-unit (snowgrave:close-source-unit
+                         (list :forms changed) :unit-name '(local-generic-value-numeric-miss)
+                         :closed-classes (list base leaf) :closed-generics generics
+                         :universe (list base leaf 'number)
+                         :entries (list (intern "BOOT-BASE") entry)
+                         :external-domains (list (list (intern "BOOT-BASE") '(number))
+                                                 (list entry (list base 'number)))))
+             (miss-record (funcall (test-unit-function miss-unit "BOOT-BASE") 17)))
+        (unwind-protect
+             (progn
+               (dolist (form changed) (eval form))
+               (let ((native (make-instance base :payload 17))
+                     (closed-generic (test-code-function miss-unit amount)))
+                 (dolist (n '(3 -2))
+                   (let ((observation
+                           (contract-observation entry (list native n)
+                                                 (list (cons native :record)
+                                                       (cons (fdefinition amount) :amount)))))
+                     (check (eq (first observation) :condition))
+                     (check (eq (second observation) 'sb-pcl::no-applicable-method-error))
+                     (check (equal observation
+                                   (contract-observation
+                                    (snowgrave:unit-function miss-unit entry) (list miss-record n)
+                                    (list (cons miss-record :record)
+                                          (cons closed-generic :amount)))))))))
+          ;; Preserve the original native fixture and fresh-artifact data.
+          (dolist (form forms) (eval form))))
       (refused "(multiple-value-bind (tag object callback) (bad r n) (declare (ignore tag)) (funcall callback object n))"
                (read-from-string "((defgeneric bad (r n)) (defmethod bad ((r base) (n number)) (if (plusp n) (values :tag r #'amount) (values :tag r))))"))
       (refused "(multiple-value-bind (tag object) (bad r n) (declare (ignore tag)) (slot-value object 'payload))"
@@ -4226,12 +4319,19 @@
     (external-result-tests)
     (external-value-guard-tests)
     (fixed-generic-call-tests)
+    (generic-required-domain-tests)
     (typed-slot-tests)
     (closed-reference-slot-tests)
     (layout-matching-tests)
     (sequence-fill-tests)
     (sequence-coerce-tests)
-  (native-materialization-tests)
+    (native-aggregate-result-tests)
+    (immediate-callee-tests)
+    (selected-method-root-tests)
+    (indirect-result-owner-tests)
+    (lambda-opaque-input-tests)
+    (local-function-flow-tests)
+    (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)
     (lambda-grammar-tests)

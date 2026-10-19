@@ -18,8 +18,15 @@
 (defvar *fixed-effective-arguments* nil)
 (defvar *collect-function-flow* nil)
 (defvar *function-flow-changed* nil)
-(defvar *immediate-function-reference* nil)
+;; Unknown inputs for otherwise uncalled selected method roots enter only
+;; after the ordinary caller fixed point has quiesced.
+(defvar *settled-method-roots* nil)
+;; The value-producing expression of one enclosing audited indirect callee.
+;; Propagate by syntactic position, never by collecting shared FUNCTION nodes.
+(defvar *immediate-callee-value* nil)
 (defvar *value-domain-local-functions* nil)
+(defvar *local-function-frames* nil)
+(defvar *local-function-scope-cache* nil)
 (defvar *declared-specials* nil)
 (defvar *mutable-invariant-bindings* nil)
 (defvar *tagbody-targets* nil)
@@ -483,7 +490,7 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
   ;; contract follows the actual finite callee, independent of call syntax.
   '(gethash remhash make-hash-table mapcar mapc maplist mapcan reduce remove-if
     delete-if sort stable-sort member assoc find position count remove delete
-    format princ prin1 print fill coerce))
+    format princ prin1 print fill coerce length))
 
 (defparameter *native-ordinary-functions*
   ;; Restricted compiler/runtime boundary. SYS provenance alone would also
@@ -496,6 +503,12 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
                              ;; audited built-in sequences via ordinary REPLACE.
                              replace sb-kernel:vector-to-list sb-int:%simple-error
                              sb-kernel:with-simple-condition-restarts
+                             ;; Constant negative ASH selects the checked
+                             ;; integer/bignum shift leaf (numbers.lisp).
+                             sb-kernel:ash-right
+                             ;; Materialized integer bitwise operations use
+                             ;; these checked two-argument specializations.
+                             sb-kernel:two-arg-and sb-kernel:two-arg-ior sb-kernel:two-arg-xor
                              sb-kernel:%member-eq
                              ;; Actual SBCL list/sequence specialization helpers
                              ;; for the audited ordinary operators. Their host
@@ -778,46 +791,131 @@ The stable key names its owner obligation, never a class or slot type."
     (cond ((some (lambda (sequence) (record-sequence-form-p build sequence)) data) :identity)
           ((every (lambda (sequence) (native-data-form-p build sequence)) data) :native))))
 
-(defun validate-callback (build reference arity local open
-                          &key (data nil data-p) equalp-realization)
-  (let* ((literal (cond ((and (consp reference) (eq (car reference) 'function)) (cadr reference))
-                        ((and (consp reference) (eq (car reference) 'lambda)) reference)
-                        ((and (consp reference) (eq (car reference) 'load-time-value)) (function-expression-target reference))
-                        ((symbolp reference) (resolved-function build reference))))
-         (names (or (known-function-targets build reference)
-                    (when (and literal (not (eq literal :unknown))) (list literal)))))
-    (when (special-variable-p build reference)
-      (fail build 'snowgrave:unclosed-call :mutable-callback-special
-            "The higher-order call cannot prove a mutable special's binding domain."))
-    ;; A helper's returned callback may be pending during the shared fixed
-    ;; point. The final emission must prove every target; inference itself
-    ;; only walks the reference to collect its actual helper inputs/returns.
-    (unless (or open names *collect-function-flow*)
-      (fail build 'snowgrave:unclosed-call :callback-target
-            "A higher-order operation needs a checked capture or complete finite named callback domain."))
-    (dolist (name names)
-     (unless (or open (member-name name local))
-      (audit-external-identity build name data :variable-tail (not data-p))
-      (when (and (not *collect-function-flow*)
-                 (member-name name (getf (build-declaration build) :external-operations))
-                 (not (and data-p (every (lambda (argument) (native-data-form-p build argument)) data))))
-        (fail build 'snowgrave:unclosed-call :external-callback-representation
-              "An external callback needs native element/accumulator/keyword value proofs or an admitted logical ABI." :reachability))
-      (when (member-name name (getf (build-declaration build) :closed-generics))
-        (let ((roots (generic-domain-roots build name)))
-          (unless (and (>= arity (length roots)) (every (lambda (axis) (member t axis)) roots))
-            (fail build 'snowgrave:incomplete-domain :callback-argument-domain
-                  "A specialized higher-order callback needs sequence-element/reachability proof." :reachability))))
-      (when (and (not *collect-function-flow*) (eq name 'equalp) (build-classes build)
-                 (not equalp-realization))
-        (fail build 'snowgrave:unclosed-class-operation :equalp-callback
-              "Native EQUALP recursively observes lowered record structure; this callback needs an exact equality lowering."))
-      (when (member name *representation-sensitive-ordinary-operations*)
-        ;; The sequence data's native-tree proof also covers its elements;
-        ;; opaque element shapes do not become safe merely through a callback.
-        (audit-ordinary-operation build name data local open :variable-tail (not data-p)))))))
+(defun callback-required-count (build target)
+  (cond ((local-function-binding-p target)
+         (length (getf (lambda-contract build (second (local-function-binding-definition target))) :required)))
+        ((and (consp target) (eq (first target) 'lambda))
+         (length (getf (lambda-contract build (second target)) :required)))
+        ((ordinary-function-form build target)
+         (length (getf (lambda-contract build (third (ordinary-function-form build target))) :required)))
+        ((member-name target (getf (build-declaration build) :closed-generics))
+         (length (generic-domain-roots build target)))))
 
-(defun validate-keyword-callbacks (build tail local open &optional equalp-realization)
+(defun literal-callback-return-summary (build lambda arity origin feedback-p)
+  ;; Only this literal occurrence owns these definition-site captures. A
+  ;; lexical variable containing an anonymous function has no such identity
+  ;; proof and is rejected at the existing computed-callee boundary.
+  (let (domains summary)
+    (loop
+      (setf domains (call-lambda-domains build (second lambda)
+                                         (make-list arity :initial-element origin) nil :lexical t
+                                         :specials (body-special-domains (cddr lambda)))
+            summary (lambda-return-summary build (second lambda) domains (cddr lambda) :lexical t))
+      (unless (and feedback-p (not (eq origin :external-result))
+                   (external-result-domain-p (return-summary-primary summary)))
+        (return))
+      (setf origin :external-result))
+    (let* ((old (assoc lambda *immediate-lambda-domains*))
+           (merged (if old (mapcar (lambda (previous new) (merge-value-domains build previous new)) (cdr old) domains)
+                       domains)))
+      ;; Fresh alist cells leave enclosing capture identities untouched.
+      (setf *immediate-lambda-domains*
+            (acons lambda merged (remove lambda *immediate-lambda-domains* :key #'car))))
+    summary))
+
+(defun validate-callback (build reference arity local open
+                          &key (data nil data-p) equalp-realization feedback-p)
+  (multiple-value-bind (targets global-targets) (known-function-targets build reference)
+    (let* ((literal (cond ((and (consp reference) (eq (car reference) 'function))
+                          (function-expression-target reference))
+                         ((and (consp reference) (eq (car reference) 'lambda)) reference)
+                         ((and (consp reference) (eq (car reference) 'load-time-value)) (function-expression-target reference))
+                         ((symbolp reference) (resolved-function build reference))))
+           (names (or targets (when (and literal (not (eq literal :unknown))) (list literal))))
+           (origin (if (or (some (lambda (input) (external-result-domain-p (value-domain build input))) data)
+                           (and feedback-p
+                                (some (lambda (name)
+                                        (external-result-domain-p
+                                         (return-summary-primary
+                                          (cond ((local-function-binding-p name) (local-function-binding-summary name))
+                                                ((and (consp name) (eq (first name) 'lambda)) nil)
+                                                (t (source-call-return-summary build name global-targets)))))) names)))
+                       :external-result :unknown))
+           (arguments (loop repeat arity collect (gensym "CALLBACK-ARGUMENT")))
+           (*argument-domains* (append (mapcar (lambda (argument) (cons argument origin)) arguments) *argument-domains*))
+           (summary :pending))
+      (when (special-variable-p build reference)
+        (fail build 'snowgrave:unclosed-call :mutable-callback-special
+              "The higher-order call cannot prove a mutable special's binding domain."))
+      (unless (or open names *collect-function-flow*)
+        (fail build 'snowgrave:unclosed-call :callback-target
+              "A higher-order operation needs a checked capture or complete finite named callback domain."))
+      (dolist (name names)
+        (let* ((literal-lambda-p (and (consp name) (eq (first name) 'lambda)))
+               (required (unless open (callback-required-count build name)))
+               (unreachable-p (and required (< arity required)))
+               (literal-summary nil))
+        (unless (or open unreachable-p)
+          (cond
+            (literal-lambda-p
+             (setf literal-summary (literal-callback-return-summary build name arity origin feedback-p)))
+            ((local-function-binding-p name)
+             (let* ((definition (local-function-binding-definition name))
+                    (domains (call-in-local-function-environment
+                              build (local-function-binding-frame name) t
+                              (lambda ()
+                                (call-lambda-domains build (second definition)
+                                                     (make-list arity :initial-element origin) nil :lexical t
+                                                     :specials (body-special-domains (cddr definition)))))))
+               (record-local-function-inputs build name domains)))
+            (t
+             ;; Actual callback origins use the same lambda/GF caller owner
+             ;; as an ordinary call. A FUNCTION capture alone says nothing
+             ;; about elements returned by an imported sequence or KEY.
+             (when (member-name name (getf (build-declaration build) :closed-generics))
+               (let ((roots (generic-domain-roots build name)))
+                 (unless (and (>= arity (length roots)) (every (lambda (axis) (member t axis)) roots))
+                   (fail build 'snowgrave:incomplete-domain :callback-argument-domain
+                         "A specialized higher-order callback needs sequence-element/reachability proof.")))
+               (audit-generic-call build name arguments))
+             (audit-function-call build name arguments)))
+          (setf summary
+                (merge-return-summaries
+                 build summary
+                 (or literal-summary
+                     (if (local-function-binding-p name) (local-function-binding-summary name)
+                         (source-call-return-summary build name global-targets))
+                     (make-return-summary (list (if (eq origin :external-result) :external-result :unknown)) nil)))))
+        (unless (or open unreachable-p literal-lambda-p (local-function-binding-p name)
+                    (and (member-name name local) (not (member-name name global-targets))))
+          (audit-external-identity build name data :variable-tail (not data-p))
+          (when (and (not *collect-function-flow*)
+                     (member-name name (getf (build-declaration build) :external-operations))
+                     (not (and data-p (every (lambda (argument) (native-data-form-p build argument)) data))))
+            (fail build 'snowgrave:unclosed-call :external-callback-representation
+                  "An external callback needs native element/accumulator/keyword value proofs or an admitted logical ABI." :reachability))
+          (when (and (not *collect-function-flow*) (eq name 'equalp) (build-classes build)
+                     (not equalp-realization))
+            (fail build 'snowgrave:unclosed-class-operation :equalp-callback
+                  "Native EQUALP recursively observes lowered record structure; this callback needs an exact equality lowering."))
+          (when (member name *representation-sensitive-ordinary-operations*)
+            (audit-ordinary-operation build name data local open :variable-tail (not data-p))))))
+      summary)))
+
+(defun keyword-callback-key-data (build tail data local open)
+  "Extend existing callback inputs with the first effective KEY return fact."
+  (unless (and (snowgrave::source-finite-list-p tail) (evenp (length tail))
+               (loop for rest on tail by #'cddr always (keywordp (first rest))))
+    (fail build 'snowgrave:unclosed-call :callback-target
+          "Callback keywords need literal names and a finite ordered argument shape."))
+  (let ((reference (getf tail :key)))
+    (if (or open (null reference)) (values data nil)
+        (let* ((summary (validate-callback build reference 1 local open :data data))
+               (variable (gensym "KEY-RESULT")))
+          (values (append data (list variable))
+                  (list (cons variable (return-summary-primary summary))))))))
+
+(defun validate-keyword-callbacks (build tail local open &optional equalp-realization &key data)
   (unless (and (evenp (length tail))
                (loop for rest on tail by #'cddr always (keywordp (car rest))))
     (fail build 'snowgrave:unclosed-call :callback-target
@@ -827,11 +925,14 @@ The stable key names its owner obligation, never a class or slot type."
              (loop for rest on tail by #'cddr thereis (eq (car rest) :test-not)))
     (fail build 'snowgrave:unclosed-call :conflicting-equality-tests
           "Simultaneous TEST and TEST-NOT need the ordinary operator's exact error contract."))
-  (loop with seen = nil
+  (multiple-value-bind (key-data domains) (keyword-callback-key-data build tail data local open)
+   (let ((*argument-domains* (append domains *argument-domains*)))
+    (loop with seen = nil
         for rest on tail by #'cddr for index from 1 by 2
         when (member (car rest) '(:test :test-not :key))
           do (unless (and (eq (car rest) :key) (null (cadr rest)))
                (validate-callback build (cadr rest) (if (eq (car rest) :key) 1 2) local open
+                                  :data (if (eq (car rest) :key) data key-data)
                                   :equalp-realization (and (not (eq (car rest) :key)) equalp-realization)))
         when (and (not (member (car rest) seen))
                   (member (car rest) '(:test :test-not))
@@ -839,7 +940,7 @@ The stable key names its owner obligation, never a class or slot type."
                   (member 'equalp (known-function-targets build (cadr rest))))
           collect index
         when (member (car rest) '(:test :test-not))
-          do (pushnew (car rest) seen)))
+          do (pushnew (car rest) seen)))))
 
 (defun coerce-sequence-target-p (type)
   "Finite built-in sequence type syntax, without user DEFTYPE or MOP queries."
@@ -868,18 +969,33 @@ The stable key names its owner obligation, never a class or slot type."
                     ((and constantp (coerce-sequence-target-p target)) target)
                     (t :unknown)) t))))
 
-(defun ordinary-call-argument-plan (build form)
+(defun native-sequence-result-domain (build input)
+  ;; Sequence shape says nothing about element representation. Filtering may
+  ;; turn a CONS into NIL; retain only the sequence family, and opaque origin.
+  (let ((domain (value-domain build input)))
+    (cond ((external-result-domain-p domain) :external-result)
+          ((eq domain :pending) :pending)
+          ((subtype-domain-p build domain 'list) 'list)
+          ((subtype-domain-p build domain 'string) 'string)
+          ((subtype-domain-p build domain 'vector) 'vector)
+          (t :unknown))))
+
+(defun ordinary-call-argument-plan (build form &key required-count)
   "Use the existing ordered producer owner for every MVC tuple."
   (case (car form)
     (funcall (values (cddr form) nil t))
     (apply
      (let ((tail (car (last form))))
-       (cond ((and (consp tail) (eq (car tail) 'list))
+       (cond ((null tail) (values (butlast (cddr form)) nil t))
+             ((and (consp tail) (eq (car tail) 'list))
               (values (append (butlast (cddr form)) (cdr tail)) nil t))
              ((and (consp tail) (eq (car tail) 'quote)
                    (snowgrave::source-finite-list-p (second tail)))
               (values (append (butlast (cddr form))
-                              (mapcar (lambda (value) (list 'quote value)) (second tail))) nil t)))))
+                              (mapcar (lambda (value) (list 'quote value)) (second tail))) nil t))
+             ((and required-count (>= (length (butlast (cddr form))) required-count))
+              (values (butlast (cddr form)) nil t
+                      (if (external-result-domain-p (value-domain build tail)) :external-result t))))))
     (multiple-value-call
      (multiple-value-bind (arguments bindings domains completep)
          (multiple-value-call-plan build (cddr form) :literal-proofs nil)
@@ -888,13 +1004,13 @@ The stable key names its owner obligation, never a class or slot type."
 
 (defun asserted-sequence-expression (build source expression)
   ;; Export the already proved native shape to the host compiler. Without it
-  ;; COERCE may leave an unreachable extended-sequence/MOP branch in code.
+  ;; COERCE/LENGTH may leave an unreachable extended-sequence/MOP branch in code.
   (let ((domain (value-domain build source)))
     `(the ,(cond ((subtype-domain-p build domain 'list) 'list)
                  ((subtype-domain-p build domain 'vector) 'vector)
                  (t '(or list vector))) ,expression)))
 
-(defun coerce-indirect-arguments (build form transformed)
+(defun native-sequence-indirect-arguments (build form transformed)
   "Annotate only the actual first argument; retain call/value producer order."
   (multiple-value-bind (arguments domains completep) (ordinary-call-argument-plan build form)
     (if (not completep) transformed
@@ -917,18 +1033,70 @@ The stable key names its owner obligation, never a class or slot type."
                                            (cddr producer))) producer)) transformed)))
             (otherwise transformed))))))
 
-(defun ordinary-indirect-result-domain (build form)
+(defun ordinary-scalar-result-domain (build name &optional global-targets)
+  ;; Facts about successful standard calls, not argument assertions or a way
+  ;; to skip their source/callback/residual audits. LENGTH's native receiver
+  ;; proof belongs to audit-ordinary-operation.
+  (let ((domain (case name ((ash logand logior logxor lognot) 'integer)
+                           (plusp 'boolean) (length '(integer 0 *)))))
+    (when (and domain (standard-operation-meaning-p build name nil global-targets)) domain)))
+
+(defun ordinary-indirect-result-domain (build form targets global-targets)
   (when (member (car form) '(funcall apply multiple-value-call))
-    (let ((targets (known-function-targets build (second form))))
-      (when (and targets (every (lambda (target) (member target '(fill coerce))) targets))
-        (multiple-value-bind (arguments domains completep) (ordinary-call-argument-plan build form)
-          (when completep
-            (let ((*argument-domains* (append domains *argument-domains*)))
-             (values (reduce (lambda (old target)
-                              (merge-value-domains build old
-                                (if (eq target 'coerce) (coerce-result-domain build arguments)
-                                    (value-domain build (first arguments)))))
-                            targets :initial-value :pending) t))))))))
+    (when (and targets
+               (every (lambda (target)
+                        (or (and (member target '(fill coerce mapc reverse remove delete mapcar maplist mapcan reduce))
+                                 (standard-operation-meaning-p build target nil global-targets))
+                            (ordinary-scalar-result-domain build target global-targets))) targets))
+      (multiple-value-bind (arguments domains completep) (ordinary-call-argument-plan build form)
+        (when completep
+          (let ((*argument-domains* (append domains *argument-domains*)))
+            (values (reduce (lambda (old target)
+                             (merge-value-domains build old
+                               (case target
+                                 (coerce (coerce-result-domain build arguments))
+                                 (fill (value-domain build (first arguments)))
+                                 (mapc (value-domain build (second arguments)))
+                                 (reverse (native-sequence-result-domain build (first arguments)))
+                                 ((remove delete) (native-sequence-result-domain build (second arguments)))
+                                 ((mapcar maplist mapcan reduce) (callback-operator-result-domain build target arguments))
+                                 (otherwise (ordinary-scalar-result-domain build target global-targets)))))
+                           targets :initial-value :pending) t)))))))
+
+(defun callback-operator-result-domain (build name arguments)
+  "Compose callback results through the existing return and input fixed point."
+  (let* ((reference (first arguments))
+         (data (rest arguments))
+         (arity (if (eq name 'reduce) 2 (length data))))
+    (multiple-value-bind (callback-data domains)
+        (if (eq name 'reduce)
+            (keyword-callback-key-data build (cddr arguments) data *value-domain-local-functions* nil)
+            (values data nil))
+      (let* ((*argument-domains* (append domains *argument-domains*))
+             (summary (validate-callback build reference arity *value-domain-local-functions* nil
+                                         :data callback-data :feedback-p (eq name 'reduce))))
+        (when (and (eq name 'reduce)
+                   (not (loop for tail on (cddr arguments) by #'cddr thereis (eq (first tail) :initial-value))))
+          (setf summary (merge-return-summaries
+                         build summary
+                         (validate-callback build reference 0 *value-domain-local-functions* nil
+                                            :data callback-data :feedback-p t))))
+        (let ((returned (return-summary-primary summary)))
+          (values
+           (cond
+             ;; REDUCE can also return an untouched initial value or a single
+             ;; keyed element. An imported origin on any such edge survives.
+             ((or (external-result-domain-p returned)
+                  (and (eq name 'reduce)
+                       (some (lambda (input) (external-result-domain-p (value-domain build input))) callback-data)))
+              :external-result)
+             ((eq returned :pending) :pending)
+             ((member name '(mapcar maplist)) 'list)
+             ;; MAPCAN's final NCONC argument can itself be an arbitrary
+             ;; object; do not invent proper-list shape from its operator.
+             ((eq name 'mapcan) (merge-value-domains build 'list returned))
+             (t :unknown))
+           t))))))
 
 (defun audit-ordinary-operation (build name arguments local open &key variable-tail)
   "Apply one logical observation/callback policy to direct and indirect calls."
@@ -945,6 +1113,13 @@ The stable key names its owner obligation, never a class or slot type."
       (unless (or open *collect-function-flow* (native-sequence-form-p build (first arguments)))
         (fail build 'snowgrave:unclosed-call :coerce-sequence-domain
               "COERCE needs an ordinary LIST/VECTOR input proof; extended sequence methods are not an intrinsic.")))
+    (when (and (eq name 'length) (not open))
+      (unless (and (not variable-tail) (= (length arguments) 1))
+        (fail build 'snowgrave:unclosed-call :length-arguments
+              "LENGTH needs a complete one-argument tuple."))
+      (unless (or *collect-function-flow* (native-sequence-form-p build (first arguments)))
+        (fail build 'snowgrave:unclosed-call :length-sequence-domain
+              "LENGTH needs an ordinary LIST/VECTOR input proof; extended sequence methods are not an intrinsic.")))
     (when (and (eq name 'fill) (not open))
       ;; FILL is an ordinary aggregate write with the same alias/state
       ;; obligation as its element setter. This synthetic place is proof
@@ -983,12 +1158,21 @@ The stable key names its owner obligation, never a class or slot type."
                       (cons (first arguments) (cddr arguments)) (cdr arguments))))
         ;; A known prefix cannot prove omitted sequences/elements native. The
         ;; count is only the proved lower bound; do not forge a full data tuple.
-        (let ((realization (and (not open)
-                                (member 'equalp (known-function-targets build reference))
-                                (mapping-equality-realization build name data variable-tail))))
-          (if variable-tail (validate-callback build reference arity local open)
-              (validate-callback build reference arity local open :data data :equalp-realization realization))
-          (when (eq realization :identity) (push 0 equality-positions)))))
+        (multiple-value-bind (callback-data domains)
+            (if (and (not variable-tail) (member name '(reduce remove-if delete-if sort stable-sort)))
+                (keyword-callback-key-data build (cddr arguments) data local open)
+                (values data nil))
+          (let ((*argument-domains* (append domains *argument-domains*))
+                (realization (and (not open)
+                                  (member 'equalp (known-function-targets build reference))
+                                  (mapping-equality-realization build name data variable-tail))))
+            (if variable-tail (validate-callback build reference arity local open)
+                (validate-callback build reference arity local open :data callback-data :equalp-realization realization
+                                   :feedback-p (eq name 'reduce)))
+            (when (and (eq name 'reduce) (not variable-tail)
+                       (not (loop for tail on (cddr arguments) by #'cddr thereis (eq (first tail) :initial-value))))
+              (validate-callback build reference 0 local open :data callback-data :feedback-p t))
+            (when (eq realization :identity) (push 0 equality-positions))))))
     (when (member name '(member assoc find position count remove delete remove-if delete-if reduce sort stable-sort))
       ;; These calls can carry a callback in an omitted keyword tail. Ordinary
       ;; positional syntax must not be mistaken for proof of that tail's ABI.
@@ -1012,7 +1196,10 @@ The stable key names its owner obligation, never a class or slot type."
         (setf equality-positions
               (append equality-positions
                       (mapcar (lambda (index) (+ 2 index))
-                              (validate-keyword-callbacks build (cddr arguments) local open realization))))))
+                              (validate-keyword-callbacks build (cddr arguments) local open realization
+                                                          :data (if (member name '(sort stable-sort)) (list (first arguments))
+                                                                    (if (member name '(remove-if delete-if reduce))
+                                                                        (list (second arguments)) (subseq arguments 0 (min 2 (length arguments)))))))))))
     (when (and (not open) (not *collect-function-flow*) (member name '(format princ prin1 print)))
       (unless (and (not variable-tail)
                    (every (lambda (argument) (native-data-form-p build argument))
@@ -1074,42 +1261,71 @@ The stable key names its owner obligation, never a class or slot type."
   (when (and (consp domain) (eq (car domain) :function-target)) (second domain)))
 
 (defun known-function-target (build form)
+  "Syntax/binding fallback only; this result never proves a global owner."
   (cond ((symbolp form) (resolved-function build form))
         ((and (consp form) (eq (car form) 'lambda)) form)
-        ((and (consp form) (eq (car form) 'function)) (second form))
-        ((and (consp form) (eq (car form) 'load-time-value)) (known-function-target build (second form)))
-        (t (or (domain-function-target (value-domain build form)) :unknown))))
-
-(defun immediate-function-reference (form)
-  ;; Only this literal occurrence is consumed by the enclosing indirect call.
-  ;; Other captures in a computed function expression may escape independently.
-  (loop while (and (consp form) (eq (car form) 'load-time-value))
-        do (setf form (cadr form)))
-  (when (and (consp form) (eq (car form) 'function)) form))
+        ((and (consp form) (eq (car form) 'function))
+         (if (and (consp (second form)) (eq (caadr form) 'lambda)) (second form)
+             (function-expression-target form)))
+        ((and (consp form) (eq (car form) 'load-time-value))
+         (let ((*argument-domains* nil) (*function-bindings* nil)
+               (*declared-specials* nil) (*value-domain-local-functions* nil) (*local-function-frames* nil)
+               (*immediate-lambda-domains* nil))
+           (known-function-target build (second form))))
+        (t :unknown)))
 
 (defun immediate-lambda-form (build call)
-  ;; Only this literal FUNCALL occurrence establishes its binding tuple. An
-  ;; escaping lambda or a separately stored/called closure gets no such fact.
-  (when (eq (car call) 'funcall)
+  (declare (ignore build))
+  ;; Only this syntactic occurrence owns the lambda's definition environment.
+  ;; A separately saved anonymous closure has no such capture proof.
+  (when (member (car call) '(funcall apply multiple-value-call))
     (let ((callee (second call)))
       (when (and (consp callee) (eq (car callee) 'function)) (setf callee (second callee)))
-      (when (and (consp callee) (eq (car callee) 'lambda))
-        (let ((contract (lambda-contract build (second callee))))
-          (unless (or (getf contract :optional) (getf contract :keyp) (getf contract :rest))
-            callee))))))
+      (when (and (consp callee) (eq (car callee) 'lambda)) callee))))
+
+(defun immediate-lambda-call-domains (build call)
+  "Project the actual call tuple through the existing lambda binding owner."
+  (let* ((lambda (immediate-lambda-form build call))
+         (contract (lambda-contract build (second lambda))))
+    (multiple-value-bind (arguments bindings completep variable-tail)
+        (ordinary-call-argument-plan build call :required-count (length (getf contract :required)))
+      (unless completep
+        (unless *collect-function-flow*
+          (fail build 'snowgrave:incomplete-domain :immediate-lambda-arguments
+                "A literal lambda call needs a complete producer tuple or a proved APPLY prefix." :reachability))
+        (return-from immediate-lambda-call-domains (values nil nil)))
+      (let ((*argument-domains* (append bindings *argument-domains*)))
+        (values (call-lambda-domains
+                 build (second lambda)
+                 (mapcar (lambda (argument) (value-domain build argument)) arguments)
+                 variable-tail :lexical t :specials (body-special-domains (cddr lambda)))
+                t)))))
+
+(defun immediate-lambda-return-summary (build call)
+  (multiple-value-bind (domains completep) (immediate-lambda-call-domains build call)
+    (if completep
+        (let ((lambda (immediate-lambda-form build call)))
+          (lambda-return-summary build (second lambda) domains (cddr lambda) :lexical t))
+        :pending)))
 
 (defun known-function-targets (build form)
-  "Return a complete finite target set, or NIL when any alternative is unknown."
-  (let ((target (known-function-target build form)))
-    (if (and target (not (eq target :unknown))) (list target)
-        (unless (and (symbolp form) (special-variable-p build form))
-          (let ((alternatives (domain-alternatives (value-domain build form))))
-            (when (every #'domain-function-target alternatives)
-              (remove-duplicates (mapcar #'domain-function-target alternatives) :test #'name=)))))))
+  "Return finite targets, qualified global targets, and the one analysed domain.
+A literal lexical FUNCTION may name a target without proving a global owner."
+  (let* ((domain (value-domain build form))
+         (alternatives (domain-alternatives domain)))
+    (if (every #'domain-function-target alternatives)
+        (let ((targets (remove-duplicates (mapcar #'domain-function-target alternatives) :test #'name=)))
+          (values targets targets domain))
+        (let ((target (known-function-target build form)))
+          (values (when (and target (not (eq target :unknown))) (list target)) nil domain)))))
 
 (defun function-expression-target (form)
-  (when (and (consp form) (eq (car form) 'load-time-value)) (setf form (cadr form)))
-  (if (and (consp form) (eq (car form) 'function)) (cadr form) :unknown))
+  (cond ((and (consp form) (eq (car form) 'load-time-value))
+         (let ((*local-function-frames* nil)) (function-expression-target (second form))))
+        ((and (consp form) (eq (car form) 'function))
+         (if (and (consp (second form)) (eq (caadr form) 'lambda)) :unknown
+             (or (find-local-function-binding (second form)) (second form))))
+        (t :unknown)))
 
 (defun analyze-let-scope (build bindings sequential-p process &key open specials)
   ;; The portable owner controls initializer order. Every adapter analysis
@@ -1189,8 +1405,8 @@ can never hide a captured write or a write reached by a backedge."
 (defun source-body-flow-facts (build body)
   "Invalidate assigned lexical value/callee facts before every body analysis.
 NUMBER/LIST are optional precision improvements, proved jointly against all
-writes under widened bindings. Failure widens to UNKNOWN, never rejects SETQ
-by itself. Existing consumers still demand their own representation/call proof."
+writes under widened bindings. Shape failure widens to UNKNOWN while opaque
+origin always survives; this analysis never rejects SETQ by itself. Existing consumers still demand their own representation/call proof."
   (let* ((specials (body-special-domains body))
          (domains (append specials (copy-tree *argument-domains*)))
          (functions (append specials (copy-list *function-bindings*)))
@@ -1202,7 +1418,8 @@ by itself. Existing consumers still demand their own representation/call proof."
       (let ((fact (assoc name domains)))
         (when (and fact (not (or (assoc name specials) (special-variable-p build name))))
           (let* ((previous (binding-value-domain name))
-                 (domain (cond ((or (member name numeric) (subtype-domain-p build previous 'number)) 'number)
+                 (domain (cond ((external-result-domain-p previous) :external-result)
+                               ((or (member name numeric) (subtype-domain-p build previous 'number)) 'number)
                                ((subtype-domain-p build previous 'list) 'list)
                                (t :unknown)))
                  (binding (assoc name functions)))
@@ -1216,19 +1433,25 @@ by itself. Existing consumers still demand their own representation/call proof."
               (push candidate candidates) (push candidate invariants))))))
     (let ((*argument-domains* domains) (*function-bindings* functions)
           (*mutable-invariant-bindings* invariants))
-      ;; At most one widening per candidate. Recheck dependencies after any
-      ;; loss of precision; no assignment may borrow a failed neighbor's fact.
+      ;; Native shape can widen to UNKNOWN, then to a may-opaque envelope.
+      ;; Recheck every dependency after either widening; opacity never falls
+      ;; back to UNKNOWN merely because its shape invariant failed.
       (loop with changed = nil do
         (setf changed nil)
         (dolist (candidate candidates)
-          (when (and (not (eq (third candidate) :unknown))
-                     (not (every (lambda (write)
-                                   (or (not (eq (car write) (first candidate)))
-                                       (subtype-domain-p build (value-domain build (cdr write))
-                                                         (third candidate)))) writes)))
-            (setf (third candidate) :unknown
-                  (cdr (assoc (first candidate) domains)) :unknown
-                  changed t)))
+          (let* ((old (third candidate))
+                 (inputs (loop for write in writes when (eq (car write) (first candidate))
+                               collect (value-domain build (cdr write))))
+                 (domain (cond ((or (external-result-domain-p old) (some #'external-result-domain-p inputs))
+                                :external-result)
+                               ((or (eq old :unknown)
+                                    (not (every (lambda (input) (subtype-domain-p build input old)) inputs)))
+                                :unknown)
+                               (t old))))
+            (unless (equal old domain)
+              (setf (third candidate) domain
+                    (cdr (assoc (first candidate) domains)) domain
+                    changed t))))
         (unless changed (return))))
     (values domains functions invariants (mapcar #'car specials))))
 
@@ -1289,7 +1512,10 @@ by itself. Existing consumers still demand their own representation/call proof."
 (defun lambda-return-summary (build lambda-list domains body &key method lexical)
   ;; Methods and ordinary helpers share the same binding/escape analysis.
   (let ((*argument-domains* (when lexical *argument-domains*))
-        (*function-bindings* (when lexical *function-bindings*)))
+        (*function-bindings* (when lexical *function-bindings*))
+        (*value-domain-local-functions* (when lexical *value-domain-local-functions*))
+        (*local-function-frames* (when lexical *local-function-frames*))
+        (*immediate-lambda-domains* (when lexical *immediate-lambda-domains*)))
     (multiple-value-bind (scope ordinary initializers)
         (analyze-lambda-scope build lambda-list domains :method method :returns #'form-return-summary
                              :specials (body-special-domains body))
@@ -1299,9 +1525,223 @@ by itself. Existing consumers still demand their own representation/call proof."
                 (mapcan #'identity initializers)
                 :initial-value (ordinary-return-summary build body))))))
 
-(defun source-call-return-summary (build name)
+;; These cold cells belong to one lexical source scope. They may occur in the
+;; existing FUNCTION-BINDINGS alist, never in persistent value-domain facts or
+;; emitted code. A saved local capture therefore retains its actual binder.
+(defstruct local-function-binding name definition frame domains reachedp (summary :pending))
+(defstruct local-function-frame
+  form bindings outer-frames outer-functions arguments functions specials invariants
+  method tags lambda-domains source-key solvingp changedp (version 0))
+
+(defun find-local-function-binding (name)
+  (loop for frame in *local-function-frames*
+        for binding = (find name (local-function-frame-bindings frame)
+                            :key #'local-function-binding-name :test #'name=)
+        when binding return binding))
+
+(defun call-in-local-function-environment (build frame definitionsp process)
+  (let* ((group-p (or (not definitionsp) (eq (car (local-function-frame-form frame)) 'labels)))
+         (*local-function-frames* (if group-p (cons frame (local-function-frame-outer-frames frame))
+                                     (local-function-frame-outer-frames frame)))
+         (*value-domain-local-functions*
+           (if group-p (append (mapcar #'local-function-binding-name (local-function-frame-bindings frame))
+                               (local-function-frame-outer-functions frame))
+               (local-function-frame-outer-functions frame)))
+         (*argument-domains* (local-function-frame-arguments frame))
+         (*function-bindings* (local-function-frame-functions frame))
+         (*declared-specials* (local-function-frame-specials frame))
+         (*mutable-invariant-bindings* (local-function-frame-invariants frame))
+         (*current-method* (local-function-frame-method frame))
+         (*tagbody-targets* (local-function-frame-tags frame))
+         (*immediate-lambda-domains* (local-function-frame-lambda-domains frame)))
+    (with-build-source-key (build (local-function-frame-source-key frame))
+      (funcall process))))
+
+(defun flow-domain-covered-p (build actual expected)
+  ;; Opacity is an origin envelope joined with UNKNOWN, not a native class.
+  ;; A may-opaque profile covers clean inputs too; UNKNOWN cannot cover an
+  ;; actual import origin which its body proof would otherwise reinterpret.
+  (or (equal actual expected) (external-result-domain-p expected)
+      (and (not (external-result-domain-p actual))
+           (or (eq expected :unknown) (subtype-domain-p build actual expected)))))
+
+(defun record-local-function-inputs (build binding domains)
+  (let* ((frame (local-function-binding-frame binding))
+         (previous (local-function-binding-domains binding))
+         (reachedp (local-function-binding-reachedp binding)))
+    (if (local-function-frame-solvingp frame)
+        (let ((merged (if reachedp
+                          (mapcar (lambda (old new) (merge-value-domains build old new)) previous domains)
+                          domains)))
+          (unless (and reachedp (equal previous merged))
+            (setf (local-function-binding-domains binding) merged
+                  (local-function-binding-reachedp binding) t
+                  (local-function-frame-changedp frame) t)
+            (incf (local-function-frame-version frame))))
+        (unless (and reachedp
+                     (every (lambda (actual expected)
+                              (flow-domain-covered-p build actual expected)) domains previous))
+          (fail build 'snowgrave:incomplete-domain :local-function-call-domain
+                "A lexical call lacks its joined definition-site input proof." :reachability)))
+    (local-function-binding-summary binding)))
+
+(defun audit-local-function-capture (build binding)
+  (call-in-local-function-environment
+   build (local-function-binding-frame binding) t
+   (lambda ()
+     (let ((definition (local-function-binding-definition binding)))
+       (record-local-function-inputs
+        build binding (capture-lambda-domains build (second definition) :lexical t
+                                              :specials (body-special-domains (cddr definition))))))))
+
+(defun local-call-return-summary (build binding form)
+  ;; Summarize caller expressions before switching to the definition's scope.
+  ;; Defaults and AUX then see actual earlier parameters plus definition-site
+  ;; captures, never the variable shadowing at this particular call site.
+  (let* ((definition (local-function-binding-definition binding))
+         (contract (lambda-contract build (second definition))))
+    (multiple-value-bind (arguments bindings completep variable-tail)
+        (if (member (car form) '(funcall apply multiple-value-call))
+            (ordinary-call-argument-plan build form :required-count (length (getf contract :required)))
+            (values (cdr form) nil t nil))
+      (unless completep
+        (unless *collect-function-flow*
+          (fail build 'snowgrave:incomplete-domain :local-function-arguments
+                "A lexical call needs a complete producer tuple or a proved APPLY prefix." :reachability))
+        (return-from local-call-return-summary :pending))
+      (let* ((*argument-domains* (append bindings *argument-domains*))
+             (supplied (mapcar (lambda (argument) (value-domain build argument)) arguments)))
+        (when (< (length supplied) (length (getf contract :required)))
+          ;; The ordinary local lambda parser owns this runtime arity error.
+          ;; Retain its lexical definition even when no body tuple can run.
+          (record-local-function-inputs
+           build binding (make-list (length (lambda-input-variables contract)) :initial-element :unknown))
+          (return-from local-call-return-summary :pending))
+        (let ((domains
+                (call-in-local-function-environment
+                 build (local-function-binding-frame binding) t
+                 (lambda ()
+                   (call-lambda-domains build (second definition) supplied variable-tail
+                                        :lexical t :specials (body-special-domains (cddr definition)))))))
+          (record-local-function-inputs build binding domains))))))
+
+(defun solve-local-function-scope (build form process &key package open next original local)
+  "One scoped input/return fixed point serves all lexical-function walkers."
+  (let* ((frame (make-local-function-frame
+                 :form form :outer-frames *local-function-frames* :outer-functions *value-domain-local-functions*
+                 :arguments *argument-domains* :functions *function-bindings* :specials *declared-specials*
+                 :invariants *mutable-invariant-bindings* :method *current-method* :tags *tagbody-targets*
+                 :lambda-domains *immediate-lambda-domains* :source-key (build-source-key build)))
+         (generated (build-generated build)) (constructors (build-constructors build))
+         (method-names (build-method-names build)) (sequence (build-sequence build))
+         (dependencies (build-dependencies build))
+         (collecting-p *collect-function-flow*) (changed-p *function-flow-changed*))
+    (setf (local-function-frame-bindings frame)
+          (mapcar (lambda (definition)
+                    (make-local-function-binding :name (first definition) :definition definition :frame frame))
+                  (second form)))
+    (when open (setf (local-function-frame-solvingp frame) t))
+    (unless open
+      (unwind-protect
+           (let ((*collect-function-flow* t) (*function-flow-changed* nil))
+             (setf (local-function-frame-solvingp frame) t)
+             (loop
+               (setf (local-function-frame-changedp frame) nil
+                     (build-generated build) generated (build-constructors build) constructors
+                     (build-method-names build) method-names (build-sequence build) sequence
+                     (build-dependencies build) dependencies)
+               ;; The existing ordinary source walker discovers calls in tests,
+               ;; defaults, side effects and nested closures as well as returns.
+               (call-in-local-function-environment
+                build frame nil
+                (lambda ()
+                  (transform-body build (cddr form) (or package (build-output-package build))
+                                  :next next :original original :local *value-domain-local-functions*)))
+               (dolist (binding (local-function-frame-bindings frame))
+                 (when (local-function-binding-reachedp binding)
+                   (call-in-local-function-environment
+                    build frame t
+                    (lambda ()
+                      (let* ((definition (local-function-binding-definition binding))
+                             (domains (local-function-binding-domains binding))
+                             (body (cddr definition)))
+                        (multiple-value-bind (scope ordinary)
+                            (analyze-lambda-scope build (second definition) domains
+                                                 :package (or package (build-output-package build))
+                                                 :local *value-domain-local-functions* :next next :original original
+                                                 :specials (body-special-domains body))
+                          (declare (ignore ordinary))
+                          (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
+                            (transform-body build body (or package (build-output-package build))
+                                            :next next :original original :local *value-domain-local-functions*)))
+                        (let* ((previous (local-function-binding-summary binding))
+                               (additional (lambda-return-summary build (second definition) domains body :lexical t))
+                               (merged (merge-return-summaries build previous additional)))
+                          (unless (same-return-summary-p previous merged)
+                            (setf (local-function-binding-summary binding) merged
+                                  (local-function-frame-changedp frame) t)
+                            (incf (local-function-frame-version frame)))))))))
+               (unless (local-function-frame-changedp frame)
+                 ;; Global pending components must settle in their existing
+                 ;; outer fixed point first. Final replay widens pure local
+                 ;; cycles once, then propagates that conservative result.
+                 (when (not collecting-p)
+                   (dolist (binding (local-function-frame-bindings frame))
+                     (when (local-function-binding-reachedp binding)
+                       (let ((summary (local-function-binding-summary binding)))
+                         (when (or (eq summary :pending)
+                                   (member :pending (return-summary-domains summary)))
+                           (setf (local-function-binding-summary binding)
+                                 (if (eq summary :pending) (make-return-summary (list :unknown) nil)
+                                     (make-return-summary (substitute :unknown :pending (return-summary-domains summary))
+                                                          (return-summary-completep summary)))
+                                 (local-function-frame-changedp frame) t)
+                           (incf (local-function-frame-version frame)))))))
+                 (unless (local-function-frame-changedp frame) (return))))
+             (when (and (not collecting-p) *function-flow-changed*)
+               (fail build 'snowgrave:incomplete-domain :local-function-flow-replay
+                     "Final lexical replay introduced a caller absent from the shared outer fixed point." :reachability))
+             (setf changed-p (or changed-p *function-flow-changed*)))
+        (setf (local-function-frame-solvingp frame) nil
+              (build-generated build) generated (build-constructors build) constructors
+              (build-method-names build) method-names (build-sequence build) sequence
+              (build-dependencies build) dependencies
+              *function-flow-changed* changed-p)))
+    (call-in-local-function-environment build frame nil (lambda () (funcall process frame)))))
+
+(defun local-function-context-key (build)
+  ;; These are cold domain facts, not runtime lexical values. Preserve exact
+  ;; owner-cell versions and mutable binder identities across replay views.
+  (list (build-source-key build) (copy-tree *argument-domains*) (copy-tree *function-bindings*)
+        *value-domain-local-functions*
+        (mapcar (lambda (frame) (cons frame (local-function-frame-version frame))) *local-function-frames*)
+        *declared-specials* *current-method* *tagbody-targets* *immediate-lambda-domains*
+        (mapcar (lambda (fact) (list (first fact) (second fact) (third fact))) *mutable-invariant-bindings*)))
+
+(defun call-with-local-function-scope (build form process &rest options &key open &allow-other-keys)
+  ;; A memo belongs only to this lexical solve and its nested scopes. Source
+  ;; node identity is qualified by captured facts and visible frame versions;
+  ;; no table survives a root traversal or a global fixed-point iteration.
+  (let* ((open (or open (not (and (build-output-package build)
+                                 (build-function-domains build) (build-function-returns build)))))
+         ;; Open-source normalization may ask for a return view before the
+         ;; closed caller fixed point exists. It must not run a closed scratch
+         ;; emission or invent output names during that earlier phase.
+         (*local-function-scope-cache* (or *local-function-scope-cache* (make-hash-table :test #'eq)))
+         (key (local-function-context-key build))
+         (cached (unless (or open *mutable-invariant-bindings*)
+                   (assoc key (gethash form *local-function-scope-cache*) :test #'equal))))
+    (if cached
+        (call-in-local-function-environment build (second cached) nil (lambda () (funcall process (second cached))))
+        (apply #'solve-local-function-scope build form
+               (lambda (frame)
+                 (unless (or open *mutable-invariant-bindings*)
+                   (push (list key frame) (gethash form *local-function-scope-cache*)))
+                 (funcall process frame)) :open open options))))
+(defun source-call-return-summary (build name &optional global-targets)
   (when (and (build-function-returns build)
-             (not (member-name name *value-domain-local-functions*)))
+             (or (not (member-name name *value-domain-local-functions*))
+                 (member-name name global-targets)))
     (cond ((ordinary-function-form build name)
            (gethash name (build-function-returns build) :pending))
           ((member-name name (getf (build-declaration build) :closed-generics))
@@ -1311,15 +1751,58 @@ by itself. Existing consumers still demand their own representation/call proof."
              (if contract (make-return-summary (copy-tree (second contract)) t)
                  (make-return-summary (list :external-result) nil)))))))
 
+(defun indirect-call-opaque-input-p (build form callee-domain)
+  ;; The saved callee fact and actual inputs share one provenance owner.
+  ;; MVC consumes every producer value, including secondary values and the
+  ;; opaque domains of incomplete return tails, rather than only its primary.
+  (or (external-result-domain-p callee-domain)
+      (some (lambda (input)
+              (if (eq (car form) 'multiple-value-call)
+                  (let ((summary (form-return-summary build input)))
+                    (some #'external-result-domain-p
+                          (if (return-summary-p summary) (return-summary-domains summary) (list summary))))
+                  (external-result-domain-p (value-domain build input))))
+            (cddr form))))
+
+(defun indirect-call-return-summary (build form targets global-targets callee-domain)
+  "Compose source return contracts, retaining opaque inputs of unowned targets."
+  (let* ((summaries (mapcar (lambda (name)
+                              (if (local-function-binding-p name) (local-call-return-summary build name form)
+                                  (source-call-return-summary build name global-targets))) targets))
+         (unowned-p (or (null targets) (some #'null summaries)))
+         (fallback (when unowned-p
+                     (make-return-summary
+                      (list (if (indirect-call-opaque-input-p build form callee-domain)
+                                :external-result :unknown)) nil))))
+    ;; Known summaries already own returned input provenance. For any other
+    ;; target the fallback composes opaque inputs here, without walking the
+    ;; saved callee subtree again or treating UNKNOWN as native proof.
+    (if targets
+        (reduce (lambda (old summary) (merge-return-summaries build old (or summary fallback)))
+                summaries :initial-value :pending)
+        fallback)))
+
+(defun assignment-return-summary (build form)
+  (let* ((pair (last (cdr form) 2)) (place (first pair)) (value (second pair))
+         (setter (when (and (eq (first form) 'setf) (consp place)) (list 'setf (first place))))
+         (binding (when setter (find-local-function-binding setter))))
+    (cond ((null pair) (make-return-summary (list '(eql nil)) t))
+          (binding (local-call-return-summary build binding (list* setter value (cdr place))))
+          ((and setter (source-call-return-summary build setter)) (source-call-return-summary build setter))
+          (t (make-return-summary (list (value-domain build value)) t)))))
+
 (defun source-truth (build form)
   (let ((domain (value-domain build form)))
     (when (and (consp domain) (eq (car domain) 'eql))
       (if (null (cadr domain)) :false :true))))
 
-(defun standard-operation-meaning-p (build name &optional local)
-  (not (or (member-name name local) (member-name name *value-domain-local-functions*)
-           (member-name name (build-functions build))
-           (member-name name (getf (build-declaration build) :closed-generics)))))
+(defun standard-operation-meaning-p (build name &optional local global-targets)
+  (and (not (or (member-name name (build-functions build))
+                (member-name name (getf (build-declaration build) :closed-generics))))
+       (or (not (or (member-name name local) (member-name name *value-domain-local-functions*)))
+           ;; Reuse the callee's qualified value proof. Argument expressions
+           ;; retain their own lexical scope; no callee subtree is revisited.
+           (member-name name global-targets))))
 
 (defun predicate-refined-domains (build test truep &optional local)
   "Use only a positive actual class test on a stable lexical value.
@@ -1458,6 +1941,7 @@ Unknown/native operations retain only their existing primary fact."
     ((and *effective-return-proof* (return-summary-p form)) form)
     ((atom form) (make-return-summary (list (value-domain build form)) t))
     ((member (car form) '(quote function)) (make-return-summary (list (value-domain build form)) t))
+    ((member (car form) '(setq setf)) (assignment-return-summary build form))
     ((eq (car form) 'values)
      (unless (snowgrave::source-finite-list-p (cdr form))
        (fail build 'snowgrave:unsupported-definition :multiple-value-producer
@@ -1516,18 +2000,18 @@ Unknown/native operations retain only their existing primary fact."
      (with-destructuring-source-facts (build form)
        (body-return-summary build (cdddr form))))
     ((immediate-lambda-form build form)
-     (let ((lambda (immediate-lambda-form build form)))
-       (lambda-return-summary build (second lambda)
-                              (mapcar (lambda (argument) (value-domain build argument)) (cddr form))
-                              (cddr lambda) :lexical t)))
+     (immediate-lambda-return-summary build form))
+    ((member (car form) '(flet labels))
+     (call-with-local-function-scope
+      build form (lambda (frame) (declare (ignore frame)) (ordinary-return-summary build (cddr form)))))
+    ((find-local-function-binding (car form))
+     (local-call-return-summary build (find-local-function-binding (car form)) form))
     ((and (build-function-returns build) (member (car form) '(funcall apply multiple-value-call)))
-     (let ((targets (known-function-targets build (cadr form))))
-       (if targets
-           (reduce (lambda (old name)
-                     (merge-return-summaries build old
-                       (or (source-call-return-summary build name) (make-return-summary (list :unknown) nil))))
-                   targets :initial-value :pending)
-           (make-return-summary (list (value-domain build form)) nil))))
+     (multiple-value-bind (targets global-targets callee-domain) (known-function-targets build (second form))
+       (multiple-value-bind (ordinary precise-p)
+           (ordinary-indirect-result-domain build form targets global-targets)
+         (if precise-p (make-return-summary (list ordinary) nil)
+             (indirect-call-return-summary build form targets global-targets callee-domain)))))
     ((source-call-return-summary build (car form)) (source-call-return-summary build (car form)))
     (t (make-return-summary (list (value-domain build form)) nil))))
 
@@ -1591,10 +2075,12 @@ existing call audits. Literal VALUES keeps its stronger source-tree proofs."
                                (t variable)) arguments)))))
     (values (nreverse arguments) (nreverse bindings) domains t)))
 
-(defun indirect-argument-audit-p (build name local)
-  ;; A returned cohort GF retains its source identity inside a same-name FLET.
-  (or (member-name name (getf (build-declaration build) :closed-generics))
-      (and (not (member-name name local))
+(defun indirect-argument-audit-p (build name local global-targets)
+  ;; A global callable value retains its owner inside a same-name FLET.
+  ;; This decides the callee's audit, never the argument expressions' scope.
+  (or (local-function-binding-p name)
+      (member-name name (getf (build-declaration build) :closed-generics))
+      (and (or (not (member-name name local)) (member-name name global-targets))
            (or (ordinary-function-form build name)
                (member name '(eq eql equal equalp))
                (member name *representation-sensitive-ordinary-operations*)
@@ -1625,6 +2111,19 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
   (labels ((walk-body (body)
              (with-source-body-facts (body)
                (mapcan #'walk body)))
+           (walk-local-definition (frame binding)
+             (when (local-function-binding-reachedp binding)
+               (call-in-local-function-environment
+                build frame t
+                (lambda ()
+                  (let ((definition (local-function-binding-definition binding)))
+                    (multiple-value-bind (scope ordinary initializers)
+                        (analyze-lambda-scope
+                         build (second definition) (local-function-binding-domains binding)
+                         :returns describe :specials (body-special-domains (cddr definition)))
+                      (declare (ignore ordinary))
+                      (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
+                        (nconc (mapcan #'identity initializers) (walk-body (cddr definition))))))))))
            (walk (form)
              (cond
                ((atom form) nil)
@@ -1661,17 +2160,14 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                   (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
                     (nconc (mapcan #'second analyzed) (walk-body (cddr form))))))
                ((member (car form) '(flet labels))
-                (let ((*value-domain-local-functions*
-                        (append (mapcar #'car (cadr form)) *value-domain-local-functions*)))
-                  (nconc
-                   (mapcan (lambda (definition)
-                             (multiple-value-bind (scope ordinary initializers)
-                                 (analyze-lambda-scope build (cadr definition) nil :returns describe
-                                                       :specials (body-special-domains (cddr definition)))
-                               (declare (ignore ordinary))
-                               (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
-                                 (nconc (mapcan #'identity initializers) (walk-body (cddr definition)))))) (cadr form))
-                   (walk-body (cddr form)))))
+                (call-with-local-function-scope
+                 build form
+                 (lambda (frame)
+                   ;; MAPCAN consumes newly collected escape lists. The
+                   ;; frame's binding list is only its input, never a result.
+                   (nconc (mapcan (lambda (binding) (walk-local-definition frame binding))
+                                  (local-function-frame-bindings frame))
+                          (walk-body (cddr form))))))
                ((eq (car form) 'lambda)
                 (multiple-value-bind (scope ordinary initializers)
                     (analyze-lambda-scope build (cadr form) nil :returns describe
@@ -1738,6 +2234,8 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ((or (keywordp form) (eq form t) (null form)) (list 'eql form))
         ((symbolp form) (if (special-variable-p build form) :unknown
                            (binding-value-domain form)))
+        ((and (consp form) (member (car form) '(setq setf)))
+         (values (return-summary-primary (assignment-return-summary build form)) t))
         ((and (consp form) (member (car form) '(progn locally)))
          (body-value-domain build (cdr form)))
         ((and (consp form) (eq (car form) 'block))
@@ -1775,9 +2273,12 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ((and (consp form) (eq (car form) 'destructuring-bind))
          (with-destructuring-source-facts (build form) (body-value-domain build (cdddr form))))
         ((and (consp form) (member (car form) '(flet labels)))
-         (let ((*value-domain-local-functions*
-                 (append (mapcar #'car (cadr form)) *value-domain-local-functions*)))
-           (body-value-domain build (cddr form))))
+         (call-with-local-function-scope
+          build form (lambda (frame) (declare (ignore frame))
+                       (return-summary-primary (ordinary-return-summary build (cddr form))))))
+        ((and (consp form) (find-local-function-binding (car form)))
+         (values (return-summary-primary
+                  (local-call-return-summary build (find-local-function-binding (car form)) form)) t))
         ((and (consp form) (eq (car form) 'quote))
          (if (or (symbolp (cadr form)) (numberp (cadr form)) (characterp (cadr form)))
              (list 'eql (cadr form)) (type-of (cadr form))))
@@ -1789,7 +2290,8 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
              (list :function-target (second form)) :unknown))
         ((and (consp form) (eq (car form) 'load-time-value))
          (let ((*argument-domains* nil) (*function-bindings* nil)
-               (*declared-specials* nil) (*value-domain-local-functions* nil))
+               (*declared-specials* nil) (*value-domain-local-functions* nil) (*local-function-frames* nil)
+               (*immediate-lambda-domains* nil))
            (value-domain build (second form))))
         ((and (consp form) (standard-operation-meaning-p build (car form))
               (member (car form) '(typep integerp rationalp floatp realp complexp stringp characterp
@@ -1797,6 +2299,8 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                                   = /= < > <= >= eq eql equal equalp))) 'boolean)
         ((and (consp form) (standard-operation-meaning-p build (car form))
               (member (car form) '(+ - * / 1+ 1- max min abs mod rem))) 'number)
+        ((and (consp form) (ordinary-scalar-result-domain build (car form)))
+         (ordinary-scalar-result-domain build (car form)))
         ((and (consp form) (member (car form) '(list cons vector)))
          (values (if (some (lambda (part) (external-result-domain-p (value-domain build part))) (cdr form))
                      :external-result (if (eq (car form) 'vector) 'vector 'list)) t))
@@ -1821,16 +2325,22 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                          ((null (cdr inputs)) (car inputs))
                          ((some (lambda (prefix) (subtype-domain-p build prefix 'cons)) (butlast inputs)) 'cons)
                          (t (merge-value-domains build 'cons (car (last inputs))))) t)))
-        ((and (consp form) (eq (car form) 'reverse))
-         (let ((input (value-domain build (cadr form))))
-           (values (cond ((external-result-domain-p input) :external-result)
-                         ((subtype-domain-p build input 'list) 'list)
-                         ((subtype-domain-p build input 'string) 'string)
-                         ((subtype-domain-p build input 'vector) 'vector)
-                         (t :unknown)) t)))
+        ((and (consp form) (member (car form) '(reverse remove delete))
+              (standard-operation-meaning-p build (car form)))
+         (values (native-sequence-result-domain
+                  build (if (eq (car form) 'reverse) (second form) (third form))) t))
+        ((and (consp form) (build-function-returns build)
+              (member (car form) '(mapcar maplist mapcan reduce))
+              (standard-operation-meaning-p build (car form)))
+         (callback-operator-result-domain build (car form) (cdr form)))
         ((and (consp form) (eq (car form) 'coerce)
               (standard-operation-meaning-p build 'coerce))
          (coerce-result-domain build (cdr form)))
+        ((and (consp form) (eq (car form) 'mapc)
+              (standard-operation-meaning-p build 'mapc))
+         ;; MAPC returns the first input list itself, not its callback results.
+         ;; Preserve that object's origin; other input lists do not replace it.
+         (values (value-domain build (third form)) t))
         ((and (consp form) (eq (car form) 'fill)
               (standard-operation-meaning-p build 'fill))
          ;; FILL returns its original sequence by identity. The value and
@@ -1840,20 +2350,17 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
          (multiple-value-bind (class constantp) (quoted-value (cadr form))
            (if (and constantp (member-name class (build-classes build))) class :unknown)))
         ((and (consp form) (immediate-lambda-form build form))
-         (return-summary-primary (form-return-summary build form)))
+         (values (return-summary-primary (immediate-lambda-return-summary build form)) t))
         ((and (consp form) (member (car form) '(funcall apply multiple-value-call)))
-         (multiple-value-bind (ordinary precise-p) (ordinary-indirect-result-domain build form)
-           (if precise-p (values ordinary t)
-               (let ((targets (and (build-function-returns build)
-                                   (known-function-targets build (cadr form)))))
-                 (if targets
-                     (reduce (lambda (previous name)
-                               (merge-value-domains build previous
-                                 (return-summary-primary (or (source-call-return-summary build name) :unknown))))
-                             targets :initial-value :pending)
-                     :unknown)))))
+         (multiple-value-bind (targets global-targets callee-domain) (known-function-targets build (second form))
+           (multiple-value-bind (ordinary precise-p)
+               (ordinary-indirect-result-domain build form targets global-targets)
+             (values (if precise-p ordinary
+                         (return-summary-primary
+                          (indirect-call-return-summary build form targets global-targets callee-domain)))
+                     t))))
         ((and (consp form) (source-call-return-summary build (car form)))
-         (return-summary-primary (source-call-return-summary build (car form))))
+         (values (return-summary-primary (source-call-return-summary build (car form))) t))
         (t :unknown)))
 
 (defun subtype-domain-p (build actual expected)
@@ -1936,11 +2443,14 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
     (let ((definition (snowgrave:find-authored-definition (build-source build) :function name)))
       (when definition (normalized-definition-form build definition)))))
 
-(defun call-lambda-domains (build lambda-list supplied variable-tail &key method specials)
+(defun call-lambda-domains (build lambda-list supplied variable-tail &key method specials lexical)
   "Project raw caller facts through the shared lambda binding owner."
   (let* ((contract (lambda-contract build lambda-list :method method))
          (inputs (lambda-input-variables contract)))
-    (let ((*argument-domains* nil) (*function-bindings* nil) (*value-domain-local-functions* nil))
+    (let ((*argument-domains* (when lexical *argument-domains*))
+          (*function-bindings* (when lexical *function-bindings*))
+          (*value-domain-local-functions* (when lexical *value-domain-local-functions*))
+          (*local-function-frames* (when lexical *local-function-frames*)))
       (multiple-value-bind (key-inputs unknown-key-tail)
           (call-key-inputs contract supplied variable-tail)
         (multiple-value-bind (scope ordinary initializers)
@@ -1950,11 +2460,18 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
           (declare (ignore ordinary initializers))
           (mapcar (lambda (name) (cdr (assoc name (car scope)))) inputs))))))
 
+(defun capture-lambda-domains (build lambda-list &key lexical specials)
+  ;; Arbitrary future callers may omit OPTIONAL/KEY values. Unknown actual
+  ;; inputs cannot erase an opaque default or a definition-site capture.
+  (call-lambda-domains build lambda-list
+                       (make-list (length (getf (lambda-contract build lambda-list) :required))
+                                  :initial-element :unknown)
+                       t :lexical lexical :specials specials))
+
 (defun call-function-domains (build form arguments capture variable-tail)
   "Derive effective argument bindings through the shared lambda scope owner."
-  (let* ((lambda-list (caddr form))
-         (inputs (lambda-input-variables (lambda-contract build lambda-list))))
-    (if capture (make-list (length inputs) :initial-element :unknown)
+  (let ((lambda-list (caddr form)))
+    (if capture (capture-lambda-domains build lambda-list :specials (body-special-domains (cdddr form)))
         (call-lambda-domains build lambda-list
                              (mapcar (lambda (argument) (value-domain build argument)) arguments)
                              variable-tail :specials (body-special-domains (cdddr form))))))
@@ -1971,19 +2488,19 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
            ;; Same-arity calls with different keys must not turn omission of a
            ;; method key into an unknown keyword tail. This also covers a
            ;; &REST generic whose congruent methods accept &KEY.
-           (key (list (not (null capture)) (not (null variable-tail)) (length actual)
+           (key (list (not (null capture))
+                      (if (external-result-domain-p variable-tail) :external-result (not (null variable-tail)))
+                      (length actual)
                       (mapcar (lambda (domain)
                                 (when (and (consp domain) (eq (car domain) 'eql) (symbolp (second domain))) domain))
                               (nthcdr required actual))))
            (shapes (gethash name (build-generic-call-shapes build))))
-      ;; Required bindings already belong to the MOP cell and the existing
-      ;; generic tuple audit. No optional/key facts need caller-shape evidence
-      ;; for a required-only contract, including an otherwise unreached helper.
-      (unless (or (getf contract :optional) (getf contract :rest) (getf contract :keyp))
-        (return-from audit-generic-call-shape nil))
       ;; Pending key names must not become a permanent unknown-name profile
       ;; when their helper return is discovered by a later iteration.
-      (when (or capture (and (>= (length actual) required)
+      ;; An unknown tail can supply required values too. Keep its short raw
+      ;; prefix, rather than dropping that caller and borrowing another
+      ;; caller's narrower required bindings.
+      (when (or capture (and (or variable-tail (>= (length actual) required))
                              (not (member :pending (nthcdr required actual)))))
         (when (and *collect-function-flow* (null shapes))
           (setf shapes (make-hash-table :test #'equal)
@@ -1999,15 +2516,16 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                    (setf *function-flow-changed* t))))
               ((or (not presentp)
                    (not (every (lambda (value expected)
-                                 (or (eq expected :unknown) (subtype-domain-p build value expected)))
+                                 (flow-domain-covered-p build value expected))
                                actual previous)))
                (fail build 'snowgrave:incomplete-domain :generic-call-bindings
                      (format nil "Caller of ~S lacks its raw argument binding proof." name) :reachability))))))))
 
 (defun method-binding-domains (build generic lambda-list body)
   "Derive method inputs from raw generic calls; the MOP still owns dispatch.
-Required bindings use the emitted cell. Nonrequired facts conservatively join
-all call shapes of this generic, without a second applicability algorithm."
+Concrete required bindings use the emitted cell. A universal cell does not
+erase the actual caller's required-value proof. All facts conservatively join
+the generic's call shapes, without a second applicability algorithm."
   (let* ((inputs (lambda-input-variables (lambda-contract build lambda-list :method t)))
          (required (length *cell-domains*))
          (summary nil) (shapes (gethash generic (build-generic-call-shapes build))))
@@ -2015,16 +2533,29 @@ all call shapes of this generic, without a second applicability algorithm."
      (maphash
       (lambda (key domains)
        (destructuring-bind (capture variable-tail count literal-names) key
-        (declare (ignore count literal-names))
-        (let* ((supplied (append *cell-domains* (unless capture (nthcdr required domains))))
+        (declare (ignore literal-names))
+        (let* ((supplied
+                 (append
+                  (loop for cell in *cell-domains* for position from 0
+                        collect
+                        (if (or (not (eq cell t)) capture (initialization-generic-p generic))
+                            ;; Construction also has compiler-owned callers.
+                            ;; Its dedicated protocol emitter owns their cell
+                            ;; contract, independently of authored call shapes.
+                            cell
+                            (if (< position count) (nth position domains) :unknown)))
+                  (unless capture (nthcdr required domains))))
                (actual (call-lambda-domains build lambda-list supplied (or capture variable-tail)
                                            :method t :specials (body-special-domains body))))
           (setf summary (if summary
                             (mapcar (lambda (old new) (merge-value-domains build old new)) summary actual)
                             actual))))) shapes))
-    (or summary (append *cell-domains*
+    (or summary (append (mapcar (lambda (cell)
+                                  (if (or (not (eq cell t)) (initialization-generic-p generic))
+                                      cell (if (and *collect-function-flow* (not *settled-method-roots*)) :pending :unknown)))
+                                *cell-domains*)
                         (make-list (- (length inputs) required)
-                                   :initial-element (if *collect-function-flow* :pending :unknown))))))
+                                   :initial-element (if (and *collect-function-flow* (not *settled-method-roots*)) :pending :unknown))))))
 
 (defun audit-function-call (build name arguments &key capture variable-tail)
   (when (build-function-domains build)
@@ -2034,6 +2565,13 @@ all call shapes of this generic, without a second applicability algorithm."
                (count (length required))
                (entryp (member-name name (getf (build-declaration build) :entries)))
                (actual (call-function-domains build form arguments capture variable-tail)))
+          ;; Declared entry domains remain the public guard, rather than a
+          ;; joined helper profile. An internal opaque origin cannot borrow
+          ;; that nominal contract for an unclassified native value.
+          (when (and entryp (not capture) (some #'external-result-domain-p actual))
+            (fail build 'snowgrave:unclosed-call :external-result-entry-argument
+                  "An internal call cannot reinterpret an unclassified external result through an entry's nominal domain contract."
+                  :reachability))
           ;; An ordinary lambda list rejects an incomplete tuple before its
           ;; body. An escaping helper capture has arbitrary future callers.
           (when (or capture (>= (length arguments) count))
@@ -2052,25 +2590,32 @@ all call shapes of this generic, without a second applicability algorithm."
                 ((not presentp)
                  (fail build 'snowgrave:incomplete-domain :ordinary-function-reachability
                        (format nil "No caller-domain proof reaches ordinary helper ~S." name) :reachability))
-                ((and capture (not (every (lambda (domain) (eq domain :unknown)) previous)))
+                ((and capture
+                      (not (every (lambda (value expected) (flow-domain-covered-p build value expected))
+                                  actual previous)))
                  (fail build 'snowgrave:incomplete-domain :ordinary-function-capture-domain
                        (format nil "Escaping helper ~S lacks an arbitrary-caller proof." name) :reachability))
                 ((and (not capture)
                       (not (every (lambda (value expected)
-                                    (or (eq expected :unknown) (subtype-domain-p build value expected)))
+                                    (flow-domain-covered-p build value expected))
                                   actual previous)))
                  (fail build 'snowgrave:incomplete-domain :ordinary-function-call-domain
                        (format nil "Caller of ~S supplies ~S outside proved required domains ~S." name actual previous)
                        :reachability))))))))))
 
 (defun audit-function-capture (build name)
-  (when (member name '(fill coerce))
+  (when (member name '(fill coerce length))
     (fail build 'snowgrave:unclosed-call :ordinary-function-capture
           "This ordinary operator needs a proved callable ABI before its unchecked host function can escape; use an audited immediate call."))
   (audit-generic-call-shape build name nil t nil)
   (audit-function-call build name nil :capture t))
 
 (defun audit-place-writer (build place value local)
+  (when (consp place)
+    (let ((binding (find-local-function-binding (list 'setf (car place)))))
+      (when binding
+        (local-call-return-summary build binding
+                                   (list* (local-function-binding-name binding) value (cdr place))))))
   (when (and (consp place) (not (member-name (list 'setf (car place)) local))
              (function-target-p build (list 'setf (car place)) local))
     (let ((name (list 'setf (car place))) (arguments (cons value (cdr place))))
@@ -2114,12 +2659,13 @@ all call shapes of this generic, without a second applicability algorithm."
 
 (defun audit-generic-call (build name arguments &key variable-tail)
   (audit-initialization-call build name arguments)
-  (audit-generic-call-shape build name arguments nil variable-tail)
   (when (member-name name (getf (build-declaration build) :closed-generics))
     (when (and (not *collect-function-flow*)
-               (some (lambda (argument) (external-result-domain-p (value-domain build argument))) arguments))
+               (or (external-result-domain-p variable-tail)
+                   (some (lambda (argument) (external-result-domain-p (value-domain build argument))) arguments)))
       (fail build 'snowgrave:unclosed-call :external-result-dispatch
             "Closed dispatch needs an admitted representation for values returned by an external operation." :reachability))
+    (audit-generic-call-shape build name arguments nil variable-tail)
     (let ((domains (generic-domain-roots build name)))
       ;; No tuple exists below required arity. The materialized host parser
       ;; signals before any applicability or domain observation can occur.
@@ -2165,18 +2711,20 @@ reflection, lexical rebinding and class values still require their own ABI."
           (when (and constantp (member-name class (build-classes build)))
             (values (second observation) class reversep t)))))))
 
-(defun transform-body (build body package &key open next original local)
+(defun transform-body (build body package &key open next original local immediate-result-p)
   (with-source-body-facts (body)
-   (let ((*value-domain-local-functions* local))
+   (let ((*value-domain-local-functions* local)
+         (*immediate-lambda-domains* *immediate-lambda-domains*))
     (multiple-value-bind (prefix executable) (snowgrave::source-body-parts body)
-      (append (mapcar (lambda (form)
-                        ;; Documentation is syntax, not a literal expression.
-                        (if (stringp form) form
-                            (transform-form build form package :open open :next next
-                                            :original original :local local))) prefix)
-              (mapcar (lambda (form)
-                        (transform-form build form package :open open :next next
-                                        :original original :local local)) executable))))))
+      (labels ((emit (form &optional immediatep)
+                 (let ((*immediate-callee-value* (when immediatep form)))
+                   (transform-form build form package :open open :next next
+                                   :original original :local local))))
+        ;; Only prefix documentation is syntax. Executable strings, including
+        ;; call arguments, must retain their owned literal-graph identity.
+        (append (mapcar (lambda (form) (if (stringp form) form (emit form))) prefix)
+                (loop for tail on executable
+                      collect (emit (car tail) (and immediate-result-p (null (cdr tail)))))))))))
 
 (defun declared-external-result-expression (build name expression)
   (let ((contract (assoc name (getf (build-declaration build) :external-return-domains) :test #'name=)))
@@ -2188,7 +2736,12 @@ reflection, lexical rebinding and class values still require their own ABI."
   (labels
       ((walk (x) (transform-form build x package :open open :next next
                                 :original original :local local))
-       (body (xs) (transform-body build xs package :open open :next next :original original :local local))
+       (value-walk (x)
+         (let ((*immediate-callee-value* (when (eq form *immediate-callee-value*) x)))
+           (walk x)))
+       (body (xs &optional resultp)
+         (transform-body build xs package :open open :next next :original original :local local
+                         :immediate-result-p (and resultp (eq form *immediate-callee-value*))))
        (target (name)
          (transformed-function-name build name package open local))
        (equality-callback (reference operators &optional callee)
@@ -2238,9 +2791,10 @@ reflection, lexical rebinding and class values still require their own ABI."
        (if (and (consp (cadr form)) (eq (caadr form) 'lambda))
            `(function ,(walk (cadr form)))
            (progn
-             (unless (or (member-name (cadr form) local)
-                         (eq form *immediate-function-reference*))
-               (audit-function-capture build (cadr form)))
+             (let ((binding (find-local-function-binding (second form))))
+               (unless (or open (eq form *immediate-callee-value*))
+                 (if binding (audit-local-function-capture build binding)
+                     (audit-function-capture build (second form)))))
              `(function ,(target (cadr form))))))
       ((eq (car form) 'declare)
        ;; Closed class type declarations must not enter the host compiler as
@@ -2268,11 +2822,11 @@ reflection, lexical rebinding and class values still require their own ABI."
       ((eq (car form) 'next-method-p) (if open form (not (null next))))
       ((eq (car form) 'if)
        (let ((test (walk (cadr form))))
-         (cond ((eq test t) (with-predicate-domains (build (second form) t local) (walk (third form))))
-               ((null test) (with-predicate-domains (build (second form) nil local) (walk (fourth form))))
+         (cond ((eq test t) (with-predicate-domains (build (second form) t local) (value-walk (third form))))
+               ((null test) (with-predicate-domains (build (second form) nil local) (value-walk (fourth form))))
                (t `(if ,test
-                       ,(with-predicate-domains (build (second form) t local) (walk (third form)))
-                       ,(with-predicate-domains (build (second form) nil local) (walk (fourth form))))))))
+                       ,(with-predicate-domains (build (second form) t local) (value-walk (third form)))
+                       ,(with-predicate-domains (build (second form) nil local) (value-walk (fourth form))))))))
       ((nth-value 3 (exact-class-comparison build form local))
        (multiple-value-bind (object class reversep) (exact-class-comparison build form local)
          (when (and (not open) (not *collect-function-flow*)
@@ -2312,26 +2866,32 @@ reflection, lexical rebinding and class values still require their own ABI."
                  (when specials (list `(declare (special ,@specials)))))
              ,@(body (cddr form))))))
       ((member (car form) '(flet labels))
-       (let* ((definitions (cadr form))
-              (names (mapcar #'car definitions))
-              (inner (append names local)))
-         `(,(car form)
-           ,(mapcar (lambda (definition)
-                      (multiple-value-bind (scope ordinary)
-                          (analyze-lambda-scope build (cadr definition) nil :package package :open open
-                                               :local (if (eq (car form) 'labels) inner local)
-                                               :next next :original original
-                                               :specials (body-special-domains (cddr definition)))
-                       (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
-                        (list* (car definition) ordinary
-                               (append (when (source-specials build)
-                                         (list `(declare (special ,@(source-specials build)))))
-                                       (transform-body build (cddr definition) package
-                                               :open open :next next :original original
-                                               :local (if (eq (car form) 'labels) inner local)))))))
-                    definitions)
-           ,@(transform-body build (cddr form) package :open open :next next
-                             :original original :local inner))))
+       (call-with-local-function-scope
+        build form
+        (lambda (frame)
+          `(,(car form)
+            ,(loop for binding in (local-function-frame-bindings frame)
+                   when (or open (local-function-binding-reachedp binding))
+                     collect
+                     (call-in-local-function-environment
+                      build frame t
+                      (lambda ()
+                        (let ((definition (local-function-binding-definition binding)))
+                          (multiple-value-bind (scope ordinary)
+                              (analyze-lambda-scope
+                               build (second definition) (local-function-binding-domains binding)
+                               :package package :open open :local *value-domain-local-functions*
+                               :next next :original original :specials (body-special-domains (cddr definition)))
+                            (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
+                              (list* (first definition) ordinary
+                                     (append (when (source-specials build)
+                                               (list `(declare (special ,@(source-specials build)))))
+                                             (transform-body build (cddr definition) package :open open
+                                                             :next next :original original
+                                                             :local *value-domain-local-functions*)))))))))
+            ,@(transform-body build (cddr form) package :open open :next next :original original
+                              :local *value-domain-local-functions*)))
+        :package package :open open :next next :original original :local local))
       ((eq (car form) 'lambda)
        (multiple-value-bind (scope ordinary)
            (analyze-lambda-scope build (cadr form)
@@ -2375,8 +2935,14 @@ reflection, lexical rebinding and class values still require their own ABI."
       ((member (car form) '(when unless))
        `(,(car form) ,(walk (second form))
           ,@(with-predicate-domains (build (second form) (eq (car form) 'when) local) (body (cddr form)))))
-      ((member (car form) '(progn locally unwind-protect multiple-value-prog1))
-       `(,(car form) ,@(body (cdr form))))
+      ((member (car form) '(progn locally))
+       `(,(car form) ,@(body (cdr form) t)))
+      ((eq (car form) 'multiple-value-prog1)
+       (with-source-body-facts ((cdr form))
+         `(multiple-value-prog1 ,(value-walk (second form))
+            ,@(mapcar #'walk (cddr form)))))
+      ((eq (car form) 'unwind-protect)
+       `(unwind-protect ,@(body (cdr form))))
       ((eq (car form) 'multiple-value-bind)
        (multiple-value-bind (scope value)
            (analyze-multiple-value-scope build (cadr form) (caddr form) #'walk
@@ -2427,124 +2993,133 @@ reflection, lexical rebinding and class values still require their own ABI."
                "LOAD-TIME-VALUE must have a reproducible checked constant/function initializer."))
        `(load-time-value
           ,(let ((*argument-domains* nil) (*function-bindings* nil)
-                 (*declared-specials* nil) (*value-domain-local-functions* nil)
+                 (*declared-specials* nil) (*value-domain-local-functions* nil) (*local-function-frames* nil)
+               (*immediate-lambda-domains* nil)
                  (*mutable-invariant-bindings* nil) (*tagbody-targets* nil)
-                 (*current-method* nil))
+                 (*current-method* nil)
+                 (*immediate-callee-value* (when (eq form *immediate-callee-value*) (second form))))
              (transform-form build (cadr form) package :open open))
           ,@(cddr form)))
       ((member (car form) '(funcall apply multiple-value-call))
-       (when (special-variable-p build (cadr form))
-         (fail build 'snowgrave:unclosed-call :mutable-function-special
-               "A callable special needs a sealed binding-domain proof; use a lexical or direct LOAD-TIME-VALUE capture in this fragment."))
-       (unless (or open *collect-function-flow*
-                   (and (consp (cadr form))
-                        (or (member (caadr form) '(function lambda))
-                            (and (eq (caadr form) 'load-time-value)
-                                 (not (eq (function-expression-target (cadr form)) :unknown)))))
-                   (known-function-targets build (cadr form)))
-         (fail build 'snowgrave:unclosed-call :computed-function
-               "Indirect calls require a checked FUNCTION/LAMBDA, immutable capture, or a complete finite set of named source targets."))
-       (let ((equality-realization nil) (mapping-plans nil)
-             (value-arguments nil) (value-bindings nil) (value-count-complete-p t)
-             (*argument-domains* *argument-domains*))
-       (when (and (not open) (eq (car form) 'multiple-value-call)
-                  (not (every (lambda (producer) (and (consp producer) (eq (car producer) 'values))) (cddr form)))
-                  (some (lambda (name) (indirect-argument-audit-p build name local))
-                        (known-function-targets build (cadr form))))
-         (multiple-value-bind (arguments bindings domains completep)
-             (multiple-value-call-plan build (cddr form))
-           (setf value-arguments arguments value-bindings bindings value-count-complete-p completep
-                 *argument-domains* (append domains *argument-domains*))
-           (unless (or completep *collect-function-flow*)
-             (fail build 'snowgrave:incomplete-domain :multiple-value-arguments
-                   "A multiple-value producer needs an exact ordered value-count/domain contract." :reachability))))
-       (unless open
-         (dolist (name (known-function-targets build (cadr form)))
-          (let ((arguments (cddr form)) (variable-tail nil))
-           ;; A returned global GF retains its source identity even inside a
-           ;; same-named FLET. Local-name membership cannot waive its tuple.
-           (when (and value-count-complete-p (indirect-argument-audit-p build name local))
-             (when (eq (car form) 'apply)
-               (let ((last (car (last arguments)))
-                     (prefix (butlast arguments))
-                     (required (if (ordinary-function-form build name)
-                                   (length (ordinary-lambda-list build (caddr (ordinary-function-form build name))))
-                                   (if (or (member name '(eq eql equal equalp))
-                                           (member name *representation-sensitive-ordinary-operations*)
-                                           (member-name name (getf (build-declaration build) :external-operations)))
-                                       (length (ordinary-lambda-list build (sb-introspect:function-lambda-list (fdefinition name))))
-                                       (length (generic-domain-roots build name))))))
-                 (cond ((and (consp last) (eq (car last) 'list))
-                        (setf arguments (append (butlast arguments) (cdr last))))
-                       ((and (consp last) (eq (car last) 'quote) (listp (cadr last)))
-                        (setf arguments (append (butlast arguments)
-                                                (mapcar (lambda (x) (list 'quote x)) (cadr last)))))
-                       ((>= (length prefix) required)
-                        (when (and (initialization-generic-p name) (not *generated-class-operation*))
-                          (fail build 'snowgrave:unclosed-class-operation :initialization-apply-tail
-                                "A variable initialization APPLY tail needs a proven keyword/error shape." :reachability))
-                        (setf arguments prefix variable-tail t))
-                       (t (fail build 'snowgrave:incomplete-domain :apply-arguments
-                                "A variable APPLY tail cannot prove that every execution supplies the required tuple." :reachability)))))
-             (when (eq (car form) 'multiple-value-call)
-               (setf arguments
-                     (if value-bindings value-arguments
-                         (mapcan (lambda (producer) (copy-list (cdr producer))) arguments))))
-             (audit-generic-call build name arguments :variable-tail variable-tail)
-             (audit-function-call build name arguments :variable-tail variable-tail)
-             (audit-external-identity build name arguments :variable-tail variable-tail)
-             (audit-external-call build name arguments :variable-tail variable-tail)
-             (dolist (position (audit-ordinary-operation build name arguments local open :variable-tail variable-tail))
-               (let ((plan (assoc position mapping-plans)))
-                 (if plan (pushnew name (cdr plan)) (push (list position name) mapping-plans))))
-             (when (eq name 'equalp)
-               (setf equality-realization
-                     (record-equality-realization build arguments :variable-tail variable-tail)))))))
-       (let ((coerce-p (and (not open) (not *collect-function-flow*)
-                             (equal (known-function-targets build (cadr form)) '(coerce))))
-             (callee (let ((*immediate-function-reference*
-                            (immediate-function-reference (cadr form)))
-                           (*immediate-lambda-domains*
-                             (let ((lambda (immediate-lambda-form build form)))
-                               (if lambda
-                                   (acons lambda
-                                          (mapcar (lambda (argument) (value-domain build argument)) (cddr form))
-                                          *immediate-lambda-domains*)
-                                   *immediate-lambda-domains*))))
-                       (walk (cadr form)))))
-         (cond (value-bindings
-                (let* ((binding (gensym "VALUE-CALLEE"))
-                       (arguments (mapcan (lambda (producer) (copy-list (first producer))) value-bindings))
-                       (invocation
-                         `(funcall ,(if (eq equality-realization :identity)
-                                        `(if (eq ,binding #'equalp) #'eq ,binding) binding)
-                                   ,@(cond (coerce-p
-                                            (cons (asserted-sequence-expression build (first value-arguments) (first arguments))
-                                                  (cdr arguments)))
-                                           (mapping-plans (equality-arguments arguments mapping-plans binding))
-                                           (t arguments)))))
-                  `(let ((,binding ,callee))
-                     ,(reduce (lambda (body producer)
-                                `(multiple-value-bind ,(first producer) ,(walk (second producer)) ,body))
-                              (reverse value-bindings) :initial-value invocation))))
-               ((or (eq equality-realization :identity) mapping-plans)
-             ;; Preserve the original callee's identity and evaluation, including
-             ;; finite sets containing other functions. Only this invocation's
-             ;; actual native EQUALP target changes to the record identity rule.
-             (let ((binding (gensym "EQUALITY-CALLEE")))
-               `(let ((,binding ,callee))
-                  (,(car form) ,(if (eq equality-realization :identity)
-                                    `(if (eq ,binding #'equalp) #'eq ,binding) binding)
-                   ,@(if mapping-plans (call-equality-arguments form binding mapping-plans)
-                         (body (cddr form)))))))
-               (t (let ((expression `(,(car form) ,callee
-                                         ,@(let ((arguments (body (cddr form))))
-                                             (if coerce-p (coerce-indirect-arguments build form arguments) arguments))))
-                        (targets (known-function-targets build (cadr form))))
-                    (if (and (not open) (= (length targets) 1))
-                        (declared-external-result-expression build (first targets) expression) expression)))))))
+       (let ((*immediate-lambda-domains* *immediate-lambda-domains*))
+       (multiple-value-bind (targets global-targets) (unless open (known-function-targets build (second form)))
+         (when (special-variable-p build (cadr form))
+           (fail build 'snowgrave:unclosed-call :mutable-function-special
+                 "A callable special needs a sealed binding-domain proof; use a lexical or direct LOAD-TIME-VALUE capture in this fragment."))
+         (unless (or open *collect-function-flow*
+                     (and (consp (cadr form))
+                          (or (member (caadr form) '(function lambda))
+                              (and (eq (caadr form) 'load-time-value)
+                                   (not (eq (function-expression-target (cadr form)) :unknown)))))
+                     targets)
+           (fail build 'snowgrave:unclosed-call :computed-function
+                 "Indirect calls require a checked FUNCTION/LAMBDA, immutable capture, or a complete finite set of named source targets."))
+         (let ((equality-realization nil) (mapping-plans nil)
+               (value-arguments nil) (value-bindings nil) (value-count-complete-p t)
+               (*argument-domains* *argument-domains*))
+         (when (and (not open) (eq (car form) 'multiple-value-call)
+                    (not (every (lambda (producer) (and (consp producer) (eq (car producer) 'values))) (cddr form)))
+                    (some (lambda (name) (indirect-argument-audit-p build name local global-targets))
+                          targets))
+           (multiple-value-bind (arguments bindings domains completep)
+               (multiple-value-call-plan build (cddr form))
+             (setf value-arguments arguments value-bindings bindings value-count-complete-p completep
+                   *argument-domains* (append domains *argument-domains*))
+             (unless (or completep *collect-function-flow*)
+               (fail build 'snowgrave:incomplete-domain :multiple-value-arguments
+                     "A multiple-value producer needs an exact ordered value-count/domain contract." :reachability))))
+         (unless open
+           (dolist (name targets)
+            (if (local-function-binding-p name)
+               (local-call-return-summary build name form)
+               (let ((arguments (cddr form)) (variable-tail nil))
+             ;; A returned global GF retains its source identity even inside a
+             ;; same-named FLET. Local-name membership cannot waive its tuple.
+             (when (and value-count-complete-p (indirect-argument-audit-p build name local global-targets))
+               (when (eq (car form) 'apply)
+                 (let ((last (car (last arguments)))
+                       (prefix (butlast arguments))
+                       (required (if (ordinary-function-form build name)
+                                     (length (ordinary-lambda-list build (caddr (ordinary-function-form build name))))
+                                     (if (or (member name '(eq eql equal equalp))
+                                             (member name *representation-sensitive-ordinary-operations*)
+                                             (member-name name (getf (build-declaration build) :external-operations)))
+                                         (length (ordinary-lambda-list build (sb-introspect:function-lambda-list (fdefinition name))))
+                                         (length (generic-domain-roots build name))))))
+                   (cond ((and (consp last) (eq (car last) 'list))
+                          (setf arguments (append (butlast arguments) (cdr last))))
+                         ((and (consp last) (eq (car last) 'quote) (listp (cadr last)))
+                          (setf arguments (append (butlast arguments)
+                                                  (mapcar (lambda (x) (list 'quote x)) (cadr last)))))
+                         ((>= (length prefix) required)
+                          (when (and (initialization-generic-p name) (not *generated-class-operation*))
+                            (fail build 'snowgrave:unclosed-class-operation :initialization-apply-tail
+                                  "A variable initialization APPLY tail needs a proven keyword/error shape." :reachability))
+                          (setf arguments prefix
+                                variable-tail (if (external-result-domain-p (value-domain build last))
+                                                  :external-result t)))
+                         (t (fail build 'snowgrave:incomplete-domain :apply-arguments
+                                  "A variable APPLY tail cannot prove that every execution supplies the required tuple." :reachability)))))
+               (when (eq (car form) 'multiple-value-call)
+                 (setf arguments
+                       (if value-bindings value-arguments
+                           (mapcan (lambda (producer) (copy-list (cdr producer))) arguments))))
+               (audit-generic-call build name arguments :variable-tail variable-tail)
+               (audit-function-call build name arguments :variable-tail variable-tail)
+               (audit-external-identity build name arguments :variable-tail variable-tail)
+               (audit-external-call build name arguments :variable-tail variable-tail)
+               (dolist (position (audit-ordinary-operation build name arguments local open :variable-tail variable-tail))
+                 (let ((plan (assoc position mapping-plans)))
+                   (if plan (pushnew name (cdr plan)) (push (list position name) mapping-plans))))
+               (when (eq name 'equalp)
+                 (setf equality-realization
+                       (record-equality-realization build arguments :variable-tail variable-tail))))))))
+         (let ((native-sequence-p
+                 (and (not open) (not *collect-function-flow*)
+                      (and (= (length targets) 1) (member (first targets) '(coerce length)))))
+               (callee (let ((*immediate-callee-value* (second form))
+                             (*immediate-lambda-domains*
+                               (let ((lambda (immediate-lambda-form build form)))
+                                 (if (and lambda (not open))
+                                     (multiple-value-bind (domains completep)
+                                         (immediate-lambda-call-domains build form)
+                                       (if completep (acons lambda domains *immediate-lambda-domains*)
+                                           *immediate-lambda-domains*))
+                                     *immediate-lambda-domains*))))
+                         (walk (cadr form)))))
+           (cond (value-bindings
+                  (let* ((binding (gensym "VALUE-CALLEE"))
+                         (arguments (mapcan (lambda (producer) (copy-list (first producer))) value-bindings))
+                         (invocation
+                           `(funcall ,(if (eq equality-realization :identity)
+                                          `(if (eq ,binding #'equalp) #'eq ,binding) binding)
+                                     ,@(cond (native-sequence-p
+                                              (cons (asserted-sequence-expression build (first value-arguments) (first arguments))
+                                                    (cdr arguments)))
+                                             (mapping-plans (equality-arguments arguments mapping-plans binding))
+                                             (t arguments)))))
+                    `(let ((,binding ,callee))
+                       ,(reduce (lambda (body producer)
+                                  `(multiple-value-bind ,(first producer) ,(walk (second producer)) ,body))
+                                (reverse value-bindings) :initial-value invocation))))
+                 ((or (eq equality-realization :identity) mapping-plans)
+               ;; Preserve the original callee's identity and evaluation, including
+               ;; finite sets containing other functions. Only this invocation's
+               ;; actual native EQUALP target changes to the record identity rule.
+               (let ((binding (gensym "EQUALITY-CALLEE")))
+                 `(let ((,binding ,callee))
+                    (,(car form) ,(if (eq equality-realization :identity)
+                                      `(if (eq ,binding #'equalp) #'eq ,binding) binding)
+                     ,@(if mapping-plans (call-equality-arguments form binding mapping-plans)
+                           (body (cddr form)))))))
+                 (t (let ((expression `(,(car form) ,callee
+                                           ,@(let ((arguments (body (cddr form))))
+                                               (if native-sequence-p (native-sequence-indirect-arguments build form arguments) arguments)))))
+                      (if (and (not open) (= (length targets) 1))
+                          (declared-external-result-expression build (first targets) expression) expression)))))))))
       ((member (car form) '(setq setf incf decf push pushnew pop))
-       (when (eq (car form) 'pushnew) (validate-keyword-callbacks build (cdddr form) local open))
+       (when (eq (car form) 'pushnew) (validate-keyword-callbacks build (cdddr form) local open nil
+                                                                            :data (list (second form) (third form))))
        (unless open
          (let ((places (if (member (car form) '(setq setf))
                            (loop for tail on (cdr form) by #'cddr collect (car tail))
@@ -2665,6 +3240,8 @@ reflection, lexical rebinding and class values still require their own ABI."
          (when (and (not open) (not *collect-function-flow*) (eq (car form) 'equalp) (build-classes build))
            (when (eq :identity (record-equality-realization build (cdr form)))
              (return-from transform-form `(eq ,@(body (cdr form))))))
+         (when (and (not open) (find-local-function-binding (car form)))
+           (local-call-return-summary build (find-local-function-binding (car form)) form))
          (unless (or open (member-name (car form) local))
            (audit-generic-call build (car form) (cdr form))
            (audit-function-call build (car form) (cdr form))
@@ -2674,6 +3251,9 @@ reflection, lexical rebinding and class values still require their own ABI."
                  (standard-operation-meaning-p build 'coerce local))
             `(coerce ,(asserted-sequence-expression build (second form) (walk (second form)))
                      ,(walk (third form))))
+           ((and (eq (car form) 'length) (not open) (not *collect-function-flow*)
+                 (standard-operation-meaning-p build 'length local))
+            `(length ,(asserted-sequence-expression build (second form) (walk (second form)))))
            (mapping-realization
              `(,(target (car form))
                 ,@(equality-arguments (cdr form)
@@ -2770,7 +3350,10 @@ class, function, displaced backing or arbitrary array is hidden by this test."
           (getf contract :keys)))
 
 (defun lambda-input-variables (contract)
-  (append (lambda-positional-variables contract) (lambda-key-variables contract)))
+  ;; The existing caller fixed point owns REST contents as well as named
+  ;; parameters. LIST shape alone cannot erase an opaque actual element.
+  (append (lambda-positional-variables contract) (lambda-key-variables contract)
+          (when (getf contract :rest) (list (getf contract :rest)))))
 
 (defun call-key-inputs (contract supplied variable-tail)
   "Project known first-occurrence keyword inputs from already summarized facts.
@@ -2781,11 +3364,16 @@ An unknown name makes that name and the remainder uncertain, never absent."
     (loop while (cdr tail) do
       (let ((name-domain (car tail)))
         (unless (and (consp name-domain) (eq (car name-domain) 'eql) (symbolp (second name-domain)))
-          (return-from call-key-inputs (values inputs t)))
+          (return-from call-key-inputs
+            (values inputs (if (or (external-result-domain-p variable-tail)
+                                   (some #'external-result-domain-p tail))
+                               :external-result t))))
         (unless (assoc (second name-domain) inputs)
           (push (cons (second name-domain) (second tail)) inputs)))
       (setf tail (cddr tail)))
-    (values inputs (or variable-tail (not (null tail))))))
+    (values inputs (if (or (external-result-domain-p variable-tail)
+                          (some #'external-result-domain-p tail))
+                      :external-result (or variable-tail (not (null tail)))))))
 
 (defun analyze-lambda-scope (build lambda-list binding-domains &key package open local method returns specials call-inputs variable-tail key-inputs unknown-key-tail next original)
   (let* ((contract (lambda-contract build lambda-list :method method))
@@ -2812,15 +3400,32 @@ An unknown name makes that name and the remainder uncertain, never absent."
                                ((:required :optional)
                                 (let ((index (position name positional)))
                                   (if (and call-inputs (eq kind :optional) (>= index (length binding-domains)))
-                                      (if variable-tail :unknown (car fact))
+                                      (if variable-tail
+                                          (merge-value-domains
+                                           build (car fact)
+                                           (if (external-result-domain-p variable-tail) :external-result :unknown))
+                                          (car fact))
                                       (or (nth index binding-domains) :unknown))))
                                (:key
                                 (if call-inputs
                                     (let* ((spec (nth (position name (lambda-key-variables contract)) (getf contract :keys)))
                                            (provided (assoc (keyword-name spec) key-inputs)))
-                                      (cond (provided (cdr provided)) (unknown-key-tail :unknown) (t (car fact))))
+                                      (cond (provided (cdr provided))
+                                            (unknown-key-tail
+                                             (merge-value-domains
+                                              build (car fact)
+                                              (if (external-result-domain-p unknown-key-tail) :external-result :unknown)))
+                                            (t (car fact))))
                                     (or (nth (position name inputs) binding-domains) :unknown)))
-                               (:rest 'list) (:supplied-p 'boolean) (:aux (car fact)) (t :unknown)))
+                               (:rest
+                                (if (if call-inputs
+                                        (or (external-result-domain-p variable-tail)
+                                            (some #'external-result-domain-p
+                                                  (nthcdr (min (length positional) (length binding-domains))
+                                                          binding-domains)))
+                                        (external-result-domain-p (nth (position name inputs) binding-domains)))
+                                    :external-result 'list))
+                               (:supplied-p 'boolean) (:aux (car fact)) (t :unknown)))
                  (domain (if specialp :unknown input-domain))
                  (target (if (and (eq kind :aux) (not specialp)) (cdr fact) :unknown)))
             (when (and specialp (not open) (not *collect-function-flow*)
@@ -2904,7 +3509,7 @@ An unknown name makes that name and the remainder uncertain, never absent."
 
 (defun open-definition (build form)
   (setf (build-source-key build) (authored-source-key build form))
-  (let ((package (build-open-package build)))
+  (let ((package (build-open-package build)) (*immediate-lambda-domains* nil))
     (case (defining-kind form)
       (:class
        (unless (every (lambda (name) (member-name name (build-classes build))) (caddr form))
@@ -2959,7 +3564,9 @@ An unknown name makes that name and the remainder uncertain, never absent."
                               (cdddr form))))
       (:method
        (multiple-value-bind (qualifiers lambda-list body) (method-parts form)
-        (let ((*argument-domains* nil) (*function-bindings* nil))
+        (let ((*argument-domains* nil) (*function-bindings* nil)
+              (*local-function-frames* nil) (*value-domain-local-functions* nil)
+              (*immediate-lambda-domains* nil))
          (multiple-value-bind (scope ordinary)
              (analyze-lambda-scope build lambda-list nil :package package :open t :method t :specials (body-special-domains body))
           (let ((required (length (ordinary-lambda-list build lambda-list :method t)))
@@ -2983,7 +3590,9 @@ An unknown name makes that name and the remainder uncertain, never absent."
             (declare (special ,@(source-specials build)))
             ,@(preserve-source-block (cadr form) (transform-body build body package :open t))))))))
       (:function
-       (let ((*argument-domains* nil) (*function-bindings* nil))
+       (let ((*argument-domains* nil) (*function-bindings* nil)
+              (*local-function-frames* nil) (*value-domain-local-functions* nil)
+              (*immediate-lambda-domains* nil))
         (multiple-value-bind (scope ordinary)
             (analyze-lambda-scope build (caddr form) nil :package package :open t
                                  :specials (body-special-domains (cdddr form)))
@@ -3418,7 +4027,10 @@ not a second inheritance or initialization algorithm."
              (tail-var (fresh-name build "TAIL"))
              (invalid (fresh-name build "INVALID-KEYS"))
              (legal nil) (allow nil)
-             (*argument-domains* nil))
+             (*argument-domains* nil) (*function-bindings* nil)
+             (*local-function-frames* nil) (*value-domain-local-functions* nil)
+             (*mutable-invariant-bindings* nil) (*declared-specials* nil)
+             (*current-method* nil) (*tagbody-targets* nil) (*immediate-lambda-domains* nil))
         (let ((host-class (find-class (mapped-name class (build-open-package build)))))
           (verify-standard-construction build host-class)
           (multiple-value-setq (legal allow) (construction-initarg-contract build host-class)))
@@ -3585,6 +4197,8 @@ not a second inheritance or initialization algorithm."
       (declare (ignore qualifiers))
       (let ((block-name (if (consp generic) (cadr generic) generic)))
         (let ((*argument-domains* nil) (*function-bindings* nil)
+              (*local-function-frames* nil) (*value-domain-local-functions* nil)
+              (*immediate-lambda-domains* nil)
               (*generated-class-operation*
                (or (typep method 'sb-mop:standard-accessor-method)
                    (and (eq generic 'initialize-instance)
@@ -3958,6 +4572,27 @@ class whitelist replaces their actual applicability behavior."
         (t (fail build 'snowgrave:incomplete-domain :entry-domain
                  (format nil "No sealed class/EQL domain for ~S." domain) :partition))))
 
+(defun seed-entry-function-domains (build)
+  ;; Public required domains keep their nominal guard. Every nonrequired
+  ;; binding may instead be omitted, so its default shares the same projection
+  ;; used for an unknown APPLY tail. Revisit it as helper returns settle.
+  (dolist (name (getf (build-declaration build) :entries))
+    (let* ((form (ordinary-function-form build name))
+           (domains (cadr (assoc name (getf (build-declaration build) :external-domains) :test #'name=))))
+      (with-build-source-key (build (authored-source-key build form))
+        (unless (= (length (ordinary-lambda-list build (caddr form))) (length domains))
+          (fail build 'snowgrave:incomplete-domain :entry-arity
+                (format nil "Entry ~S needs one domain per required argument." name) :partition))
+        (let ((actual (call-lambda-domains build (caddr form) (copy-tree domains) t
+                                           :specials (body-special-domains (cdddr form)))))
+          (multiple-value-bind (previous presentp) (gethash name (build-function-domains build))
+            (let ((merged (if presentp
+                              (mapcar (lambda (old new) (merge-value-domains build old new)) previous actual)
+                              actual)))
+              (unless (and presentp (equal previous merged))
+                (setf (gethash name (build-function-domains build)) merged
+                      *function-flow-changed* t)))))))))
+
 (defun infer-function-domains (build)
   "Compute effective helper binding domains from every admitted source caller.
 Analysis output is discarded; the ordinary generation pass repeats all source
@@ -3966,26 +4601,17 @@ and class audits with the fixed point. Unknown captures poison the proof."
         (method-names (build-method-names build)) (sequence (build-sequence build))
         (dependencies (build-dependencies build))
         (*collect-function-flow* t) (*function-flow-changed* nil)
-        (iterations 0))
+        (*settled-method-roots* nil) (iterations 0))
     (setf (build-function-domains build) (make-hash-table :test #'equal)
           (build-function-returns build) (make-hash-table :test #'equal)
           (build-generic-call-shapes build) (make-hash-table :test #'equal))
     (unwind-protect
          (progn
-           (dolist (name (getf (build-declaration build) :entries))
-             (let* ((form (ordinary-function-form build name))
-                    (domains (cadr (assoc name (getf (build-declaration build) :external-domains) :test #'name=))))
-               (unless (= (length (ordinary-lambda-list build (caddr form))) (length domains))
-                 (fail build 'snowgrave:incomplete-domain :entry-arity
-                       (format nil "Entry ~S needs one domain per required argument." name) :partition))
-               (setf (gethash (cadr form) (build-function-domains build))
-                     (append (copy-tree domains)
-                             (make-list (- (length (lambda-input-variables (lambda-contract build (caddr form))))
-                                           (length domains))
-                                        :initial-element :unknown)))))
+           (seed-entry-function-domains build)
            (loop
              (incf iterations)
              (setf *function-flow-changed* nil)
+             (seed-entry-function-domains build)
              ;; Each iteration is an analysis scratch generation. Keep only
              ;; the persistent domain/return facts across the fixed point,
              ;; rather than retaining every temporary method body and name.
@@ -3999,14 +4625,17 @@ and class audits with the fixed point. Unknown captures poison the proof."
              (dolist (name (getf (build-declaration build) :closed-generics)) (emit-generic build name))
              (dolist (form (build-forms build))
                (when (and (eq (defining-kind form) :global) (> (length form) 2))
-                 (transform-form build (caddr form) (build-output-package build))))
+                 (let ((*immediate-lambda-domains* nil))
+                   (transform-form build (caddr form) (build-output-package build)))))
              (dolist (form (build-forms build))
                (when (eq (defining-kind form) :function)
                  (multiple-value-bind (domains reachedp) (gethash (cadr form) (build-function-domains build))
                    (when reachedp
                      (setf (build-source-key build)
                            (authored-source-key build form))
-                     (let ((*argument-domains* nil) (*function-bindings* nil))
+                     (let ((*argument-domains* nil) (*function-bindings* nil)
+              (*local-function-frames* nil) (*value-domain-local-functions* nil)
+              (*immediate-lambda-domains* nil))
                       (multiple-value-bind (scope ordinary)
                           (analyze-lambda-scope build (caddr form) domains :package (build-output-package build)
                                                :specials (body-special-domains (cdddr form)))
@@ -4036,12 +4665,25 @@ and class audits with the fixed point. Unknown captures poison the proof."
                                              *function-flow-changed* t))) shapes))
                         (build-generic-call-shapes build))
                (dolist (name (getf (build-declaration build) :closed-generics))
-                 (settle-return-summary build name)))
+                 ;; An otherwise uncalled selected method can discover helper
+                 ;; returns in the final root pass. Do not poison those still
+                 ;; pending returns before that pass has had a chance to run.
+                 (when (or *settled-method-roots*
+                           (gethash name (build-generic-call-shapes build)))
+                   (settle-return-summary build name)))
+               (unless (or *function-flow-changed* *settled-method-roots*)
+                 ;; Caller facts and unresolved caller components have now
+                 ;; propagated. Revisit selected method roots with UNKNOWN
+                 ;; only where no actual caller proof exists, using the same
+                 ;; argument/return fixed point to retain their dependencies.
+                 (setf *settled-method-roots* t *function-flow-changed* t)))
              (unless *function-flow-changed* (return)))
            (setf (build-function-flow-evidence build)
                  (list :method :finite-argument-binding-fixed-point :iterations iterations
                        :optional-domain-method :effective-call-site-bindings
                        :key-domain-method :first-occurrence-call-site-bindings
+                       :rest-domain-method :actual-tail-origin-through-shared-lambda-owner
+                       :variable-tail-domain-method :opaque-origin-in-raw-call-shape
                        :primary-return-method :monotone-normal-and-explicit-escape-union
                        :ordered-return-method :same-fixed-point-binding-position-union
                        :generic-return-method :same-emitted-effective-method-proof-tree
@@ -4072,7 +4714,9 @@ and class audits with the fixed point. Unknown captures poison the proof."
                                                  :required-domains (copy-tree (subseq domains 0 required-count))
                                                  :optional-domains (copy-tree (subseq domains required-count positional-count))
                                                  :key-domains (mapcar (lambda (spec domain) (list (keyword-name spec) (copy-tree domain)))
-                                                                      (getf contract :keys) (nthcdr positional-count domains)))
+                                                                      (getf contract :keys) (nthcdr positional-count domains))
+                                                 :rest-domain (when (getf contract :rest)
+                                                                (copy-tree (nth (1- (length domains)) domains))))
                                                    (return-summary-evidence (gethash name (build-function-returns build) :unknown))))
                              #'string< :key #'prin1-to-string))))
       (setf (build-generated build) generated (build-constructors build) constructors
@@ -4085,48 +4729,57 @@ and class audits with the fixed point. Unknown captures poison the proof."
       (setf (build-source-key build) (authored-source-key build form))
       (case (defining-kind form)
         (:function
-         (let* ((name (cadr form)) (lambda-list (caddr form))
-                (domains (gethash name (build-function-domains build)))
-                (*argument-domains* nil) (*function-bindings* nil))
-          (multiple-value-bind (scope ordinary)
-              (analyze-lambda-scope build lambda-list domains :package (build-output-package build)
-                                   :specials (body-special-domains (cdddr form)))
-           (let* ((*argument-domains* (car scope)) (*function-bindings* (cdr scope))
-                  (body (transform-body build (cdddr form) (build-output-package build))))
-           (when (member-name name entries)
-             (when (and (or (build-classes build) (getf (build-declaration build) :closed-generics))
-                        (some #'external-result-domain-p
-                              (return-summary-domains (gethash name (build-function-returns build)))))
-               (fail build 'snowgrave:unclosed-call :external-result-escape
-                     "An entry cannot publish an unclassified external result that may retain open cohort state." :reachability))
-             (ordinary-lambda-list build lambda-list)
-             (let ((domains (cadr (assoc name (getf (build-declaration build) :external-domains)
-                                        :test #'name=))))
-               (unless (= (length (ordinary-lambda-list build lambda-list)) (length domains))
-                 (fail build 'snowgrave:incomplete-domain :entry-arity
-                       (format nil "Entry ~S needs one domain per required argument." name) :partition))
-               (let ((declarations (loop while (and body (consp (car body)) (eq (caar body) 'declare))
-                                         collect (pop body))))
-                 (setf body
-                       `(,@declarations
-                         (unless (and ,@(mapcar (lambda (domain variable) (domain-test build domain variable))
-                                               domains (ordinary-lambda-list build lambda-list)))
-                           (snowgrave:sg-domain-violation ',(build-identity build) ',name (list ,@(ordinary-lambda-list build lambda-list))))
-                         ,@body)))
-               (push (list :name name :definition-key (list (build-identity build) :entry (snowgrave::function-name-key name))
-                           :code-key (snowgrave::function-name-key (mapped-name name (build-output-package build))) :lambda-list lambda-list
-                           :domains domains :violation-key :signal) entry-records)))
-           (push `(defun ,(mapped-name name (build-output-package build))
-                    ,ordinary
-                    ,@(preserve-source-block name body))
-                 (build-generated build))))))
+         ;; Only the entry-reachable cohort is deployed. Global initializers,
+         ;; selected methods, construction and captures also seed the shared
+         ;; fixed point. An absent helper has no caller facts and must not
+         ;; become an extra unaudited root merely because it was authored.
+         ;; PRESENTP matters: a reached zero-argument helper has NIL domains.
+         (when (nth-value 1 (gethash (cadr form) (build-function-domains build)))
+           (let* ((name (cadr form)) (lambda-list (caddr form))
+                  (domains (gethash name (build-function-domains build)))
+                  (*argument-domains* nil) (*function-bindings* nil)
+                  (*local-function-frames* nil) (*value-domain-local-functions* nil)
+                  (*immediate-lambda-domains* nil))
+            (multiple-value-bind (scope ordinary)
+                (analyze-lambda-scope build lambda-list domains :package (build-output-package build)
+                                     :specials (body-special-domains (cdddr form)))
+             (let* ((*argument-domains* (car scope)) (*function-bindings* (cdr scope))
+                    (body (transform-body build (cdddr form) (build-output-package build))))
+             (when (member-name name entries)
+               (when (and (or (build-classes build) (getf (build-declaration build) :closed-generics))
+                          (some #'external-result-domain-p
+                                (return-summary-domains (gethash name (build-function-returns build)))))
+                 (fail build 'snowgrave:unclosed-call :external-result-escape
+                       "An entry cannot publish an unclassified external result that may retain open cohort state." :reachability))
+               (ordinary-lambda-list build lambda-list)
+               (let ((domains (cadr (assoc name (getf (build-declaration build) :external-domains)
+                                          :test #'name=))))
+                 (unless (= (length (ordinary-lambda-list build lambda-list)) (length domains))
+                   (fail build 'snowgrave:incomplete-domain :entry-arity
+                         (format nil "Entry ~S needs one domain per required argument." name) :partition))
+                 (let ((declarations (loop while (and body (consp (car body)) (eq (caar body) 'declare))
+                                           collect (pop body))))
+                   (setf body
+                         `(,@declarations
+                           (unless (and ,@(mapcar (lambda (domain variable) (domain-test build domain variable))
+                                                 domains (ordinary-lambda-list build lambda-list)))
+                             (snowgrave:sg-domain-violation ',(build-identity build) ',name (list ,@(ordinary-lambda-list build lambda-list))))
+                           ,@body)))
+                 (push (list :name name :definition-key (list (build-identity build) :entry (snowgrave::function-name-key name))
+                             :code-key (snowgrave::function-name-key (mapped-name name (build-output-package build))) :lambda-list lambda-list
+                             :domains domains :violation-key :signal) entry-records)))
+             (push `(defun ,(mapped-name name (build-output-package build))
+                      ,ordinary
+                      ,@(preserve-source-block name body))
+                   (build-generated build)))))))
         (:global
-         (when (and (> (length form) 2) (member (cadr form) (source-specials build)))
-           (audit-external-shared-value build (cadr form) (caddr form)))
-         (push `(,(car form) ,(global-binding-name build (cadr form) (build-output-package build) nil)
-                 ,@(when (> (length form) 2)
-                     (cons (transform-form build (caddr form) (build-output-package build)) (cdddr form))))
-               (build-generated build)))))
+         (let ((*immediate-lambda-domains* nil))
+           (when (and (> (length form) 2) (member (cadr form) (source-specials build)))
+             (audit-external-shared-value build (cadr form) (caddr form)))
+           (push `(,(car form) ,(global-binding-name build (cadr form) (build-output-package build) nil)
+                   ,@(when (> (length form) 2)
+                       (cons (transform-form build (caddr form) (build-output-package build)) (cdddr form))))
+                 (build-generated build))))))
     (nreverse entry-records)))
 
 (defun residual-source-audit (build forms)
@@ -4571,7 +5224,18 @@ implemented here. A nominal native class is never an imported graph proof."
   (unless (serializable-tree-p (getf declaration :unit-name))
     (snowgrave::reject 'snowgrave:nonreproducible-source :declaration :unit-identity
                       "Unit identity must contain stable readable scalar/list data."))
-  (let* ((identity (getf declaration :unit-name))
+  ;; Each invocation owns its proof environment, including a nested close
+  ;; triggered by compile-time source processing. Dynamic binding restores the
+  ;; outer build's facts; clearing an ambient cell would corrupt that build.
+  (let* ((*argument-domains* nil) (*cell-domains* nil) (*function-bindings* nil)
+         (*generated-class-operation* nil) (*current-method* nil)
+         (*effective-return-proof* nil) (*fixed-effective-arguments* nil)
+         (*collect-function-flow* nil) (*function-flow-changed* nil) (*settled-method-roots* nil)
+         (*immediate-callee-value* nil) (*value-domain-local-functions* nil)
+         (*local-function-frames* nil) (*local-function-scope-cache* nil)
+         (*declared-specials* nil) (*mutable-invariant-bindings* nil) (*tagbody-targets* nil)
+         (*immediate-lambda-domains* nil)
+         (identity (getf declaration :unit-name))
          (identity-key (with-standard-io-syntax (write-to-string identity)))
          (open (make-package (format nil "SNOWGRAVE.BUILDER.~D" (incf *builder-counter*)) :use '(:cl)))
          (output-name (format nil "SNOWGRAVE.UNIT.~A" identity-key))
