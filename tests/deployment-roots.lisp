@@ -223,7 +223,7 @@
   ;; Syntax and load-time execution admission still inspect all source.
   (deployment-refusal (deployment-forms "((defun cold () (load-time-value (get-universal-time))) (defun entry () 17))") :load-time-capture)
   (deployment-refusal (deployment-forms "((defun cold (x) (cond (t . :bad))) (defun entry () 17))") :conditional-clause)
-  (deployment-refusal (deployment-forms "((defun cold (class) (make-instance class)) (defun entry () 17))") :dynamic-construction-class)
+  (deployment-refusal (deployment-forms "((defun cold (class) (make-instance class)) (defun entry () (cold 'symbol)))") :dynamic-construction-class)
   ;; A reached ordinary helper remains one definition despite recursion.
   (let* ((forms (deployment-forms "((defun cold (x) (class-of x))
                                     (defun walk (n) (if (zerop n) 17 (walk (1- n))))

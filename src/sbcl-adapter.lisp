@@ -3641,6 +3641,11 @@ reflection, lexical rebinding and class values still require their own ABI."
                         ,@(body (cdddr form))))
          (otherwise `(,(car form) ,@(body (cdr form))))))
       ((member (car form) '(slot-value slot-boundp slot-makunbound))
+       (when (and open (entry-rooted-deployment-p build))
+         ;; Disposable CLOS uses the actual host slot protocol, including a
+         ;; dynamic name and its error behavior. Closed records still need
+         ;; the finite success/error proof below.
+         (return-from transform-form-code `(,(car form) ,@(body (cdr form)))))
        (multiple-value-bind (slot constantp) (quoted-value (caddr form))
          (unless constantp
            (fail build 'snowgrave:unclosed-class-operation :dynamic-slot
@@ -3699,6 +3704,12 @@ reflection, lexical rebinding and class values still require their own ABI."
                   ,(if (member-name type (build-classes build))
                        (record-type-test build type value) (builtin-type-test build type value)))))))
       ((eq (car form) 'make-instance)
+       (when (and open (entry-rooted-deployment-p build))
+         ;; Class designators are evaluated once and sealed symbolic names
+         ;; refer to their builder classes. Initargs keep normal host order.
+         (return-from transform-form-code
+           `(make-instance ,(open-class-name-expression build (cadr form) package local)
+                           ,@(body (cddr form)))))
        (multiple-value-bind (class constantp) (quoted-value (cadr form))
          (unless (and constantp (member-name class (build-classes build)))
            (fail build 'snowgrave:unclosed-class-operation :dynamic-construction-class
@@ -3767,6 +3778,9 @@ reflection, lexical rebinding and class values still require their own ABI."
   (cond ((symbolp place)
          (if (member place (build-globals build)) (global-binding-name build place package open) place))
         ((and (consp place) (eq (car place) 'slot-value))
+         (when (and open (entry-rooted-deployment-p build))
+           (return-from transform-place
+             `(slot-value ,@(transform-body build (cdr place) package :open t :local local))))
          (multiple-value-bind (slot constantp) (quoted-value (caddr place))
            (unless constantp
              (fail build 'snowgrave:unclosed-class-operation :dynamic-slot-writer
