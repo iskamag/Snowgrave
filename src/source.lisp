@@ -21,7 +21,7 @@
     (dolist (node path) (setf (gethash node checked) t))
     t))
 
-(defun immutable-copy (value)
+(defun immutable-copy (value &optional copy-observer)
   "Own mutable cons/array data, preserving sharing, cycles and array geometry."
   (let ((copies (make-hash-table :test #'eq)) (displacements (make-hash-table :test #'eq)))
     (labels ((copy-array (array)
@@ -52,7 +52,9 @@
                                   (cdr result) (copy (cdr x))) result)))
                      ((arrayp x) (copy-array x))
                      (t x))))
-      (copy value))))
+      (let ((result (copy value)))
+        (when copy-observer (maphash copy-observer copies))
+        result))))
 
 (defun record-authored-definition (kind name form)
   (when *definition-recorder*

@@ -9,7 +9,7 @@
    #:error-source-key #:error-feature #:error-phase #:error-path #:error-detail
    #:domain-violation #:violation-unit #:violation-name #:violation-arguments
    #:closed-unit #:closed-unit-p #:unit-metadata #:unit-source
-   #:unit-function #:unit-report #:write-unit-source #:write-unit-metadata
+   #:unit-function #:unit-report #:write-unit-source #:write-unit-metadata #:with-native-bindings
    #:make-reference-domain #:make-layout #:layout-identity #:sg-make-record #:sg-record-p
    #:sg-record-class #:sg-record-typep #:sg-record-unit-p #:sg-record-layout-p
    #:sg-record-matches-layout-p #:sg-record-boundp #:sg-record-read

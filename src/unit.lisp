@@ -11,6 +11,7 @@
   (metadata nil :read-only t)
   (source nil :read-only t)
   (bindings nil :read-only t)
+  (configuration-bindings nil :read-only t)
   (report nil :read-only t))
 
 (defun unit-metadata (unit)
@@ -24,17 +25,67 @@
 
 (defun function-name-key (name) (source-name-key name))
 
-(defun unit-function (unit name)
-  "Resolve an externally callable entry in this installed portable binding."
-  (or (if (stringp name)
-          (let ((matches (remove-if-not (lambda (binding)
-                                         (let ((key (car binding)))
-                                           (and (stringp (car key)) (string= name (second key)))))
-                                       (closed-unit-bindings unit))))
-            (when (= (length matches) 1) (cdar matches)))
-          (cdr (assoc (function-name-key name) (closed-unit-bindings unit) :test #'equal)))
-      (error "~S is not an entry of Snowgrave unit ~S."
-             name (getf (closed-unit-metadata unit) :identity))))
+(defun unit-binding-key (unit name)
+  (let ((bindings (remove-duplicates
+                   (append (closed-unit-bindings unit) (closed-unit-configuration-bindings unit))
+                   :key #'car :test #'equal)))
+    (if (stringp name)
+        (let ((matches (remove-if-not
+                        (lambda (binding)
+                          (let ((key (car binding)))
+                            (and (stringp (car key)) (string= name (second key)))))
+                        bindings)))
+          (when (= (length matches) 1) (caar matches)))
+        (function-name-key name))))
+
+(defun unit-function (unit name &key bind-configuration)
+  "Resolve an installed entry. BIND-CONFIGURATION explicitly selects its
+zero-argument fixed-root binding; the artifact retains its original arity."
+  (let* ((key (unit-binding-key unit name))
+         (configured (cdr (assoc key (closed-unit-configuration-bindings unit) :test #'equal))))
+    (when configured
+      (unless bind-configuration
+        (error "Entry ~S requires :BIND-CONFIGURATION T for its fixed-root binding." name))
+      (return-from unit-function configured))
+    (when bind-configuration (error "Entry ~S has no fixed configuration binding." name))
+    (or (cdr (assoc key (closed-unit-bindings unit) :test #'equal))
+        (error "~S is not an entry of Snowgrave unit ~S."
+               name (getf (closed-unit-metadata unit) :identity)))))
+
+(defstruct (identity-operand (:constructor make-identity-operand (value))) value)
+
+(defun own-closing-declaration (declaration)
+  "Own structural data without copying identity operands before joint capture.
+An object used both as an identity operand and as metadata still has an owned
+metadata copy. Temporary handles occur only at explicit operand positions."
+  (labels ((entry-map (entries function)
+             (if (source-finite-list-p entries)
+                 (mapcar (lambda (entry)
+                           (if (and (source-finite-list-p entry) (= (length entry) 2)
+                                    (source-finite-list-p (second entry)))
+                               (list (first entry)
+                                     (mapcar (lambda (domain)
+                                               (if (and (consp domain) (source-finite-list-p domain)
+                                                        (= (length domain) 2) (eq (first domain) 'eql))
+                                                   (list 'eql (funcall function (second domain))) domain))
+                                             (second entry))) entry)) entries) entries))
+           (binding-map (bindings function)
+             (if (source-finite-list-p bindings)
+                 (mapcar (lambda (binding)
+                           (if (and (source-finite-list-p binding) (= (length binding) 2))
+                               (list (first binding) (funcall function (second binding))) binding)) bindings)
+                 bindings)))
+    (let ((skeleton (copy-list declaration)))
+      (setf (getf skeleton :external-domains)
+            (entry-map (getf skeleton :external-domains) #'make-identity-operand)
+            (getf skeleton :native-bindings)
+            (binding-map (getf skeleton :native-bindings) #'make-identity-operand))
+      (let ((owned (immutable-copy skeleton)))
+        (setf (getf owned :external-domains)
+              (entry-map (getf owned :external-domains) #'identity-operand-value)
+              (getf owned :native-bindings)
+              (binding-map (getf owned :native-bindings) #'identity-operand-value))
+        owned))))
 
 (defun write-unit-source (unit stream)
   (let ((*print-readably* t) (*print-pretty* t) (*print-circle* t) (*package* (find-package :cl)))
@@ -96,11 +147,19 @@
 (defun close-source-unit (source-unit &rest declaration
                          &key unit-name closed-classes universe closed-generics
                            entries external-domains external-operations external-return-domains
-                           external-value-guards external-argument-domains
+                           external-value-guards external-argument-domains native-bindings
                            (domain-violation :signal) (adapter :sbcl)
                          &allow-other-keys)
   "Close an ordered source unit through a registered compiler adapter.
 No unit is returned until the adapter's semantic and residual audits pass.
+Identity-bearing EQL entry operands request joint cold graph capture. Native
+array bindings are (stable-key array) pairs whose identities are preserved;
+other captured storage becomes a private installed copy without initialization.
+Successful closing adopts this source configuration exclusively: the caller
+must stop using its original mutation and cleanup routes. Failure retains the
+original configuration's custody. Native installation owners maintain admitted
+geometry, alias relations and external resource lifetime. Resolve such entries
+with UNIT-FUNCTION :BIND-CONFIGURATION T; their bindings take no arguments.
 EXTERNAL-RETURN-DOMAINS optionally records (operation exact-native-value-tuple)
 owner ABI guarantees. It grants no purity, placement, or opaque-object proof;
 an installed external binding must satisfy its published result contract.
@@ -124,4 +183,7 @@ argument authority. Definition/resource/alias lifetime remains installation-owne
     (unless closer
       (reject 'unsupported-definition :declaration :adapter
               (format nil "Load the compiler adapter for ~S before closing." adapter)))
-    (funcall closer source-unit (immutable-copy declaration))))
+    (flet ((close-it () (funcall closer source-unit (own-closing-declaration declaration))))
+      (if native-bindings
+          (call-with-native-bindings unit-name native-bindings #'close-it)
+          (close-it)))))

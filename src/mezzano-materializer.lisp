@@ -28,6 +28,9 @@ preparation, including symbols carried in quoted forms and metadata."
     (reject 'unsupported-definition :native-materialization :record-area
             "Only the target's ordinary :WIRED and :DYNAMIC areas are supported."))
   (let ((forms (unit-source unit)) (metadata (unit-metadata unit)) (type-obligations nil))
+    (when (getf metadata :configuration)
+      (reject 'unsupported-definition :native-materialization :configuration-installation-abi
+              "Fixed configuration capture needs a target installation and custody mapping before native preparation."))
     (labels ((audit (form)
                (cond ((symbolp form)
                       (when (and (symbol-package form)

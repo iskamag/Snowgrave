@@ -31,7 +31,7 @@
 (defstruct (authored-source (:constructor %make-authored-source))
   (forms nil :read-only t) (index nil :read-only t))
 
-(defun make-authored-source (forms &key identity)
+(defun make-authored-source (forms &key identity copy-observer)
   "Own and index ordered authored input. Readers expose immutable facts by contract.
 The complete definition sequence is ordered; per-kind groups are newest first.
 Repeated ordinary definitions reject; methods retain their observable source order."
@@ -39,7 +39,7 @@ Repeated ordinary definitions reject; methods retain their observable source ord
     (reject 'nonreproducible-source :source-admission :source-sequence
             "Authored input must be a finite proper list of ordered definitions."
             :path (list identity)))
-  (let ((owned (immutable-copy forms)) (index (make-hash-table :test #'equal)))
+  (let ((owned (immutable-copy forms copy-observer)) (index (make-hash-table :test #'equal)))
     (setf (gethash :by-form index) (make-hash-table :test #'eq))
     (loop for form in owned for position from 1
           for kind = (source-defining-kind form)

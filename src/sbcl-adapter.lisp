@@ -96,7 +96,12 @@
   (sequence 0) (dependencies nil) (source-key nil)
   (literal-pools nil)
   (literal-states (make-hash-table :test #'eq))
-  function-domains function-returns generic-call-shapes function-flow-evidence)
+  function-domains function-returns generic-call-shapes function-flow-evidence
+  (graph-index (make-hash-table :test #'eq))
+  graph-nodes graph-imports graph-root-names graph-root-references graph-resource-name
+  graph-state-invalidations
+  (source-origins (make-hash-table :test #'eq))
+  (graph-literal-states (make-hash-table :test #'eq)))
 
 (defun build-forms (build)
   (or (build-normalized-forms build) (snowgrave:authored-source-forms (build-source build))))
@@ -287,16 +292,25 @@ all other expansions re-enter the same admission and residual audits."
            (list* (car form) (second form) (expression (third form)) (cdddr form)) form))
       (t form))))
 
+(defun source-copy-observer (build)
+  ;; Transient ownership provenance joins native literals with captured roots.
+  ;; Syntax is still copied on every boundary; no source handle is retained in
+  ;; the installed unit or in its serialized metadata.
+  (when (entry-graph-request-p build)
+    (lambda (original copy)
+      (setf (gethash copy (build-source-origins build))
+            (gethash original (build-source-origins build) original)))))
+
 (defun normalize-authored-source (build)
   ;; Neither a user expander that destructively edits its argument nor a
   ;; returned, globally aliased expansion can mutate the authored provenance
   ;; or the pass-two input. Own both graphs, preserving literal EQ sharing.
   (let* ((originals (snowgrave:authored-source-forms (build-source build)))
-         (inputs (snowgrave::immutable-copy originals))
+         (inputs (snowgrave::immutable-copy originals (source-copy-observer build)))
          (expanded (loop for original in originals for input in inputs
                          collect (with-build-source-key (build (authored-source-key build original))
                                    (normalize-authored-definition build input))))
-         (frozen (snowgrave::immutable-copy expanded)))
+         (frozen (snowgrave::immutable-copy expanded (source-copy-observer build))))
     (loop for original in originals for normalized in frozen
           do (setf (gethash normalized (build-normalized-originals build)) original))
     ;; Every pass and every return/call analysis consumes this same snapshot.
@@ -609,6 +623,7 @@ No arbitrary type alias, pointer array, or foreign class is an owner ABI."
 
 (defun external-result-domain-p (domain)
   (or (eq domain :external-result) (shaped-domain-p domain)
+      (and (graph-node-domain-p domain) (external-result-domain-p (third domain)))
       (and (consp domain) (eq (car domain) 'or) (some #'external-result-domain-p (cdr domain)))))
 
 (defun qualify-domain-origin (shape origin)
@@ -618,7 +633,8 @@ No arbitrary type alias, pointer array, or foreign class is an owner ABI."
       shape))
 
 (defun value-domain-shape (build domain)
-  (cond ((shaped-domain-p domain) (second domain))
+  (cond ((graph-node-domain-p domain) (value-domain-shape build (third domain)))
+        ((shaped-domain-p domain) (second domain))
         ((or (eq domain :external-result) (external-value-domain-p build domain)) :unknown)
         ((and (consp domain) (eq (car domain) 'or))
          (reduce (lambda (left right) (merge-value-domains build left right))
@@ -635,6 +651,7 @@ The stable key names its owner obligation, never a class or slot type."
 
 (defun external-value-observation-p (build domain)
   (or (external-value-domain-p build domain)
+      (and (graph-node-domain-p domain) (external-value-observation-p build (third domain)))
       (and (consp domain) (eq (car domain) 'or)
            (some (lambda (part) (external-value-observation-p build part)) (cdr domain)))))
 
@@ -654,7 +671,8 @@ The stable key names its owner obligation, never a class or slot type."
 
 (defun native-data-domain-p (build domain)
   (and (not (external-result-domain-p domain))
-       (or (external-value-domain-p build domain)
+       (or (and (graph-node-domain-p domain) (native-data-domain-p build (third domain)))
+           (external-value-domain-p build domain)
            (and (consp domain) (eq (car domain) 'or)
                 (every (lambda (part) (native-data-domain-p build part)) (cdr domain)))
            (and (consp domain) (eq (car domain) 'eql)
@@ -683,6 +701,8 @@ The stable key names its owner obligation, never a class or slot type."
   ;; A record/callable/shared-layout ABI needs its actual external owner seam.
   (when (and (not *collect-function-flow*)
              (member-name name (getf (build-declaration build) :external-operations)))
+    (when (graph-state-profile-p build)
+      (audit-graph-native-inputs build arguments :graph-state-external-argument))
     ;; An owner guard has an explicit all-logical-values rejection ABI. It
     ;; must establish unchanged identity before interpreting the candidate;
     ;; its positive result, not argument syntax, is the import proof.
@@ -707,7 +727,7 @@ The stable key names its owner obligation, never a class or slot type."
 
 (defun external-shared-binding-p (build name local-specials)
   (and (not *collect-function-flow*)
-       (getf (build-declaration build) :external-operations)
+       (or (getf (build-declaration build) :external-operations) (graph-state-profile-p build))
        (or (special-variable-p build name) (assoc name local-specials))))
 
 (defun audit-external-shared-binding (build name compatiblep &optional local-specials)
@@ -725,6 +745,14 @@ The stable key names its owner obligation, never a class or slot type."
     (audit-external-shared-binding build name (and knownp (native-data-form-p build value)) local-specials)))
 
 (defun audit-external-place-value (build place value)
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*) (consp place))
+    (audit-graph-native-inputs build (list value) :graph-state-write)
+    (if (eq (car place) 'slot-value)
+        (audit-graph-record-slot build (second place) (third place))
+        (loop for argument in (cdr place) for position from 0
+              unless (and (= position 0) (member (car place) '(aref svref car cdr nth))
+                          (native-sequence-form-p build argument))
+              do (audit-graph-native-inputs build (list argument) :graph-state-place))))
   (when (and (not *collect-function-flow*)
              (or (build-classes build) (getf (build-declaration build) :closed-generics))
              (external-result-domain-p (value-domain build value)))
@@ -1089,8 +1117,20 @@ The stable key names its owner obligation, never a class or slot type."
   ;; to skip their source/callback/residual audits. LENGTH's native receiver
   ;; proof belongs to audit-ordinary-operation.
   (let ((domain (case name ((ash logand logior logxor lognot) 'integer)
-                           (plusp 'boolean) (length '(integer 0 *)))))
+                           ((plusp eq eql equal equalp) 'boolean) (length '(integer 0 *)))))
     (when (and domain (standard-operation-meaning-p build name nil global-targets)) domain)))
+
+(defun ordinary-single-value-result-p (build name &optional global-targets)
+  ;; Only normal-return cardinality, never permission to omit operation,
+  ;; callback, argument, representation or residual audits. In particular a
+  ;; reducer can forward its callback's values, so REDUCE is not in this list.
+  (and (or (ordinary-scalar-result-domain build name global-targets)
+           (member name '(eq eql equal equalp identity not null atom consp symbolp
+                          numberp integerp rationalp floatp realp complexp stringp
+                          characterp vectorp arrayp keywordp
+                          fill coerce mapc mapl reverse nreverse remove delete
+                          list list* cons vector mapcar maplist mapcan)))
+       (standard-operation-meaning-p build name nil global-targets)))
 
 (defun ordinary-indirect-result-domain (build form targets global-targets)
   (when (member (car form) '(funcall apply multiple-value-call))
@@ -1153,6 +1193,7 @@ The stable key names its owner obligation, never a class or slot type."
   "Apply one logical observation/callback policy to direct and indirect calls."
   (let ((equality-positions nil))
   (unless (member-name name local)
+    (unless open (audit-graph-ordinary-inputs build name arguments))
     (when (eq name 'coerce)
       (unless (and (not variable-tail) (= (length arguments) 2))
         (fail build 'snowgrave:unclosed-call :coerce-arguments
@@ -1263,7 +1304,7 @@ The stable key names its owner obligation, never a class or slot type."
   (when *collect-function-flow* (return-from validate-record-slot (build-layouts build)))
   (let* ((domain (value-domain build record-form))
          (layouts (remove-if-not (lambda (layout)
-                                   (some (lambda (actual) (member actual (getf layout :ancestors)))
+                                   (some (lambda (actual) (member (graph-node-domain actual) (getf layout :ancestors)))
                                          (domain-alternatives domain))) (build-layouts build))))
     (unless (and (record-domain-p build domain) layouts
                  (symbolp slot) (symbol-package slot))
@@ -1613,13 +1654,16 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
   ;; A may-opaque profile covers clean inputs too; UNKNOWN cannot cover an
   ;; actual import origin which its body proof would otherwise reinterpret.
   (or (equal actual expected)
-      (if (external-result-domain-p expected)
+      (if (graph-node-domain-p expected)
+          (and (graph-node-domain-p actual) (eql (second actual) (second expected))
+               (flow-domain-covered-p build (third actual) (third expected)))
+          (if (external-result-domain-p expected)
           ;; A may-opaque envelope covers clean callers too, but a shaped
           ;; envelope still requires geometry from every caller.
           (or (eq (value-domain-shape build expected) :unknown)
               (subtype-domain-p build actual (value-domain-shape build expected)))
           (and (not (external-result-domain-p actual))
-               (or (eq expected :unknown) (subtype-domain-p build actual expected))))))
+               (or (eq expected :unknown) (subtype-domain-p build actual expected)))))))
 
 (defun record-local-function-inputs (build binding domains)
   (let* ((frame (local-function-binding-frame binding))
@@ -2073,9 +2117,19 @@ Unknown/native operations retain only their existing primary fact."
      (multiple-value-bind (targets global-targets callee-domain) (known-function-targets build (second form))
        (multiple-value-bind (ordinary precise-p)
            (ordinary-indirect-result-domain build form targets global-targets)
-         (if precise-p (make-return-summary (list ordinary) nil)
+         (if precise-p
+             (make-return-summary
+              (list ordinary)
+              (every (lambda (target) (ordinary-single-value-result-p build target global-targets)) targets))
              (indirect-call-return-summary build form targets global-targets callee-domain)))))
     ((source-call-return-summary build (car form)) (source-call-return-summary build (car form)))
+    ((and (member (car form) '(slot-value snowgrave::%record-read))
+          (nth-value 1 (record-slot-read-domain build (second form) (third form))))
+     (make-return-summary (list (value-domain build form)) t))
+    ((or (ordinary-single-value-result-p build (car form))
+         (and (member (car form) '(typep slot-boundp))
+              (standard-operation-meaning-p build (car form))))
+     (make-return-summary (list (value-domain build form)) t))
     (t (make-return-summary (list (value-domain build form)) nil))))
 
 (defun analyze-multiple-value-scope (build variables producer process &key open specials)
@@ -2347,6 +2401,13 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ((and (consp form) (find-local-function-binding (car form)))
          (values (return-summary-primary
                   (local-call-return-summary build (find-local-function-binding (car form)) form)) t))
+        ((and (consp form) (or (eq (car form) 'slot-value)
+                                    (and *generated-class-operation* (eq (car form) 'snowgrave::%record-read))))
+         (record-slot-read-domain build (second form) (third form)))
+        ((and (graph-state-profile-p build) (consp form) (eq (car form) 'slot-boundp))
+         (values 'boolean t))
+        ((and (graph-state-profile-p build) (consp form) (eq (car form) 'slot-makunbound))
+         (values (value-domain build (second form)) t))
         ((and (consp form) (eq (car form) 'quote))
          (if (or (symbolp (cadr form)) (numberp (cadr form)) (characterp (cadr form)))
              (list 'eql (cadr form)) (type-of (cadr form))))
@@ -2432,7 +2493,11 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         (t :unknown)))
 
 (defun subtype-domain-p (build actual expected)
-  (cond ((shaped-domain-p actual) (subtype-domain-p build (second actual) expected))
+  (cond ((graph-node-domain-p expected)
+         (and (graph-node-domain-p actual) (eql (second actual) (second expected))
+              (subtype-domain-p build (third actual) (third expected))))
+        ((graph-node-domain-p actual) (subtype-domain-p build (third actual) expected))
+        ((shaped-domain-p actual) (subtype-domain-p build (second actual) expected))
         ((shaped-domain-p expected) (subtype-domain-p build actual (second expected)))
         ((eq expected t) t)
         ((member actual '(:unknown :pending :external-result)) nil)
@@ -2472,7 +2537,8 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
   (if (and (consp domain) (eq (car domain) 'or)) (cdr domain) (list domain)))
 
 (defun record-domain-p (build domain)
-  (every (lambda (actual) (member-name actual (build-classes build))) (domain-alternatives domain)))
+  (every (lambda (actual) (member-name (graph-node-domain actual) (build-classes build)))
+         (domain-alternatives domain)))
 
 (defun builtin-type-test (build type value)
   ;; The physical output is a compiled ordinary function. Its source generic
@@ -2492,7 +2558,9 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ;; UNKNOWN must not erase the fact that a possible return came from
         ;; an opaque native boundary. Otherwise a join can authorize a closed
         ;; class observation of the actual original CLOS object.
-        ((or (external-result-domain-p previous) (external-result-domain-p additional))
+        ((and (or (external-result-domain-p previous) (external-result-domain-p additional))
+              (not (every #'graph-node-domain-p
+                          (append (domain-alternatives previous) (domain-alternatives additional)))))
          (qualify-domain-origin
           (merge-value-domains build (value-domain-shape build previous)
                                     (value-domain-shape build additional))
@@ -2595,38 +2663,55 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                (fail build 'snowgrave:incomplete-domain :generic-call-bindings
                      (format nil "Caller of ~S lacks its raw argument binding proof." name) :reachability))))))))
 
+(defun intersect-method-cell-domain (build actual cell)
+  ;; Return a binding fact and whether this caller can occupy the already
+  ;; selected cell. UNKNOWN/captures cannot establish a private node identity.
+  (cond ((eq actual :pending) (values :pending t))
+        ((eq cell t) (values actual t))
+        ((member actual '(:unknown :external-result)) (values cell t))
+        (t (let ((selected :pending) (compatiblep nil))
+             (dolist (part (domain-alternatives actual))
+               (cond ((subtype-domain-p build part cell)
+                      (setf selected (merge-value-domains build selected part) compatiblep t))
+                     ;; A broad declared caller can occupy this class cell,
+                     ;; but cannot lend it a particular graph node qualifier.
+                     ((subtype-domain-p build cell (graph-node-domain part))
+                      (setf selected (merge-value-domains build selected cell) compatiblep t))))
+             (values selected compatiblep)))))
+
 (defun method-binding-domains (build generic lambda-list body)
-  "Derive method inputs from raw generic calls; the MOP still owns dispatch.
-Concrete required bindings use the emitted cell. A universal cell does not
-erase the actual caller's required-value proof. All facts conservatively join
-the generic's call shapes, without a second applicability algorithm."
+  "Project whole compatible caller tuples through the existing MOP cell."
   (let* ((inputs (lambda-input-variables (lambda-contract build lambda-list :method t)))
          (required (length *cell-domains*))
          (summary nil) (shapes (gethash generic (build-generic-call-shapes build))))
     (when shapes
-     (maphash
-      (lambda (key domains)
-       (destructuring-bind (capture variable-tail count literal-names) key
-        (declare (ignore literal-names))
-        (let* ((supplied
-                 (append
-                  (loop for cell in *cell-domains* for position from 0
-                        collect
-                        (if (or (not (eq cell t)) capture (initialization-generic-p generic))
-                            ;; Construction also has compiler-owned callers.
-                            ;; Its dedicated protocol emitter owns their cell
-                            ;; contract, independently of authored call shapes.
-                            cell
-                            (if (< position count) (nth position domains) :unknown)))
-                  (unless capture (nthcdr required domains))))
-               (actual (call-lambda-domains build lambda-list supplied (or capture variable-tail)
-                                           :method t :specials (body-special-domains body))))
-          (setf summary (if summary
-                            (mapcar (lambda (old new) (merge-value-domains build old new)) summary actual)
-                            actual))))) shapes))
+      (maphash
+       (lambda (key domains)
+         (destructuring-bind (capture variable-tail count literal-names) key
+           (declare (ignore literal-names))
+           (let ((supplied nil) (compatiblep t))
+             (loop for cell in *cell-domains* for position from 0
+                   do (multiple-value-bind (fact possiblep)
+                          (if (or capture (initialization-generic-p generic)
+                                  (and (not (graph-state-profile-p build)) (not (eq cell t))))
+                              (values cell t)
+                              (intersect-method-cell-domain build (if (< position count) (nth position domains) :unknown) cell))
+                        (push fact supplied)
+                        (unless possiblep (setf compatiblep nil))))
+             ;; Never mix positions from incompatible caller tuples, and never
+             ;; narrow a selected cell merely because it has no known caller.
+             (when compatiblep
+               (let ((actual (call-lambda-domains
+                              build lambda-list (append (nreverse supplied) (unless capture (nthcdr required domains)))
+                              (or capture variable-tail) :method t :specials (body-special-domains body))))
+                 (setf summary (if summary
+                                   (mapcar (lambda (old new) (merge-value-domains build old new)) summary actual)
+                                   actual))))))) shapes))
     (or summary (append (mapcar (lambda (cell)
-                                  (if (or (not (eq cell t)) (initialization-generic-p generic))
-                                      cell (if (and *collect-function-flow* (not *settled-method-roots*)) :pending :unknown)))
+                                  (if (and (graph-state-profile-p build) *collect-function-flow* (not *settled-method-roots*))
+                                      :pending
+                                      (if (or (not (eq cell t)) (initialization-generic-p generic))
+                                          cell (if (and *collect-function-flow* (not *settled-method-roots*)) :pending :unknown))))
                                 *cell-domains*)
                         (make-list (- (length inputs) required)
                                    :initial-element (if (and *collect-function-flow* (not *settled-method-roots*)) :pending :unknown))))))
@@ -2990,12 +3075,20 @@ reflection, lexical rebinding and class values still require their own ABI."
            (fail build 'snowgrave:unsupported-definition :lexical-control
                  "GO needs an enclosing normalized TAGBODY target."))
          `(go ,(cdr target))))
+      ((and (graph-state-profile-p build) (not open) (not *collect-function-flow*)
+            (eq (car form) 'make-instance))
+       (fail build 'snowgrave:unclosed-class-operation :graph-state-construction
+             "Source construction requires its graph-bearing initarg/error escape proof; cold captured graph shells are separate."
+             :reachability))
       ((eq (car form) 'the)
        (unless (or (native-value-type-p (second form)) (member (second form) '(t list cons)))
          (fail build 'snowgrave:unclosed-class-operation :type-assertion
                "THE needs an admitted native type or explicit closed representation mapping."))
        `(the ,(second form) ,(walk (third form))))
       ((member (car form) '(block return-from catch throw))
+       (when (and (eq (car form) 'throw) (not open) (graph-state-profile-p build)
+                  (not *collect-function-flow*))
+         (audit-graph-native-inputs build (cdr form) :graph-state-throw))
        `(,(car form) ,(if (member (car form) '(catch throw))
                          (walk (cadr form)) (cadr form))
          ,@(body (cddr form))))
@@ -3236,7 +3329,9 @@ reflection, lexical rebinding and class values still require their own ABI."
          (unless constantp
            (fail build 'snowgrave:unclosed-class-operation :dynamic-slot
                  "A dynamic slot name needs a finite success/error dispatcher."))
-         (unless open (validate-record-slot build (cadr form) slot))
+         (unless open
+           (validate-record-slot build (cadr form) slot)
+           (audit-graph-record-slot build (second form) (third form) :bound (eq (first form) 'slot-value)))
          (if open `(,(car form) ,(walk (cadr form)) ',slot)
              (case (car form)
                (slot-value `(snowgrave::%record-read ,(walk (cadr form)) ',slot
@@ -3747,6 +3842,10 @@ An unknown name makes that name and the remainder uncertain, never absent."
     (t form)) form))
 
 (defun literal-reference (build value package)
+  (when (eq package (build-output-package build))
+    (setf value (graph-literal-origin build value)))
+  (when (and (eq package (build-output-package build)) (graph-source-node build value))
+    (return-from literal-reference (graph-literal-reference build value)))
   ;; EQ is the source graph's authority, not structural equality. Separate
   ;; pools keep the disposable CLOS pass and the installed unit independent.
   (unless (serializable-literal-graph-p value (build-literal-states build))
@@ -3763,7 +3862,11 @@ An unknown name makes that name and the remainder uncertain, never absent."
                           (vector-push-extend value (literal-pool-values pool))))))
     ;; Retain the literal's native type for ordinary array/string lowering;
     ;; an opaque LOAD-TIME-VALUE would otherwise lose that compiler fact.
-    `(the ,(type-of value) (load-time-value (svref ,(literal-pool-name pool) ,index) t))))
+    ;; Even an ordinary outer literal can share a captured mutable child after
+    ;; provenance is joined by the pool. Keep that whole installation mutable.
+    `(the ,(type-of value)
+       (load-time-value (svref ,(literal-pool-name pool) ,index)
+         ,(not (and (eq package (build-output-package build)) (build-graph-root-names build)))))))
 
 (defun literal-pool-definition (build package)
   (let ((pool (cdr (assoc package (build-literal-pools build)))))
@@ -3771,50 +3874,94 @@ An unknown name makes that name and the remainder uncertain, never absent."
       (let ((seen (make-hash-table :test #'eq)) (defaults (make-hash-table :test #'eq))
             (bindings nil) (edges nil) (pending nil))
         (labels ((reference (value)
-                   (if (or (consp value) (arrayp value))
-                       (or (gethash value seen)
-                           (let* ((backing (when (arrayp value)
-                                             (let ((parent (array-displacement value)))
-                                               (when parent (reference parent)))))
-                                  (name (gensym "LITERAL"))
-                                  (default (when (and (arrayp value) (not backing)
-                                                      (array-element-type value) (plusp (array-total-size value)))
-                                             (let ((first (row-major-aref value 0)))
-                                               (list (if (or (numberp first) (characterp first) (symbolp first))
-                                                         first nil)))))
-                                  (initializer
-                                    (cond ((consp value) '(cons nil nil))
-                                          (t `(make-array ',(array-dimensions value)
-                                                ,@(loop for (key argument) on
-                                                        (snowgrave::array-allocation-options value backing) by #'cddr
-                                                        append (list key (if (eq key :displaced-to) argument `',argument)))
-                                                ,@(when default `(:initial-element ',(car default))))))))
-                             (setf (gethash value seen) name)
-                             (when default (setf (gethash value defaults) default))
-                             (push (list name initializer) bindings)
-                             (unless (and (arrayp value)
-                                          (or (array-displacement value) (null (array-element-type value))))
-                               (push (cons name value) pending))
-                             name))
-                       `',value)))
+                   (when (eq package (build-output-package build))
+                     (setf value (graph-literal-origin build value)))
+                   (let ((row (and (eq package (build-output-package build))
+                                   (graph-source-node build value))))
+                    (cond ((and row (getf row :import-reference)) (getf row :import-reference))
+                          ((or (consp value) (arrayp value) (and row (getf row :class)))
+                           (or (gethash value seen)
+                               (let* ((parent (when (arrayp value)
+                                                (if row (getf row :backing) (array-displacement value))))
+                                      (backing (when parent (reference parent)))
+                                      (name (gensym "LITERAL"))
+                                      (payload (when (arrayp value)
+                                                 (if row (getf row :values)
+                                                     (unless (or parent (null (array-element-type value)))
+                                                       (loop for i below (array-total-size value)
+                                                             collect (row-major-aref value i))))))
+                                      (default (when payload
+                                                 (let ((first (car payload)))
+                                                   (list (if (or (numberp first) (characterp first) (symbolp first)) first nil)))))
+                                      (initializer
+                                        (cond ((and row (getf row :class))
+                                               `(snowgrave:sg-make-record ,(ensure-layout build (getf row :class))))
+                                              ((consp value) '(cons nil nil))
+                                              (t `(make-array ',(if row (getf row :dimensions) (array-dimensions value))
+                                                    ,@(loop for (key argument) on
+                                                            (if row (getf row :options)
+                                                                (snowgrave::array-allocation-options value backing)) by #'cddr
+                                                            append (list key (if (eq key :displaced-to) backing `',argument)))
+                                                    ,@(when default `(:initial-element ',(car default))))))))
+                                 (setf (gethash value seen) name)
+                                 (when default (setf (gethash value defaults) default))
+                                 (push (list name initializer) bindings)
+                                 (unless (and (arrayp value) (or parent (null (array-element-type value))))
+                                   (push (list name value row payload) pending))
+                                 name)))
+                          (t `',value)))))
           (let ((roots (map 'list #'reference (literal-pool-values pool))))
-            (loop while pending for (name . value) = (pop pending) do
-              (if (consp value)
-                  (push `(setf (car ,name) ,(reference (car value))
-                               (cdr ,name) ,(reference (cdr value))) edges)
-                  (dotimes (index (array-total-size value))
-                    (let ((element (row-major-aref value index)) (default (gethash value defaults)))
-                      (unless (and default (eql element (car default)))
-                        (push `(setf (row-major-aref ,name ,index) ,(reference element)) edges))))))
-            ;; Allocate every shell before installing edges. Back edges and
-            ;; cycles need no source object or initialization callback. Only
-            ;; scalar leaves reach the compiler's constant dumper.
+            (loop while pending for (name value row payload) = (pop pending) do
+              (cond ((and row (getf row :class))
+                     (dolist (field (getf row :values))
+                       (when (second field)
+                         (push `(snowgrave:sg-record-write ,name ',(first field) ,(reference (third field))) edges))))
+                    ((consp value)
+                     (let ((parts (if row (getf row :values) (list (car value) (cdr value)))))
+                       (push `(setf (car ,name) ,(reference (first parts))
+                                    (cdr ,name) ,(reference (second parts))) edges)))
+                    (t (loop for element in payload for index from 0 do
+                         (let ((default (gethash value defaults)))
+                           (unless (and default (eql element (car default)))
+                             (push `(setf (row-major-aref ,name ,index) ,(reference element)) edges)))))))
+            ;; One identity inventory and shell/fill recipe handles both native
+            ;; literals and admitted configuration records. Imported nodes are
+            ;; references and never receive initializer/fill effects.
             `(defparameter ,(literal-pool-name pool)
                (let* ,(nreverse bindings) ,@(nreverse edges) (vector ,@roots)))))))))
 
 (defun with-literal-pool (build forms package)
-  (let ((definition (literal-pool-definition build package)))
-    (if definition (cons definition forms) forms)))
+  (let* ((definition (literal-pool-definition build package))
+         (configurationp (and (eq package (build-output-package build))
+                              (build-graph-root-names build)))
+         (ordered
+           (cond ((null definition) forms)
+                 (configurationp
+                  ;; Native validation precedes layouts; both precede record
+                  ;; shells. Keep the ordinary/open native literal prefix.
+                  (let ((prefix nil) (rest forms))
+                    (loop while (and rest
+                                     (let ((form (car rest)))
+                                       (and (eq (car form) 'defparameter)
+                                            (or (eq (second form) (build-reference-domain-name build))
+                                                (member (second form) (build-layout-names build) :key #'cdr)
+                                                (eq (second form) (build-graph-resource-name build))
+                                                (find (second form) (build-graph-imports build)
+                                                      :key (lambda (binding) (getf (cdr binding) :name)))))))
+                          do (push (pop rest) prefix))
+                    (append (nreverse prefix) (list definition) rest)))
+                 (t (cons definition forms)))))
+    (if configurationp
+        ;; Reserve the incarnation before any resource/layout/root cell can be
+        ;; changed, including a second load after an incomplete installation.
+        (let ((seal (fresh-name build "CONFIGURATION-INCARNATION")))
+          (cons `(defparameter ,seal
+                   (if (boundp ',seal)
+                       (snowgrave::native-binding-error ',(build-identity build)
+                         :configuration-incarnation "A configuration identity has already been installed.")
+                       t))
+                ordered))
+        ordered)))
 
 (defun compile-forms (build forms phase &key stage-specials)
   (flet ((run ()
@@ -4721,6 +4868,12 @@ class whitelist replaces their actual applicability behavior."
 
 (defun domain-test (build domain parameter)
   (cond ((eq domain t) t)
+        ((graph-node-domain-p domain)
+         (let ((row (graph-node-row build domain)))
+           (unless row
+             (fail build 'snowgrave:incomplete-domain :entry-domain
+                   "An installed entry graph identity needs its captured node." :partition))
+           `(eq ,parameter ,(graph-literal-reference build (getf row :source)))))
         ((and (consp domain) (eq (car domain) 'eql)) `(eql ,parameter ',(cadr domain)))
         ((member-name domain (build-classes build))
          (record-type-test build domain parameter))
@@ -4735,7 +4888,8 @@ class whitelist replaces their actual applicability behavior."
   ;; used for an unknown APPLY tail. Revisit it as helper returns settle.
   (dolist (name (getf (build-declaration build) :entries))
     (let* ((form (ordinary-function-form build name))
-           (domains (cadr (assoc name (getf (build-declaration build) :external-domains) :test #'name=))))
+           (domains (or (cdr (assoc name (build-graph-root-names build) :test #'name=))
+                        (cadr (assoc name (getf (build-declaration build) :external-domains) :test #'name=)))))
       (with-build-source-key (build (authored-source-key build form))
         (unless (= (length (ordinary-lambda-list build (caddr form))) (length domains))
           (fail build 'snowgrave:incomplete-domain :entry-arity
@@ -4759,6 +4913,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
         (dependencies (build-dependencies build))
         (*collect-function-flow* t) (*function-flow-changed* nil)
         (*settled-method-roots* nil) (iterations 0))
+    (when (graph-state-profile-p build) (prepare-graph-state-proof build))
     (setf (build-function-domains build) (make-hash-table :test #'equal)
           (build-function-returns build) (make-hash-table :test #'equal)
           (build-generic-call-shapes build) (make-hash-table :test #'equal))
@@ -4904,6 +5059,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
              (let* ((*argument-domains* (car scope)) (*function-bindings* (cdr scope))
                     (body (transform-body build (cdddr form) (build-output-package build))))
              (when (member-name name entries)
+               (audit-graph-entry-result build name)
                (when (and (or (build-classes build) (getf (build-declaration build) :closed-generics))
                           (some #'external-result-domain-p
                                 (return-summary-domains (gethash name (build-function-returns build)))))
@@ -4939,6 +5095,33 @@ and class audits with the fixed point. Unknown captures poison the proof."
                        (cons (transform-form build (caddr form) (build-output-package build)) (cdddr form))))
                  (build-generated build))))))
     (nreverse entry-records)))
+
+(defun emit-configuration-bindings (build entries)
+  ;; Public wrappers capture this installation's roots at load time. The
+  ;; ordinary entry keeps its source arity and identity guard in the artifact.
+  (mapcar
+   (lambda (entry)
+     (let ((roots (assoc (getf entry :name) (build-graph-root-references build) :test #'name=)))
+       (when roots
+         (let ((name (fresh-name build "BOUND-CONFIGURATION")))
+           (push `(defun ,name ()
+                    (,(mapped-name (getf entry :name) (build-output-package build)) ,@(cdr roots)))
+                 (build-generated build))
+           (setf (getf entry :bound-code-key) (snowgrave::function-name-key name)
+                 (getf entry :bound-lambda-list) nil
+                 (getf entry :binding) :fixed-configuration))))
+     entry)
+   entries))
+
+(defun configuration-metadata (build)
+  (when (build-graph-root-names build)
+    (list :roots (copy-tree (build-graph-root-names build))
+          :native-manifest (graph-native-manifest build)
+          :source-custody :exclusive-one-way-adoption-on-success
+          :native-custody :installation-owner-maintains-geometry-and-aliases
+          :record-custody :private-installed-copy
+          :entry-binding :explicit-zero-argument-fixed-roots
+          :installation :one-incarnation-per-identity)))
 
 (defun residual-source-audit (build forms)
   (let ((seen (make-hash-table :test #'eq))
@@ -5361,6 +5544,10 @@ implemented here. A nominal native class is never an imported graph proof."
   ;; last so captures see the fresh ordinary bindings from the open CLOS pass.
   (labels ((rank (form)
              (cond ((and (eq (car form) 'defparameter)
+                         (or (eq (second form) (build-graph-resource-name build))
+                             (find (second form) (build-graph-imports build)
+                                   :key (lambda (binding) (getf (cdr binding) :name))))) -1)
+                   ((and (eq (car form) 'defparameter)
                          (or (eq (second form) (build-reference-domain-name build))
                              (member (second form) (build-layout-names build) :key #'cdr))) 0)
                    ((and (eq (car form) 'defun)
@@ -5424,7 +5611,9 @@ implemented here. A nominal native class is never an imported graph proof."
            (when (or (gethash identity-key *published-identities*) (find-package output-name))
              (fail build 'snowgrave:unsupported-definition :sealed-identity
                    "A published unit identity cannot be reopened or reused." :declaration))
-           (setf (build-source build) (snowgrave:make-authored-source (read-source source) :identity identity))
+           (setf (build-source build)
+                 (snowgrave:make-authored-source (read-source source) :identity identity
+                                                :copy-observer (source-copy-observer build)))
            (index-source build)
            (normalize-authored-source build)
            (validate-external-value-contracts build)
@@ -5440,10 +5629,11 @@ implemented here. A nominal native class is never an imported graph proof."
            ;; before the return-domain fixed point takes/discards scratch
            ;; emissions, so a cached name can never outlive its definition.
            (ensure-admitted-layouts build)
+           (when (entry-graph-request-p build) (capture-entry-graph build))
            (infer-function-domains build)
            (let* ((dispatch (mapcar (lambda (name) (emit-generic build name))
                                     (getf declaration :closed-generics)))
-                  (entries (emit-functions build))
+                  (entries (emit-configuration-bindings build (emit-functions build)))
                   (specials (source-specials build))
                   (forms (with-literal-pool build
                            (order-closed-definitions
@@ -5451,6 +5641,7 @@ implemented here. A nominal native class is never an imported graph proof."
                                           (nreverse (build-generated build))))
                            (build-output-package build)))
                   (metadata (list :abi-version 3 :identity identity :entries entries
+                                  :configuration (configuration-metadata build)
                                   :source-normalization
                                   '(:method :sbcl-lexical-host-macroexpansion
                                     :snapshot :once-per-authored-definition
@@ -5528,7 +5719,12 @@ implemented here. A nominal native class is never an imported graph proof."
                           :bindings (mapcar (lambda (name)
                                               (cons (snowgrave::function-name-key name)
                                                     (fdefinition (mapped-name name (build-output-package build)))))
-                                            (getf declaration :entries)))))
+                                            (getf declaration :entries))
+                          :configuration-bindings
+                          (loop for entry in entries for key = (getf entry :bound-code-key)
+                                when key collect
+                                  (cons (snowgrave::function-name-key (getf entry :name))
+                                        (fdefinition (intern (second key) (first key))))))))
                (publish-special-values special-values)
                (setf (gethash identity-key *published-identities*) t published t)
                unit))))

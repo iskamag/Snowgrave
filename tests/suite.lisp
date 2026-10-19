@@ -4336,6 +4336,8 @@
     (local-function-flow-tests)
     (pending-multiple-value-tests)
     (cold-source-boundary-tests)
+    (entry-graph-tests)
+    (graph-state-inference-tests)
     (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)

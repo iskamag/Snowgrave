@@ -9,6 +9,7 @@
                (:file "src/source")
                (:file "src/source-analysis")
                (:file "src/runtime")
+               (:file "src/native-bindings")
                (:file "src/unit")
                (:file "src/mezzano-materializer"))
   :in-order-to ((asdf:test-op (asdf:test-op "snowgrave/tests"))))
@@ -17,7 +18,8 @@
   :description "Restricted two-pass SBCL source adapter for Snowgrave"
   :depends-on ("snowgrave")
   :serial t
-  :components ((:file "src/sbcl-adapter")))
+  :components ((:file "src/sbcl-adapter")
+               (:file "src/sbcl-configuration")))
 
 (asdf:defsystem "snowgrave/tests"
   :depends-on ("snowgrave/sbcl")
@@ -51,6 +53,8 @@
                (:file "tests/local-function-flow")
                (:file "tests/pending-multiple-values")
                (:file "tests/cold-source-boundary")
+               (:file "tests/entry-graphs")
+               (:file "tests/graph-state-inference")
                (:file "tests/native-materialization"))
   :perform (asdf:test-op (operation component)
              (declare (ignore operation component))
