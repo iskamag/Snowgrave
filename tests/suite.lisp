@@ -4337,6 +4337,8 @@
     (pending-multiple-value-tests)
     (cold-source-boundary-tests)
   (cold-symbol-initializer-tests)
+  (deployment-root-tests)
+  (cold-method-combination-tests)
     (entry-graph-tests)
     (native-binding-context-tests)
     (graph-state-inference-tests)

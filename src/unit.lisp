@@ -148,10 +148,13 @@ metadata copy. Temporary handles occur only at explicit operand positions."
                          &key unit-name closed-classes universe closed-generics
                            entries external-domains external-operations external-return-domains
                            external-value-guards external-argument-domains native-bindings
-                           (domain-violation :signal) (adapter :sbcl)
+                           (domain-violation :signal) (deployment-roots :selected) (adapter :sbcl)
                          &allow-other-keys)
   "Close an ordered source unit through a registered compiler adapter.
 No unit is returned until the adapter's semantic and residual audits pass.
+DEPLOYMENT-ROOTS is :SELECTED (selected methods retain independent roots) or
+:ENTRIES (only proven entry/call/capture/global/construction roots are deployed).
+Both policies retain the complete sealed authored source and its open audits.
 Identity-bearing EQL entry operands request joint cold graph capture. Native
 array bindings are (stable-key array) pairs whose identities are preserved;
 other captured storage becomes a private installed copy without initialization.
@@ -176,6 +179,9 @@ argument authority. Definition/resource/alias lifetime remains installation-owne
   (unless (and unit-name entries)
     (reject 'unsupported-definition :declaration :unit-identity-and-entries
             "Both an immutable unit identity and ordinary-function entries are required."))
+  (unless (member deployment-roots '(:selected :entries))
+    (reject 'unsupported-definition :declaration :deployment-roots
+            "Deployment roots must be :SELECTED or :ENTRIES."))
   (unless (eq domain-violation :signal)
     (reject 'unsupported-definition :declaration :violation-action
             "This portable binding supplies only the non-returning :SIGNAL action."))
@@ -183,7 +189,9 @@ argument authority. Definition/resource/alias lifetime remains installation-owne
     (unless closer
       (reject 'unsupported-definition :declaration :adapter
               (format nil "Load the compiler adapter for ~S before closing." adapter)))
-    (flet ((close-it () (funcall closer source-unit (own-closing-declaration declaration))))
-      (if native-bindings
-          (call-with-native-bindings unit-name native-bindings #'close-it)
-          (close-it)))))
+    (let ((effective (copy-list declaration)))
+      (setf (getf effective :deployment-roots) deployment-roots)
+      (flet ((close-it () (funcall closer source-unit (own-closing-declaration effective))))
+        (if native-bindings
+            (call-with-native-bindings unit-name native-bindings #'close-it)
+            (close-it))))))

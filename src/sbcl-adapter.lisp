@@ -26,6 +26,9 @@
 (defvar *flow-record-origins* nil)
 (defvar *flow-defer-source-call* nil)
 (defvar *effective-return-proof* nil)
+;; A CEM uses the shared source grammar. Only CALL-METHOD leaves belong to
+;; the MOP composer; their code/value receipt is supplied at evaluation time.
+(defvar *effective-method-emitter* nil)
 (defvar *fixed-effective-arguments* nil)
 (defvar *collect-function-flow* nil)
 (defvar *function-flow-changed* nil)
@@ -44,6 +47,13 @@
 (defvar *immediate-lambda-domains* nil)
 ;; Only source-owned cold global initializers may emit fresh symbol recipes.
 (defvar *cold-global-initializer* nil)
+(defvar *cold-method-combination-factory* nil)
+(defvar *cold-recipe-source-nodes* nil)
+(defvar *cold-recipe-source-marker* nil)
+(defvar *cold-recipe-normalization* nil)
+(defvar *reproducible-source-expansion* nil)
+(defvar *cold-recipe-active* nil)
+(defvar *cold-recipe-functions* nil)
 
 (defparameter *standard-miss-methods*
   (loop for (name specializers) in '((no-next-method (standard-generic-function standard-method))
@@ -172,7 +182,22 @@ all other expansions re-enter the same admission and residual audits."
            ;; the host; only its normalized body is retained.
            (cddr (walk `(lambda ,variables ,@forms) env)))
          (visit (form context env)
+           (when (and (or *cold-recipe-normalization* *reproducible-source-expansion*)
+                      (eq context :eval))
+             (audit-cold-recipe-macro build form env))
+           (when (and (consp form) (eq (car form) 'declare)
+                      (or *cold-recipe-normalization*
+                          (and *cold-recipe-source-nodes* (gethash form *cold-recipe-source-nodes*))))
+             (audit-cold-recipe-form build form nil))
            (cond
+             ((and *cold-recipe-source-nodes* (eq context :eval)
+                   (gethash form *cold-recipe-source-nodes*)
+                   (or (consp form)
+                       (and (symbolp form)
+                            (multiple-value-bind (kind localp) (sb-cltl2:variable-information form env)
+                              (or (eq kind :special) (not localp))))))
+              (let ((*cold-recipe-source-nodes* nil) (*cold-recipe-normalization* t))
+                (values (list *cold-recipe-source-marker* (walk form env)) t)))
              ((or (not (eq context :eval)) (atom form)) form)
              ((and (member (car form) '(macrolet symbol-macrolet)) (not (eq form wrapper)))
               ;; Let the host establish the local definitions, then discard
@@ -182,6 +207,17 @@ all other expansions re-enter the same admission and residual audits."
                      (normalized (unwind-protect (progn (setf wrapper form) (walk form env))
                                    (setf wrapper previous))))
                 (values `(locally ,@(cddr normalized)) t)))
+             ((and *effective-method-emitter* (eq (car form) 'call-method))
+              ;; METHOD objects and the literal next-method list are compiler
+              ;; inputs, not ordinary source values. MAKE-METHOD's body still
+              ;; belongs to this lexical normalization environment.
+              (let ((method (second form)))
+                (values
+                 (if (and (consp method) (eq (first method) 'make-method))
+                     `(call-method (make-method ,(walk (second method) env)) ,@(cddr form))
+                     form) t)))
+             ((and *effective-method-emitter* (eq (car form) 'sb-pcl::call-method-list))
+              (values (walk `(progn ,@(cdr form)) env) t))
              ((eq (car form) 'load-time-value)
               (values `(load-time-value ,(walk (second form) global-environment) ,@(cddr form)) t))
              ((member (car form) '(setf incf decf push pushnew pop multiple-value-setq))
@@ -500,7 +536,7 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
 
 (defparameter *ordinary-operations*
   '(+ - * / 1+ 1- = /= < > <= >= zerop plusp minusp max min abs mod rem floor
-    ceiling truncate round ash logand logior logxor lognot evenp oddp
+    ceiling truncate round ash integer-length logand logior logxor lognot evenp oddp
     values values-list list list* cons car cdr caar cadr cdar cddr first second
     third fourth rest nth nthcdr endp null not atom consp symbolp numberp
     integerp rationalp floatp realp complexp stringp characterp vectorp arrayp
@@ -513,6 +549,14 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
     error signal warn break cerror invoke-restart find-restart abort
     condition-name type-error-datum type-error-expected-type
     unbound-slot-instance cell-error-name))
+
+(defparameter *reproducible-integer-operations*
+  ;; Each result is an integer when every argument is an integer. The host
+  ;; still owns arity, exceptional inputs and secondary values. No floating
+  ;; arithmetic environment or ambient variable is part of this grammar.
+  '(+ - * 1+ 1- min max abs mod rem floor ceiling truncate round ash
+    logand logior logxor lognot integer-length))
+
 
 (defparameter *reproducible-global-operations*
   '(list list* cons vector make-array))
@@ -578,6 +622,9 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
   ;; Open code runs only in the disposable host world. Its binding isolation
   ;; is still required, but deployed target admission and dependencies belong
   ;; to the closed cohort discovered afterward, including non-entry roots.
+  (when (and open *cold-method-combination-factory* *cold-recipe-functions*
+             (not (member-name name local)) (ordinary-function-form build name))
+    (audit-cold-source-function build name))
   (unless open
     (unless (function-target-p build name local)
       (fail build 'snowgrave:unclosed-call :call-target
@@ -1462,6 +1509,8 @@ A literal lexical FUNCTION may name a target without proving a global owner."
           (values (when (and target (not (eq target :unknown))) (list target)) nil domain)))))
 
 (defun function-expression-target (form)
+  (when (and *cold-recipe-source-marker* (consp form) (eq (car form) *cold-recipe-source-marker*))
+    (return-from function-expression-target (function-expression-target (second form))))
   (cond ((and (consp form) (eq (car form) 'load-time-value))
          (let ((*local-function-frames* nil)) (function-expression-target (second form))))
         ((and (consp form) (eq (car form) 'function))
@@ -2101,8 +2150,16 @@ This proves a branch, not a field declaration or arbitrary external alias ABI."
             (*argument-domains* (car ,scope)) (*function-bindings* (cdr ,scope))) ,@body)))
 
 (defun form-return-summary (build form)
+  (when (and *cold-recipe-source-marker* (consp form) (eq (car form) *cold-recipe-source-marker*))
+    (return-from form-return-summary (form-return-summary build (second form))))
   (let ((receipt (and (consp form) (assoc form *flow-value-receipts* :test #'eq))))
     (when receipt (return-from form-return-summary (cdr receipt))))
+  (when (and *effective-method-emitter* (consp form) (eq (first form) 'call-method))
+    ;; An early binder/default query has not executed the CALL-METHOD leaf.
+    ;; Its normal value count and origin are unknown until the composer gives
+    ;; the source walker the actual receipt. Never treat its MOP inputs as
+    ;; ordinary arguments or interpret missing information as clean UNKNOWN.
+    (return-from form-return-summary (make-return-summary (list :external-result) nil)))
   (if (and *initialization-phase* (initialization-effectful-form-p build form))
       ;; Binder queries precede actual source evaluation. A phase-dependent
       ;; effectful value cannot borrow the receiver's earlier/later row. Keep
@@ -2412,8 +2469,12 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
       (primary-return-domain build executable))))
 
 (defun value-domain (build form)
+  (when (and *cold-recipe-source-marker* (consp form) (eq (car form) *cold-recipe-source-marker*))
+    (return-from value-domain (value-domain build (second form))))
   (let ((receipt (and (consp form) (assoc form *flow-value-receipts* :test #'eq))))
     (when receipt (return-from value-domain (return-summary-primary (cdr receipt)))))
+  (when (and *effective-method-emitter* (consp form) (eq (first form) 'call-method))
+    (return-from value-domain :external-result))
   (when (and *initialization-phase* (initialization-effectful-form-p build form)
              (not (eq (first form) 'make-instance)))
     (return-from value-domain (return-summary-primary (form-return-summary build form))))
@@ -2772,6 +2833,12 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                                 (when (and (consp domain) (eq (car domain) 'eql) (symbolp (second domain))) domain))
                               (nthcdr required actual))))
            (shapes (gethash name (build-generic-call-shapes build))))
+      ;; Presence is also the deployment reachability fact. A call below
+      ;; required arity still needs this generic's exact error implementation.
+      (when (and (entry-rooted-deployment-p build) *collect-function-flow* (null shapes))
+        (setf shapes (make-hash-table :test #'equal)
+              (gethash name (build-generic-call-shapes build)) shapes
+              *function-flow-changed* t))
       ;; Pending key names must not become a permanent unknown-name profile
       ;; when their helper return is discovered by a later iteration.
       ;; An unknown tail can supply required values too. Keep its short raw
@@ -3052,6 +3119,19 @@ reflection, lexical rebinding and class values still require their own ABI."
            ,expression) expression)))
 
 (defun transform-form (build form package &key open next original local)
+  (when (and open *cold-recipe-source-marker* (consp form)
+             (eq (car form) *cold-recipe-source-marker*))
+    (let ((*cold-recipe-active* t))
+      (return-from transform-form
+        (transform-form build (second form) package :open open :next next :original original :local local))))
+  (when (and open *cold-recipe-active*) (audit-cold-recipe-form build form local))
+  (when (and *effective-method-emitter* (consp form) (eq (first form) 'call-method))
+    (multiple-value-bind (code summary) (funcall *effective-method-emitter* form package local)
+      (let ((previous (assoc form *flow-value-receipts* :test #'eq)))
+        (setf *flow-value-receipts*
+              (acons form (if previous (merge-return-summaries build (cdr previous) summary) summary)
+                     (remove form *flow-value-receipts* :key #'car :test #'eq))))
+      (return-from transform-form (values code summary))))
   (flet ((emit ()
            (if (and *initialization-phase* (not open))
                (let ((*flow-defer-source-call* (record-flow-owned-call-p build form)))
@@ -3075,6 +3155,18 @@ reflection, lexical rebinding and class values still require their own ABI."
                          :immediate-result-p (and resultp (eq form *immediate-callee-value*))))
        (target (name)
          (transformed-function-name build name package open local))
+       (cem-source-call-p ()
+         (and *effective-method-emitter*
+              (or (find-local-function-binding (car form))
+                  (ordinary-function-form build (car form))
+                  (member-name (car form) (getf (build-declaration build) :closed-generics)))))
+       (audit-source-call ()
+         (when (find-local-function-binding (car form))
+           (local-call-return-summary build (find-local-function-binding (car form)) form))
+         (unless (member-name (car form) local)
+           (audit-generic-call build (car form) (cdr form))
+           (audit-function-call build (car form) (cdr form))
+           (audit-external-call build (car form) (cdr form))))
        (equality-callback (reference operators &optional callee)
          (let ((callback (gensym "MAPPING-CALLBACK")))
            `(let ((,callback ,(walk reference)))
@@ -3110,11 +3202,15 @@ reflection, lexical rebinding and class values still require their own ABI."
       ((symbolp form)
        (if (member form (build-globals build)) (global-binding-name build form package open) form))
       ((atom form)
+       (when (and *effective-method-emitter* (not (serializable-tree-p form)))
+         (fail build 'snowgrave:residual-metaobject :effective-method-constant
+               "The MOP effective method contains a builder constant." :materialization))
        (if (arrayp form)
            (literal-reference build form package) form))
       ((eq (car form) 'quote)
        (unless (serializable-literal-graph-p (cadr form) (build-literal-states build))
-         (fail build 'snowgrave:residual-metaobject :quoted-object
+         (fail build 'snowgrave:residual-metaobject
+               (if *effective-method-emitter* :effective-method-quote :quoted-object)
                "Literal graphs need readable native scalar, cons and array nodes."))
        (if (or (consp (cadr form)) (arrayp (cadr form)))
            (literal-reference build (cadr form) package) form))
@@ -3624,8 +3720,10 @@ reflection, lexical rebinding and class values still require their own ABI."
                 ,@(loop for (key value) on (cddr form) by #'cddr append (list key (walk value)))))))
       ((member (car form) '(class-of find-class change-class
                             slot-missing slot-unbound))
-       (fail build 'snowgrave:unclosed-class-operation (car form)
-             "This class operation requires construction/reflection/error protocol lowering."))
+       (if (and open (or (entry-rooted-deployment-p build) *cold-method-combination-factory*))
+           (open-reflection-form build form package local)
+           (fail build 'snowgrave:unclosed-class-operation (car form)
+                 "This class operation requires construction/reflection/error protocol lowering.")))
       ((symbolp (car form))
        (unless (or open (member-name (car form) local))
          (audit-external-identity build (car form) (cdr form)))
@@ -3633,12 +3731,7 @@ reflection, lexical rebinding and class values still require their own ABI."
          (when (and (not open) (not *collect-function-flow*) (eq (car form) 'equalp) (build-classes build))
            (when (eq :identity (record-equality-realization build (cdr form)))
              (return-from transform-form-code `(eq ,@(body (cdr form))))))
-         (when (and (not open) (find-local-function-binding (car form)))
-           (local-call-return-summary build (find-local-function-binding (car form)) form))
-         (unless (or open (member-name (car form) local))
-           (audit-generic-call build (car form) (cdr form))
-           (audit-function-call build (car form) (cdr form))
-           (audit-external-call build (car form) (cdr form)))
+         (when (and (not open) (not (cem-source-call-p))) (audit-source-call))
          (cond
            ((and (eq (car form) 'coerce) (not open) (not *collect-function-flow*)
                  (standard-operation-meaning-p build 'coerce local))
@@ -3660,6 +3753,11 @@ reflection, lexical rebinding and class values still require their own ABI."
            (t (multiple-value-bind (callee fixedp)
                  (direct-call-name build (car form) package open local (length (cdr form)))
                (let ((expression `(,callee ,@(body (cdr form)) ,@(when fixedp '(nil)))))
+                 ;; A composer leaf produces its typed value while walking
+                 ;; the argument. Feed the same ordinary/local caller owner
+                 ;; after those receipts exist, rather than permanently join
+                 ;; the pre-evaluation opaque placeholder into helper inputs.
+                 (when (and (not open) (cem-source-call-p)) (audit-source-call))
                  (if (or open (member-name (car form) local)) expression
                      (declared-external-result-expression build (car form) expression))))))))
       (t (fail build 'snowgrave:unsupported-definition :computed-operator
@@ -3942,6 +4040,40 @@ An unknown name makes that name and the remainder uncertain, never absent."
         (substitute name (mapped-name name (build-open-package build)) qualifiers :test #'eq)
         qualifiers)))
 
+(defun open-method-combination-definition (build form package)
+  ;; The host owns method-group patterns, order expressions, combination
+  ;; arguments and their lexical bindings. Its generated factory is ordinary
+  ;; source; only that lambda re-enters the shared OPEN source transformer.
+  ;; Quoted declarations and the host's isolated registration stay cold.
+  (let* ((shortp (authored-short-combination-p build (second form)))
+         (options (cddr form))
+         (definition
+           `(cl:define-method-combination ,(mapped-name (second form) package)
+              ,@(if (and shortp (not (loop for tail on options by #'cddr
+                                          thereis (eq (car tail) :operator))))
+                    (append options (list :operator (second form))) options))))
+    (if shortp definition
+        (multiple-value-bind (expansion expandedp) (macroexpand-1 definition)
+          (let* ((registration (and (consp expansion) (eq (first expansion) 'progn)
+                                    (= (length expansion) 3) (third expansion)))
+                 (function (and (consp registration) (fourth registration))))
+            (unless (and expandedp (consp registration)
+                         (eq (first registration) 'sb-pcl::load-long-defcombin)
+                         (consp function) (eq (first function) 'function)
+                         (consp (second function)) (eq (caadr function) 'lambda))
+              (fail build 'snowgrave:unsupported-definition :host-method-combination-expansion
+                    "This host does not expose the expected ordinary method-combination factory lambda." :source-admission))
+            (let* ((*cold-method-combination-factory* t)
+                   (*cold-recipe-functions* (make-hash-table :test #'eq))
+                   (*cold-recipe-source-marker* (gensym "COLD-RECIPE-SOURCE"))
+                   (*cold-recipe-source-nodes* (cold-source-nodes form))
+                   (factory (progn (audit-cold-method-group-predicates build form)
+                                   (normalize-source-expression build (second function))))
+                   (transformed (transform-form build factory package :open t))
+                   (registration (copy-list registration)))
+              (setf (fourth registration) `(function ,transformed))
+              `(progn ,(second expansion) ,registration)))))))
+
 (defun open-definition (build form)
   (setf (build-source-key build) (authored-source-key build form))
   (let ((package (build-open-package build)) (*immediate-lambda-domains* nil))
@@ -3991,9 +4123,7 @@ An unknown name makes that name and the remainder uncertain, never absent."
                                       append (list key (transform-form build value package :open t)))) option))
                     (cddddr form))))
       (:method-combination
-       ;; Definition and registration remain in the host's method-combination
-       ;; machinery, under an isolated name with exact authored provenance.
-       `(cl:define-method-combination ,(mapped-name (cadr form) package) ,@(cddr form)))
+       (open-method-combination-definition build form package))
       (:generic `(cl:defgeneric ,(mapped-name (cadr form) package) ,(third form)
                     ,@(mapcar (lambda (option) (open-generic-option build option package))
                               (cdddr form))))
@@ -4057,6 +4187,14 @@ An unknown name makes that name and the remainder uncertain, never absent."
 (defun transform-global-initializer (build form package &key open)
   (let ((*cold-global-initializer* t))
     (transform-form build form package :open open)))
+
+(defun reproducible-integer-operation-p (build name &optional local)
+  "A stable primitive identity for callers that prove integer arguments."
+  (let ((native (assoc name *native-ordinary-functions*)))
+    (and (member name *reproducible-integer-operations*)
+         (standard-operation-meaning-p build name local)
+         native (fboundp name) (eq (fdefinition name) (cdr native)))))
+
 
 (defun reproducible-global-p (build form &optional fresh-symbols-p)
   (cond ((atom form) (or (numberp form) (stringp form) (characterp form)
@@ -4486,6 +4624,8 @@ not a second inheritance or initialization algorithm."
     `(,name ,@parameters)))
 
 (defun emit-initialization-generic (build generic)
+  (when (eq generic 'initialize-instance)
+    (retain-construction-initialization build))
   (let* ((*fixed-effective-arguments* nil)
          (gf (fdefinition generic))
          (record (fresh-name build "RECORD"))
@@ -4493,10 +4633,7 @@ not a second inheritance or initialization algorithm."
          (tail (fresh-name build "INITARGS"))
          (arguments (fresh-name build "ARGUMENTS"))
          (clauses nil) (descriptions nil))
-    (unless (and (eq (class-of gf) (find-class 'standard-generic-function))
-                 (typep (sb-mop:generic-function-method-combination gf) 'sb-pcl::standard-method-combination))
-      (fail build 'snowgrave:unclosed-class-operation :initialization-generic-protocol
-            "Initialization generic classes and combinations require exact host normalization." :materialization))
+    (validate-generic-protocol build generic gf)
     (dolist (layout (build-layouts build))
       (let* ((class (getf layout :class))
              (host-class (find-class (mapped-name class (build-open-package build))))
@@ -4592,6 +4729,7 @@ not a second inheritance or initialization algorithm."
                            (not (member-name 'initialize-instance selected)) (not (member-name 'shared-initialize selected))))
             (fail build 'snowgrave:unclosed-class-operation :initialization-cohort
                   "Authored construction requires both initialization protocol generics in the closed cohort." :materialization)))
+        (retain-construction-initialization build)
         (push (cons class name) (build-constructors build))
         (push `(defun ,name (&rest ,arguments)
                  (let ((,defaults nil))
@@ -4790,40 +4928,56 @@ not a second inheritance or initialization algorithm."
                     (build-generated build))))))))
     (values `(,name ,@parameters) (if (eq summary :pending) '(error) summary))))))
 
+(defun emit-effective-call (build generic call parameters package local)
+  (unless (and (snowgrave::source-finite-list-p call)
+               (<= 2 (length call) 3)
+               (snowgrave::source-finite-list-p (third call)))
+    (fail build 'snowgrave:unsupported-definition :effective-method-call
+          "CALL-METHOD requires one method and a literal finite next-method list." :materialization))
+  (let ((method (second call)))
+    (if (and (consp method) (eq (first method) 'make-method))
+        (progn
+          (unless (= (length method) 2)
+            (fail build 'snowgrave:unsupported-definition :effective-method-call
+                  "MAKE-METHOD requires exactly one effective body." :materialization))
+          ;; Normalized in the surrounding CEM lexical environment, including
+          ;; local macros. The shared transformer retains runtime bindings.
+          (multiple-value-bind (code receipt)
+              (transform-form build (second method) package :local local)
+            (values code (or receipt (form-return-summary build (second method))))))
+        ;; An authored method has its own definition environment; CALL-METHOD
+        ;; syntax is not legal in its ordinary body.
+        (let ((*effective-method-emitter* nil) (*flow-value-receipts* nil))
+          (multiple-value-bind (code proof)
+              (emit-method-call build generic method (third call) parameters)
+            (let ((*effective-return-proof* t))
+              (values code (form-return-summary build proof))))))))
+
 (defun emit-effective (build generic form parameters)
-  "Co-produce ordinary CEM code and a cold return proof over those same nodes.
-CALL-METHOD proof leaves reuse method summaries; standard PROGN/MV-PROG1
-structure is described by the existing source return composer. Nothing in
-the second value enters generated code or recomputes method order."
-  (cond
-    ((atom form)
-     (if (serializable-tree-p form) (values form form)
-         (fail build 'snowgrave:residual-metaobject :effective-method-constant
-               "The MOP effective method contains a builder constant." :materialization)))
-    ((eq (car form) 'sb-pcl::call-method-list)
-     ;; The host expands this helper to calls in their given order. Preserve
-     ;; that order in ordinary PROGN; never deploy the MOP helper macro.
-     (let (code proof)
-       (dolist (part (cdr form))
-         (multiple-value-bind (emitted description) (emit-effective build generic part parameters)
-           (push emitted code) (push description proof)))
-       (values `(progn ,@(nreverse code)) `(progn ,@(nreverse proof)))))
-    ((eq (car form) 'call-method)
-     (let ((method (cadr form)))
-       (if (and (consp method) (eq (car method) 'make-method))
-           (emit-effective build generic (cadr method) parameters)
-           (emit-method-call build generic method (caddr form) parameters))))
-    ((eq (car form) 'quote)
-     (unless (serializable-tree-p (cadr form))
-       (fail build 'snowgrave:residual-metaobject :effective-method-quote
-             "MOP error or combination constant retains a builder metaobject." :materialization))
-     (values form form))
-    (t
-     (let (code proof)
-       (dolist (part form)
-         (multiple-value-bind (emitted description) (emit-effective build generic part parameters)
-           (push emitted code) (push description proof)))
-       (values (nreverse code) (nreverse proof))))))
+  "Lower a CEM through the same lexical source and call-flow owners.
+Only CALL-METHOD is composer syntax. Its ordinary code and typed result are
+co-produced at the leaf's actual source evaluation point; no ambient authored
+function cell or independent CEM source interpreter participates."
+  (let* ((definition (authored-combination-name build (source-generic-combination build generic)))
+         (source-key (if definition
+                         (authored-source-key build (snowgrave:authored-definition-form definition))
+                         (build-source-key build))))
+    (with-build-source-key (build source-key)
+      (let* ((*flow-value-receipts* nil)
+             ;; Returned CEM code executes at runtime, but its macro expansion
+             ;; is a repeated cold input and needs the same expander proof.
+             (*reproducible-source-expansion* t)
+             (*effective-method-emitter*
+               (lambda (call package local)
+                 (emit-effective-call build generic call parameters package local)))
+             (normalized (normalize-source-expression build form)))
+        (multiple-value-bind (code receipt)
+            (transform-form build normalized (build-output-package build)
+                            :local *value-domain-local-functions*)
+          (let ((summary (or receipt (form-return-summary build normalized))))
+            ;; Existing callers consume one typed proof leaf; an authored
+            ;; literal :PENDING remains distinct from return-lattice bottom.
+            (values code (if (eq summary :pending) '(error) summary))))))))
 
 (defun generic-axis (build methods position)
   (let ((classes nil) (universal nil))
@@ -5031,15 +5185,7 @@ class whitelist replaces their actual applicability behavior."
     ;; discriminator, the native bounded call convention checks arity first.
     ;; This boolean preserves that observable error state; it never computes
     ;; or caches a method, combination or class at runtime.
-    (unless (eq (class-of gf) (find-class 'standard-generic-function))
-      (fail build 'snowgrave:unsupported-definition :generic-function-class
-            "Custom generic-function classes need an exact argument/applicability/error contract." :materialization))
-    (unless (or (typep (sb-mop:generic-function-method-combination gf) 'sb-pcl::standard-method-combination)
-                (let ((name (source-generic-combination build generic)))
-                  (or (authored-combination-name build name)
-                      (member name *host-method-combinations*))))
-      (fail build 'snowgrave:unsupported-definition :custom-method-combination
-            "Custom combinations need their own audited normalized source extension." :materialization))
+    (validate-generic-protocol build generic gf)
     (dolist (cell cells)
       (let ((*cell-domains* (mapcar (lambda (class) (source-class build class)) cell)))
        (multiple-value-bind (applicable certainp)
@@ -5209,7 +5355,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
                    (build-dependencies build) dependencies)
              ;; Return summaries can now reach calls in methods and value
              ;; initializers. Repeat these roots with each expanded fixed point.
-             (dolist (name (getf (build-declaration build) :closed-generics)) (emit-generic build name))
+             (dolist (name (deployed-generics build)) (emit-generic build name))
              (dolist (form (build-forms build))
                (when (and (eq (defining-kind form) :global) (> (length form) 2))
                  (with-build-source-key (build (authored-source-key build form))
@@ -5251,7 +5397,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
                                            (setf (gethash key shapes) (substitute :unknown :pending domains)))
                                        (setf *function-flow-changed* t))) shapes))
                         (build-generic-call-shapes build))
-               (dolist (name (getf (build-declaration build) :closed-generics))
+               (dolist (name (deployed-generics build))
                  ;; An otherwise uncalled selected method can discover helper
                  ;; returns in the final root pass. Do not poison those still
                  ;; pending returns before that pass has had a chance to run.
@@ -5870,7 +6016,7 @@ implemented here. A nominal native class is never an imported graph proof."
   ;; outer build's facts; clearing an ambient cell would corrupt that build.
   (let* ((*argument-domains* nil) (*cell-domains* nil) (*function-bindings* nil)
          (*generated-class-operation* nil) (*current-method* nil)
-         (*effective-return-proof* nil) (*fixed-effective-arguments* nil)
+         (*effective-return-proof* nil) (*effective-method-emitter* nil) (*fixed-effective-arguments* nil)
          (*active-construction-classes* nil) (*initialization-phase* nil) (*initialization-next* nil) (*initialization-plan* nil)
          (*flow-value-receipts* nil) (*flow-input-row* nil)
          (*flow-unknown-effect* nil) (*flow-deferred-call-p* nil) (*flow-exit-receipts* nil)
@@ -5879,7 +6025,10 @@ implemented here. A nominal native class is never an imported graph proof."
          (*immediate-callee-value* nil) (*value-domain-local-functions* nil)
          (*local-function-frames* nil) (*local-function-scope-cache* nil)
          (*declared-specials* nil) (*mutable-invariant-bindings* nil) (*tagbody-targets* nil)
-         (*immediate-lambda-domains* nil) (*cold-global-initializer* nil)
+         (*immediate-lambda-domains* nil) (*cold-global-initializer* nil) (*cold-method-combination-factory* nil)
+         (*cold-recipe-source-nodes* nil) (*cold-recipe-source-marker* nil)
+         (*cold-recipe-normalization* nil) (*reproducible-source-expansion* nil)
+         (*cold-recipe-active* nil) (*cold-recipe-functions* nil)
          (identity (getf declaration :unit-name))
          (identity-key (with-standard-io-syntax (write-to-string identity)))
          (open (make-package (format nil "SNOWGRAVE.BUILDER.~D" (incf *builder-counter*)) :use '(:cl)))
@@ -5907,6 +6056,7 @@ implemented here. A nominal native class is never an imported graph proof."
                                     (build-forms build)) open)
                           :open-pass :stage-specials (source-specials build))
            (obtain-layouts build)
+           (when (entry-rooted-deployment-p build) (audit-sealed-generic-provenance build))
            (setf (build-output-package build) (make-package output-name :use '(:cl)))
            ;; Shared type data is persistent generation state. Establish it
            ;; before the return-domain fixed point takes/discards scratch
@@ -5915,7 +6065,7 @@ implemented here. A nominal native class is never an imported graph proof."
            (when (entry-graph-request-p build) (capture-entry-graph build))
            (infer-function-domains build)
            (let* ((dispatch (mapcar (lambda (name) (emit-generic build name))
-                                    (getf declaration :closed-generics)))
+                                    (deployed-generics build)))
                   (entries (emit-configuration-bindings build (emit-functions build)))
                   (specials (source-specials build))
                   (forms (with-literal-pool build
@@ -5924,6 +6074,7 @@ implemented here. A nominal native class is never an imported graph proof."
                                           (nreverse (build-generated build))))
                            (build-output-package build)))
                   (metadata (list :abi-version 3 :identity identity :entries entries
+                                  :deployment (deployment-evidence build)
                                   :configuration (configuration-metadata build)
                                   :source-normalization
                                   '(:method :sbcl-lexical-host-macroexpansion
@@ -5954,6 +6105,7 @@ implemented here. A nominal native class is never an imported graph proof."
                                           (getf declaration :external-value-guards))
                                   :ordinary-function-flow (build-function-flow-evidence build)))
                   (report (list :implementation :snowgrave-sbcl :claim :semantically-closed
+                                :deployment (deployment-evidence build)
                                 :fragment :standard-method-and-authored-initialization-contracts
                                 :declaration (snowgrave::immutable-copy declaration)
                                 :argument-forwarding :whole-original-argument-list
@@ -5993,7 +6145,7 @@ implemented here. A nominal native class is never an imported graph proof."
                       "A compiled dependency lacks a stable readable identity." :compiled-residual-audit))
               (setf (getf metadata :compiler-dependencies)
                     (getf (getf report :compiled-root-evidence) :trust-boundaries))
-              (dolist (name (getf declaration :closed-generics))
+              (dolist (name (deployed-generics build))
                (when (typep (fdefinition (mapped-name name (build-output-package build))) 'generic-function)
                  (fail build 'snowgrave:residual-metaobject :generic-root
                        "The second-pass generic binding remains open." :residual-audit)))

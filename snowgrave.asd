@@ -21,7 +21,9 @@
   :components ((:file "src/sbcl-adapter")
                (:file "src/sbcl-configuration")
                (:file "src/sbcl-initialization")
-               (:file "src/sbcl-relational")))
+               (:file "src/sbcl-relational")
+               (:file "src/sbcl-deployment")
+               (:file "src/sbcl-cold-source")))
 
 (asdf:defsystem "snowgrave/tests"
   :depends-on ("snowgrave/sbcl")
@@ -56,6 +58,8 @@
                (:file "tests/pending-multiple-values")
                (:file "tests/cold-source-boundary")
                (:file "tests/cold-symbol-initializers")
+               (:file "tests/deployment-roots")
+               (:file "tests/cold-method-combinations")
                (:file "tests/entry-graphs")
                (:file "tests/native-binding-contexts")
                (:file "tests/graph-state-inference")
