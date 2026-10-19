@@ -14,7 +14,7 @@
         (list :error (condition-observation condition mapping) :events (reverse *constructor-state-events*))))))
 
 (defun constructor-state-case (tag definitions body expected
-                               &key refusal protocol external-operations (native-expected nil native-expected-p))
+                               &key refusal protocol external-operations unit-check (native-expected nil native-expected-p))
   ;; Separate native/installed roots and unique authored classes prevent a
   ;; native mutation or an earlier fixture method from changing admission.
   (let* ((index (incf *constructor-state-sequence*))
@@ -53,6 +53,7 @@
                  (when (keywordp refusal) (check (eq refusal (snowgrave:error-feature condition)))))
           (progn
             (check (null condition))
+            (when unit-check (funcall unit-check unit))
             (let* ((layouts (getf (snowgrave:unit-metadata unit) :record-layouts))
                    (native-map (mapcar (lambda (class) (cons (find-class class) class)) classes))
                    (closed-map (mapcar (lambda (row) (cons (getf row :class-token) (getf row :class))) layouts))

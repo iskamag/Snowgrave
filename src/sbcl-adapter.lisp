@@ -15,6 +15,9 @@
 (defvar *generated-class-operation* nil)
 (defvar *current-method* nil)
 (defvar *active-construction-classes* nil)
+(defvar *initialization-phase* nil)
+(defvar *initialization-next* nil)
+(defvar *initialization-plan* nil)
 (defvar *effective-return-proof* nil)
 (defvar *fixed-effective-arguments* nil)
 (defvar *collect-function-flow* nil)
@@ -639,7 +642,8 @@ No arbitrary type alias, pointer array, or foreign class is an owner ABI."
       shape))
 
 (defun value-domain-shape (build domain)
-  (cond ((owned-record-domain-p domain) (second domain))
+  (cond ((initializing-record-domain-p domain) (third domain))
+        ((owned-record-domain-p domain) (second domain))
         ((graph-node-domain-p domain) (value-domain-shape build (third domain)))
         ((shaped-domain-p domain) (second domain))
         ((or (eq domain :external-result) (external-value-domain-p build domain)) :unknown)
@@ -678,6 +682,7 @@ The stable key names its owner obligation, never a class or slot type."
 
 (defun native-data-domain-p (build domain)
   (and (not (external-result-domain-p domain)) (not (owned-record-domain-p domain))
+       (not (initializing-record-domain-p domain))
        (or (and (graph-node-domain-p domain) (native-data-domain-p build (third domain)))
            (external-value-domain-p build domain)
            (and (consp domain) (eq (car domain) 'or)
@@ -2047,6 +2052,20 @@ This proves a branch, not a field declaration or arbitrary external alias ABI."
             (*argument-domains* (car ,scope)) (*function-bindings* (cdr ,scope))) ,@body)))
 
 (defun form-return-summary (build form)
+  (if (and *initialization-phase* (initialization-effectful-form-p build form))
+      ;; Binder queries precede actual source evaluation. A phase-dependent
+      ;; effectful value cannot borrow the receiver's earlier/later row. Keep
+      ;; tuple bottom/count proof, but retain a conservative origin envelope.
+      (let* ((*initialization-phase* nil)
+             (summary (form-return-summary-code build form)))
+        (if (return-summary-p summary)
+            (make-return-summary
+             (mapcar (lambda (domain) (if (eq domain :pending) :pending :external-result))
+                     (return-summary-domains summary))
+             (return-summary-completep summary)) summary))
+      (form-return-summary-code build form)))
+
+(defun form-return-summary-code (build form)
   "Use one existing helper return fixed point for primary and ordered values.
 Position unions describe ordinary MVB bindings, including NIL padding only
 from a complete shorter result. Different counts stay incomplete for calls.
@@ -2339,6 +2358,9 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
       (primary-return-domain build executable))))
 
 (defun value-domain (build form)
+  (when (and *initialization-phase* (initialization-effectful-form-p build form)
+             (not (eq (first form) 'make-instance)))
+    (return-from value-domain :external-result))
   ;; One return lattice carries unclassified native results through ordinary
   ;; constructors/projections as well as helpers and joins. A proved native
   ;; result (for example a predicate boolean) ends this dependence. UNKNOWN
@@ -2504,7 +2526,10 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         (t :unknown)))
 
 (defun subtype-domain-p (build actual expected)
-  (cond ((owned-record-domain-p expected)
+  (cond ((initializing-record-domain-p expected)
+         (and (initializing-record-domain-p actual) (eq (second actual) (second expected))))
+        ((initializing-record-domain-p actual) (subtype-domain-p build (third actual) expected))
+        ((owned-record-domain-p expected)
          (and (owned-record-domain-p actual) (name= (second actual) (second expected))))
         ((owned-record-domain-p actual) (subtype-domain-p build (second actual) expected))
         ((graph-node-domain-p expected)
@@ -2641,7 +2666,8 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
              (member-name name (getf (build-declaration build) :closed-generics)))
     (let* ((contract (lambda-contract build (sb-mop:generic-function-lambda-list (open-generic build name))))
            (required (length (getf contract :required)))
-           (actual (unless capture (mapcar (lambda (argument) (value-domain build argument)) arguments)))
+           (actual (unless capture (mapcar (lambda (argument)
+                                           (erase-initialization-domain (value-domain build argument))) arguments)))
            ;; Keep literal key names apart before joining their value domains.
            ;; Same-arity calls with different keys must not turn omission of a
            ;; method key into an unknown keyword tail. This also covers a
@@ -2739,7 +2765,8 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         (let* ((required (ordinary-lambda-list build (caddr form)))
                (count (length required))
                (entryp (member-name name (getf (build-declaration build) :entries)))
-               (actual (call-function-domains build form arguments capture variable-tail)))
+               (actual (mapcar #'erase-initialization-domain
+                               (call-function-domains build form arguments capture variable-tail))))
           ;; Declared entry domains remain the public guard, rather than a
           ;; joined helper profile. An internal opaque origin cannot borrow
           ;; that nominal contract for an unclassified native value.
@@ -2909,6 +2936,13 @@ reflection, lexical rebinding and class values still require their own ABI."
            ,expression) expression)))
 
 (defun transform-form (build form package &key open next original local)
+  (if (and *initialization-phase* (not open))
+      (transform-initialization-form
+       build form
+       (lambda () (transform-form-code build form package :open open :next next :original original :local local)))
+      (transform-form-code build form package :open open :next next :original original :local local)))
+
+(defun transform-form-code (build form package &key open next original local)
   (labels
       ((walk (x) (transform-form build x package :open open :next next
                                 :original original :local local))
@@ -2988,6 +3022,9 @@ reflection, lexical rebinding and class values still require their own ABI."
              ((cdr form)
               (fail build 'snowgrave:unsupported-definition :changed-argument-next-method
                     "Changed-argument next methods need the host's exact continuation/error mapping."))
+             (*initialization-next*
+              (fail build 'snowgrave:unsupported-definition :initialization-continuation-context
+                    "This lexical control/helper context has no transported initialization state proof." :reachability))
              (next `(,next ,@original))
              (*current-method*
               (emit-standard-miss build 'no-next-method
@@ -2995,14 +3032,18 @@ reflection, lexical rebinding and class values still require their own ABI."
                                   (if *fixed-effective-arguments* `(list ,@original) (car original))))
              (t (fail build 'snowgrave:mop-failure :no-next-method-context
                       "CALL-NEXT-METHOD has no reproducible authored method context." :materialization))))
-      ((eq (car form) 'next-method-p) (if open form (not (null next))))
+      ((eq (car form) 'next-method-p)
+       (if open form (if *current-method* (not (null (third *current-method*))) (not (null next)))))
       ((eq (car form) 'if)
        (let ((test (walk (cadr form))))
          (cond ((eq test t) (with-predicate-domains (build (second form) t local) (value-walk (third form))))
                ((null test) (with-predicate-domains (build (second form) nil local) (value-walk (fourth form))))
-               (t `(if ,test
-                       ,(with-predicate-domains (build (second form) t local) (value-walk (third form)))
-                       ,(with-predicate-domains (build (second form) nil local) (value-walk (fourth form))))))))
+               (t (multiple-value-bind (yes no)
+                      (call-with-initialization-branches
+                       build (second form)
+                       (lambda () (with-predicate-domains (build (second form) t local) (value-walk (third form))))
+                       (lambda () (with-predicate-domains (build (second form) nil local) (value-walk (fourth form)))) local)
+                    `(if ,test ,yes ,no))))))
       ((nth-value 3 (exact-class-comparison build form local))
        (multiple-value-bind (object class reversep) (exact-class-comparison build form local)
          (when (and (not open) (not *collect-function-flow*)
@@ -3112,13 +3153,33 @@ reflection, lexical rebinding and class values still require their own ABI."
       ((member (car form) '(and or))
        (labels ((terms (arguments)
                   (when arguments
-                    (cons (walk (car arguments))
-                          (with-predicate-domains (build (car arguments) (eq (car form) 'and) local)
-                            (terms (cdr arguments)))))))
+                    (let ((first (walk (car arguments))))
+                      (if (null (cdr arguments)) (list first)
+                          (multiple-value-bind (rest ignored)
+                              (if (eq (car form) 'and)
+                                  (call-with-initialization-branches
+                                   build (car arguments)
+                                   (lambda () (with-predicate-domains (build (car arguments) t local)
+                                                (terms (cdr arguments))))
+                                   (lambda () nil) local)
+                                  (multiple-value-bind (yes no)
+                                      (call-with-initialization-branches
+                                       build (car arguments) (lambda () nil)
+                                       (lambda () (with-predicate-domains (build (car arguments) nil local)
+                                                    (terms (cdr arguments)))) local)
+                                    (values no yes)))
+                            (declare (ignore ignored)) (cons first rest)))))))
          `(,(car form) ,@(terms (cdr form)))))
       ((member (car form) '(when unless))
-       `(,(car form) ,(walk (second form))
-          ,@(with-predicate-domains (build (second form) (eq (car form) 'when) local) (body (cddr form)))))
+       (let ((test (walk (second form))))
+         (multiple-value-bind (yes no)
+             (call-with-initialization-branches
+              build (second form)
+              (lambda () (when (eq (car form) 'when)
+                           (with-predicate-domains (build (second form) t local) (body (cddr form)))))
+              (lambda () (when (eq (car form) 'unless)
+                           (with-predicate-domains (build (second form) nil local) (body (cddr form))))) local)
+           `(,(car form) ,test ,@(if (eq (car form) 'when) yes no)))))
       ((member (car form) '(progn locally))
        `(,(car form) ,@(body (cdr form) t)))
       ((eq (car form) 'multiple-value-prog1)
@@ -3126,7 +3187,11 @@ reflection, lexical rebinding and class values still require their own ABI."
          `(multiple-value-prog1 ,(value-walk (second form))
             ,@(mapcar #'walk (cddr form)))))
       ((eq (car form) 'unwind-protect)
-       `(unwind-protect ,@(body (cdr form))))
+       (let ((protected (walk (second form))))
+         ;; Cleanup also runs after a partially completed abrupt initializer.
+         ;; Its audit cannot borrow only the successful protected poststate.
+         (when *initialization-phase* (forget-initialization-state))
+         `(unwind-protect ,protected ,@(body (cddr form)))))
       ((eq (car form) 'multiple-value-bind)
        (multiple-value-bind (scope value)
            (analyze-multiple-value-scope build (cadr form) (caddr form) #'walk
@@ -3312,7 +3377,8 @@ reflection, lexical rebinding and class values still require their own ABI."
                            (loop for tail on (cdr form) by #'cddr collect (car tail))
                            (if (member (car form) '(push pushnew)) (list (caddr form)) (list (cadr form))))))
            (audit-assignment-targets build places)))
-       (when (and (not open) (member (car form) '(setq setf)))
+       (when (and (not open) (member (car form) '(setq setf))
+                  (not (and *initialization-phase* (eq (car form) 'setf))))
          (loop for (place value) on (cdr form) by #'cddr
                do (audit-external-place-value build place value)))
        (when (and (not open) (member (car form) '(push pushnew)))
@@ -3332,7 +3398,16 @@ reflection, lexical rebinding and class values still require their own ABI."
                         append (progn
                                  (unless open (audit-missing-slot-writer build place value))
                                  (unless open (audit-place-writer build place value local))
-                                 (list (transform-place build place package open local) (walk value))))))
+                                 (let* ((location (transform-place build place package open local))
+                                        (checked (when (and (not open) *initialization-phase*)
+                                                   (audit-external-place-value build place value)))
+                                        (domain (when *initialization-phase*
+                                                  (if (initialization-effectful-form-p build value) :external-result
+                                                      (value-domain build value))))
+                                        (value-code (walk value)))
+                                   (declare (ignore checked))
+                                   (note-initialization-place-write build place domain)
+                                   (list location value-code))))))
          ((incf decf pop)
           `(,(car form) ,(transform-place build (cadr form) package open local :readp t)
                         ,@(body (cddr form))))
@@ -3429,7 +3504,7 @@ reflection, lexical rebinding and class values still require their own ABI."
        (let ((mapping-realization (audit-ordinary-operation build (car form) (cdr form) local open)))
          (when (and (not open) (not *collect-function-flow*) (eq (car form) 'equalp) (build-classes build))
            (when (eq :identity (record-equality-realization build (cdr form)))
-             (return-from transform-form `(eq ,@(body (cdr form))))))
+             (return-from transform-form-code `(eq ,@(body (cdr form))))))
          (when (and (not open) (find-local-function-binding (car form)))
            (local-call-return-summary build (find-local-function-binding (car form)) form))
          (unless (or open (member-name (car form) local))
@@ -3618,14 +3693,17 @@ An unknown name makes that name and the remainder uncertain, never absent."
           (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
             (unless open (audit-external-shared-value build name initializer specials))
             (values (cons (value-domain build initializer) (function-expression-target initializer))
-                    (cond (call-inputs nil)
-                          (returns (source-return-domains build (list initializer) (if (eq returns t) #'value-domain returns)))
-                          (t
-                           ;; Lambda defaults run in the method's lexical next
-                           ;; context, including nested local/lambda defaults.
-                           ;; ORIGINAL remains the raw generic argument list;
-                           ;; the current method's defaults must not replace it.
-                           (transform-form build initializer package :open open :local local :next next :original original))))))
+                    (call-with-initialization-default-effects
+                     build name contract
+                     (lambda ()
+                       (cond (call-inputs nil)
+                             (returns (source-return-domains build (list initializer) (if (eq returns t) #'value-domain returns)))
+                             (t
+                              ;; Lambda defaults run in the method's lexical next
+                              ;; context, including nested local/lambda defaults.
+                              ;; ORIGINAL remains the raw generic argument list;
+                              ;; the current method's defaults must not replace it.
+                              (transform-form build initializer package :open open :local local :next next :original original))))))))
         (lambda (name kind fact scope)
           (let* ((specialp (or (assoc name specials) (special-variable-p build name)))
                  (input-domain (case kind
@@ -4282,7 +4360,10 @@ not a second inheritance or initialization algorithm."
       (let* ((class (getf layout :class))
              (host-class (find-class (mapped-name class (build-open-package build))))
              (methods (initialization-methods build generic host-class))
-             (*cell-domains* (append (list class) (when slots (list t)))))
+             (*cell-domains* (append (list class) (when slots (list t))))
+             (*initialization-phase* (when (graph-state-profile-p build)
+                                      (make-initialization-root-phase build generic class)))
+             (*initialization-next* nil))
         (multiple-value-bind (effective options)
             (sb-mop:compute-effective-method gf (sb-mop:generic-function-method-combination gf) methods)
           (when options (fail build 'snowgrave:unsupported-definition :effective-method-options
@@ -4290,7 +4371,9 @@ not a second inheritance or initialization algorithm."
           (let ((validator (emit-argument-validator build generic gf methods)))
             (push `(,(record-layout-test build class record)
                      (apply #',validator ,arguments)
-                     ,(emit-effective build generic effective (list arguments))) clauses)))
+                     ,(if *initialization-phase*
+                          (emit-initialization-plan build generic effective (list arguments))
+                          (emit-effective build generic effective (list arguments)))) clauses)))
         (push (list :classes (append (list class) (when slots (list t)))
                     :methods (mapcar (lambda (method) (method-logical-key build generic method)) methods)) descriptions)))
     (push `(defun ,(mapped-name generic (build-output-package build)) (,record ,@(when slots (list slots)) &rest ,tail)
@@ -4355,7 +4438,8 @@ not a second inheritance or initialization algorithm."
              (*argument-domains* nil) (*function-bindings* nil)
              (*local-function-frames* nil) (*value-domain-local-functions* nil)
              (*mutable-invariant-bindings* nil) (*declared-specials* nil)
-             (*current-method* nil) (*tagbody-targets* nil) (*immediate-lambda-domains* nil))
+             (*current-method* nil) (*tagbody-targets* nil) (*immediate-lambda-domains* nil)
+             (*initialization-phase* nil) (*initialization-next* nil) (*initialization-plan* nil))
         (let ((host-class (find-class (mapped-name class (build-open-package build)))))
           (verify-standard-construction build host-class)
           (multiple-value-setq (legal allow) (construction-initarg-contract build host-class)))
@@ -4506,6 +4590,9 @@ not a second inheritance or initialization algorithm."
     (if saved-arguments `(let ((,saved-arguments ,arguments)) ,body) body)))
 
 (defun emit-method-call (build generic method next-methods parameters)
+  (when *initialization-phase*
+    (return-from emit-method-call
+      (emit-initialization-method-call build generic method next-methods parameters)))
   (when (and (eq generic 'shared-initialize)
              (eq method (second (assoc generic *standard-initialization-methods*))))
     (standard-initialization-method-p build generic method)
@@ -5629,7 +5716,7 @@ implemented here. A nominal native class is never an imported graph proof."
   (let* ((*argument-domains* nil) (*cell-domains* nil) (*function-bindings* nil)
          (*generated-class-operation* nil) (*current-method* nil)
          (*effective-return-proof* nil) (*fixed-effective-arguments* nil)
-         (*active-construction-classes* nil)
+         (*active-construction-classes* nil) (*initialization-phase* nil) (*initialization-next* nil) (*initialization-plan* nil)
          (*collect-function-flow* nil) (*function-flow-changed* nil) (*settled-method-roots* nil)
          (*immediate-callee-value* nil) (*value-domain-local-functions* nil)
          (*local-function-frames* nil) (*local-function-scope-cache* nil)

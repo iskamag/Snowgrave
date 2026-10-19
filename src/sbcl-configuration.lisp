@@ -454,7 +454,8 @@ The existing literal pool consumes these cold node recipes for shell/fill."
        (symbolp (second domain))))
 
 (defun private-record-domain-base (domain)
-  (cond ((graph-node-domain-p domain) (third domain))
+  (cond ((initializing-record-domain-p domain) (third domain))
+        ((graph-node-domain-p domain) (third domain))
         ((owned-record-domain-p domain) (second domain)) (t domain)))
 
 (defun owned-record-layout (build domain)
@@ -524,7 +525,8 @@ The existing literal pool consumes these cold node recipes for shell/fill."
     (setf (build-graph-state-invalidations build) (list :writes writes :unbinds unbinds))))
 
 (defun private-record-slot-row (build domain)
-  (cond ((graph-node-domain-p domain) (graph-node-row build domain))
+  (cond ((initializing-record-domain-p domain) (initialization-record-row domain))
+        ((graph-node-domain-p domain) (graph-node-row build domain))
         ((owned-record-domain-p domain)
          (let ((layout (owned-record-layout build domain)))
            (when (getf layout :construction-state)
@@ -538,7 +540,8 @@ The existing literal pool consumes these cold node recipes for shell/fill."
         (let* ((row (private-record-slot-row build domain))
                (field (assoc slot (getf row :slots))))
           (unless (and (getf row :class) field (second field)
-                       (not (member slot (getf (build-graph-state-invalidations build) :unbinds))))
+                       (or (initialization-domain-current-p domain)
+                           (not (member slot (getf (build-graph-state-invalidations build) :unbinds)))))
             (return (values nil :unknown)))
           (let* ((prior (third field))
                  ;; A possible write invalidates value/shape facts, but cannot
@@ -546,7 +549,8 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                  ;; its exact owner relation is lost, a guarded native value
                  ;; has the same conservative observation boundary as an
                  ;; unclassified native result.
-                 (current (if (member slot (getf (build-graph-state-invalidations build) :writes))
+                 (current (if (and (not (initialization-domain-current-p domain))
+                                   (member slot (getf (build-graph-state-invalidations build) :writes)))
                               (merge-value-domains build
                                                    (if (external-value-observation-p build prior)
                                                        :external-result prior)
@@ -589,7 +593,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
           ;; The opaque envelope also covers clean alternatives joined with
           ;; native returns. One such alternative may be a private record.
           (cond ((member part '(:pending :unknown :external-result)) t)
-                ((owned-record-domain-p part) t)
+                ((or (owned-record-domain-p part) (initializing-record-domain-p part)) t)
                 ((graph-node-domain-p part)
                  (let ((row (graph-node-row build part)))
                    (or (null row) (not (null (getf row :class))))))
@@ -617,13 +621,9 @@ The existing literal pool consumes these cold node recipes for shell/fill."
     (multiple-value-bind (slot literalp) (quoted-value slot-form)
       (let ((alternatives (domain-alternatives (value-domain build receiver-form))))
         (unless (and literalp alternatives
-                     (every (lambda (domain)
-                              (let* ((row (private-record-slot-row build domain)) (field (assoc slot (getf row :slots))))
-                                (if bound
-                                    (and (getf row :class) field (second field)
-                                         (not (member slot (getf (build-graph-state-invalidations build) :unbinds))))
-                                    (private-record-slot-present-p build domain slot))))
-                            alternatives))
+                     (if bound
+                         (nth-value 0 (graph-record-slot-facts build (value-domain build receiver-form) slot))
+                         (every (lambda (domain) (private-record-slot-present-p build domain slot)) alternatives)))
           (fail build 'snowgrave:unclosed-class-operation :graph-state-slot-read
                 "A private state record needs an exact existing slot and preserved boundness before an operation could expose it in a slot condition."
                 :reachability))))))
@@ -691,6 +691,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
         (*local-function-frames* nil) (*value-domain-local-functions* nil)
         (*mutable-invariant-bindings* nil) (*declared-specials* nil)
         (*current-method* nil) (*effective-return-proof* nil) (*fixed-effective-arguments* nil)
+        (*initialization-phase* nil) (*initialization-next* nil) (*initialization-plan* nil)
         (*immediate-callee-value* nil) (*generated-class-operation* nil)
         (*tagbody-targets* nil) (*immediate-lambda-domains* nil))
     (with-build-source-key (build (getf initializer :source-key)) (funcall process))))
@@ -740,7 +741,10 @@ The existing literal pool consumes these cold node recipes for shell/fill."
         (return-from source-construction-domain :unknown))
       (loop for (key value) on arguments by #'cddr
             for domain = (value-domain build value)
-            do (audit-construction-initarg-domain build layout key domain)
+            do (when (some #'initializing-record-domain-p (domain-alternatives domain))
+                 (fail build 'snowgrave:unclosed-class-operation :initialization-activation-escape
+                       "A constructor cannot retain an enclosing symbolic initialization receiver without activation transport." :reachability))
+               (audit-construction-initarg-domain build layout key domain)
                (setf plist (append plist (list key domain))))
       ;; GET-PROPERTIES below mirrors the materializer's first-occurrence
       ;; selection across all accepted names. Every initializer is still

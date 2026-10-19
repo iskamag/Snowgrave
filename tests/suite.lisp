@@ -4340,6 +4340,7 @@
     (native-binding-context-tests)
     (graph-state-inference-tests)
     (constructor-state-tests)
+    (initialization-phase-tests)
     (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)
