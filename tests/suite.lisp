@@ -4331,6 +4331,7 @@
     (indirect-result-owner-tests)
     (lambda-opaque-input-tests)
     (local-function-flow-tests)
+    (pending-multiple-value-tests)
     (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)

@@ -2026,7 +2026,12 @@ Unknown/native operations retain only their existing primary fact."
             ;; which is exactly MVB's first binding (including zero-value NIL).
             ;; Other proved positions may survive variable-count joins, with
             ;; their possible padding included; no missing tail is invented.
-            (domains (when (return-summary-p summary) (return-summary-domains summary)))
+            (domains (cond ((eq summary :pending)
+                            ;; No returned position is known yet. Preserve
+                            ;; lattice bottom for each requested binding;
+                            ;; this does not prove a count or NIL padding.
+                            (make-list (length variables) :initial-element :pending))
+                           ((return-summary-p summary) (return-summary-domains summary))))
             (literalp (and (consp form) (eq (car form) 'values)))
             (arguments (when literalp (cdr form))))
        ;; An unclassified external result has an unknown native tail, not an
