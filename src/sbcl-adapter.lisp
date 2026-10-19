@@ -2514,7 +2514,9 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ((shaped-domain-p actual) (subtype-domain-p build (second actual) expected))
         ((shaped-domain-p expected) (subtype-domain-p build actual (second expected)))
         ((eq expected t) t)
-        ((member actual '(:unknown :pending :external-result)) nil)
+        ;; Internal fact markers are not host Common Lisp type specifiers.
+        ((or (member actual '(:unknown :pending :external-result))
+             (member expected '(:unknown :pending :external-result))) nil)
         ((and (consp actual) (eq (car actual) 'or))
          (every (lambda (alternative) (subtype-domain-p build alternative expected)) (cdr actual)))
         ((and (consp expected) (eq (car expected) 'or))

@@ -3,6 +3,7 @@
 (defvar *constructor-state-sequence* 0)
 (defvar *constructor-state-events* nil)
 (defun constructor-state-event (tag) (push tag *constructor-state-events*) nil)
+(defun constructor-state-opaque (class) (make-instance class))
 (defun constructor-state-read (package text)
   (let ((*package* package)) (read-from-string text)))
 (defun constructor-state-observation (function mapping)
@@ -12,7 +13,8 @@
       (error (condition)
         (list :error (condition-observation condition mapping) :events (reverse *constructor-state-events*))))))
 
-(defun constructor-state-case (tag definitions body expected &key refusal protocol)
+(defun constructor-state-case (tag definitions body expected
+                               &key refusal protocol external-operations (native-expected nil native-expected-p))
   ;; Separate native/installed roots and unique authored classes prevent a
   ;; native mutation or an earlier fixture method from changing admission.
   (let* ((index (incf *constructor-state-sequence*))
@@ -35,13 +37,15 @@
            (condition
              (handler-case
                  (progn
+                   (when native-expected-p
+                     (check (equal native-expected (multiple-value-list (funcall entry native-root)))))
                    (setf unit (snowgrave:close-source-unit
                                (list :forms forms) :unit-name identity :closed-classes classes
                                :closed-generics generics
                                :universe (append classes '(number symbol vector list cons function t))
                                :entries (list entry)
                                :external-domains (list (list entry (list (list 'eql installed-root))))
-                               :external-operations '(constructor-state-event)))
+                               :external-operations (cons 'constructor-state-event external-operations)))
                    nil)
                (snowgrave:snowgrave-error (condition) condition))))
       (if refusal
@@ -135,6 +139,14 @@
     "(declare (ignore root)) (let ((n (make-instance 'node))) #'(lambda () n))" nil :refusal :graph-state-result)
   (constructor-state-case :fresh-container "((defclass node () ()))"
     "(fill (vector (make-instance 'node)) nil :end (length (slot-value root 'data))) 0" nil :refusal :graph-state-operation-input)
+  ;; An unrelated reinitialization invalidates DATA value facts globally.
+  ;; The field's retained native origin must survive that conservative join.
+  (constructor-state-case :retained-opaque-after-reinitialization
+    "((defclass marker () ()) (defclass node () ((data :initarg :data))))"
+    "(let ((fresh (make-instance 'node :data (snowgrave.tests::constructor-state-opaque 'marker))))
+       (shared-initialize root t :data 17) (typep (slot-value fresh 'data) 'marker))"
+    nil :refusal :external-result-class-observation :protocol t :native-expected '(t)
+    :external-operations '(constructor-state-opaque))
   ;; Explicit initialization is a state transition, including on captured
   ;; nodes. Its writes cannot preserve an earlier backing-vector fact.
   (constructor-state-case :captured-reinitialization "((defclass node () ()))"

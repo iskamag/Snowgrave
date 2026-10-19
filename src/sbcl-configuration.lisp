@@ -540,9 +540,19 @@ The existing literal pool consumes these cold node recipes for shell/fill."
           (unless (and (getf row :class) field (second field)
                        (not (member slot (getf (build-graph-state-invalidations build) :unbinds))))
             (return (values nil :unknown)))
-          (setf value (merge-value-domains
-                       build value (if (member slot (getf (build-graph-state-invalidations build) :writes))
-                                       :unknown (third field)))))))))
+          (let* ((prior (third field))
+                 ;; A possible write invalidates value/shape facts, but cannot
+                 ;; erase native origin already retained by the field. Once
+                 ;; its exact owner relation is lost, a guarded native value
+                 ;; has the same conservative observation boundary as an
+                 ;; unclassified native result.
+                 (current (if (member slot (getf (build-graph-state-invalidations build) :writes))
+                              (merge-value-domains build
+                                                   (if (external-value-observation-p build prior)
+                                                       :external-result prior)
+                                                   :unknown)
+                              prior)))
+            (setf value (merge-value-domains build value current))))))))
 
 (defun record-slot-read-domain (build receiver-form slot-form)
   ;; Authored reads and MOP-generated readers use this one fact owner. A class
