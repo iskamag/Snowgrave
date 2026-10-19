@@ -42,6 +42,8 @@
 (defvar *mutable-invariant-bindings* nil)
 (defvar *tagbody-targets* nil)
 (defvar *immediate-lambda-domains* nil)
+;; Only source-owned cold global initializers may emit fresh symbol recipes.
+(defvar *cold-global-initializer* nil)
 
 (defparameter *standard-miss-methods*
   (loop for (name specializers) in '((no-next-method (standard-generic-function standard-method))
@@ -1159,7 +1161,7 @@ The stable key names its owner obligation, never a class or slot type."
   ;; to skip their source/callback/residual audits. LENGTH's native receiver
   ;; proof belongs to audit-ordinary-operation.
   (let ((domain (case name ((ash logand logior logxor lognot) 'integer)
-                           ((plusp eq eql equal equalp) 'boolean) (length '(integer 0 *)))))
+                           ((plusp eq eql equal equalp) 'boolean) (make-symbol 'symbol) (length '(integer 0 *)))))
     (when (and domain (standard-operation-meaning-p build name nil global-targets)) domain)))
 
 (defun ordinary-single-value-result-p (build name &optional global-targets)
@@ -3355,6 +3357,13 @@ reflection, lexical rebinding and class values still require their own ABI."
       ((eq (car form) 'handler-bind)
        `(handler-bind ,(mapcar (lambda (binding) (list (car binding) (walk (cadr binding))))
                                (cadr form)) ,@(body (cddr form))))
+      ((and *cold-global-initializer* (eq (car form) 'make-symbol))
+       ;; Keep allocation at its authored occurrence. Equal names do not
+       ;; identify symbols, and no builder value becomes an emitted literal.
+       (unless (fresh-symbol-initializer-p build form)
+         (fail build 'snowgrave:nonreproducible-source :global-initializer
+               "A cold MAKE-SYMBOL recipe requires one literal string name."))
+       `(make-symbol ,(walk (second form))))
       ((eq (car form) 'load-time-value)
        (unless (reproducible-global-p build (cadr form))
          (fail build 'snowgrave:nonreproducible-source :load-time-capture
@@ -3364,7 +3373,7 @@ reflection, lexical rebinding and class values still require their own ABI."
                  (*declared-specials* nil) (*value-domain-local-functions* nil) (*local-function-frames* nil)
                (*immediate-lambda-domains* nil)
                  (*mutable-invariant-bindings* nil) (*tagbody-targets* nil)
-                 (*current-method* nil)
+                 (*current-method* nil) (*cold-global-initializer* nil)
                  (*immediate-callee-value* (when (eq form *immediate-callee-value*) (second form))))
              (transform-form build (cadr form) package :open open))
           ,@(cddr form)))
@@ -4027,21 +4036,37 @@ An unknown name makes that name and the remainder uncertain, never absent."
             ,ordinary
             ,@(preserve-source-block (cadr form) (transform-body build (cdddr form) package :open t)))))))
       (:global
-       (unless (or (= (length form) 2) (reproducible-global-p build (caddr form)))
+       (unless (or (= (length form) 2) (reproducible-global-p build (caddr form) t))
          (fail build 'snowgrave:nonreproducible-source :global-initializer
-               "Global initializers admit only constants, checked captures, and pure constant construction."))
+               "Global initializers admit constants, checked captures, pure construction, and literal-named fresh symbol recipes."))
        `(,(car form) ,(global-binding-name build (cadr form) package t)
          ,@(when (> (length form) 2)
-             (cons (transform-form build (caddr form) package :open t) (cdddr form))))))))
+             (cons (transform-global-initializer build (caddr form) package :open t) (cdddr form))))))))
 
-(defun reproducible-global-p (build form)
+(defun fresh-symbol-initializer-p (build form)
+  ;; This is an allocation recipe, separate from pure constant construction.
+  ;; Names are frozen source strings; dynamic/side-effecting name expressions
+  ;; and caller-supplied uninterned symbols have no admitted capture mapping.
+  (and (consp form) (eq (first form) 'make-symbol)
+       (snowgrave::source-finite-list-p form) (= (length form) 2)
+       (standard-operation-meaning-p build 'make-symbol)
+       (or (stringp (second form))
+           (multiple-value-bind (name constantp) (quoted-value (second form))
+             (and constantp (stringp name))))))
+
+(defun transform-global-initializer (build form package &key open)
+  (let ((*cold-global-initializer* t))
+    (transform-form build form package :open open)))
+
+(defun reproducible-global-p (build form &optional fresh-symbols-p)
   (cond ((atom form) (or (numberp form) (stringp form) (characterp form)
                         (keywordp form) (eq form t) (null form)))
         ((eq (car form) 'quote) (serializable-literal-graph-p (cadr form) (build-literal-states build)))
+        ((and fresh-symbols-p (fresh-symbol-initializer-p build form)) t)
         ((eq (car form) 'function) (function-target-p build (cadr form) nil))
         ((eq (car form) 'load-time-value) (reproducible-global-p build (cadr form)))
         ((member (car form) *reproducible-global-operations*)
-         (every (lambda (x) (reproducible-global-p build x)) (cdr form)))
+         (every (lambda (x) (reproducible-global-p build x fresh-symbols-p)) (cdr form)))
         (t nil)))
 
 (defun staged-special-form (form specials)
@@ -5189,7 +5214,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
                (when (and (eq (defining-kind form) :global) (> (length form) 2))
                  (with-build-source-key (build (authored-source-key build form))
                    (let ((*immediate-lambda-domains* nil))
-                     (transform-form build (caddr form) (build-output-package build))))))
+                     (transform-global-initializer build (caddr form) (build-output-package build))))))
              (dolist (form (build-forms build))
                (when (eq (defining-kind form) :function)
                  (multiple-value-bind (input reachedp) (gethash (cadr form) (build-function-domains build))
@@ -5342,7 +5367,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
              (audit-external-shared-value build (cadr form) (caddr form)))
            (push `(,(car form) ,(global-binding-name build (cadr form) (build-output-package build) nil)
                    ,@(when (> (length form) 2)
-                       (cons (transform-form build (caddr form) (build-output-package build)) (cdddr form))))
+                       (cons (transform-global-initializer build (caddr form) (build-output-package build)) (cdddr form))))
                  (build-generated build))))))
     (nreverse entry-records)))
 
@@ -5854,7 +5879,7 @@ implemented here. A nominal native class is never an imported graph proof."
          (*immediate-callee-value* nil) (*value-domain-local-functions* nil)
          (*local-function-frames* nil) (*local-function-scope-cache* nil)
          (*declared-specials* nil) (*mutable-invariant-bindings* nil) (*tagbody-targets* nil)
-         (*immediate-lambda-domains* nil)
+         (*immediate-lambda-domains* nil) (*cold-global-initializer* nil)
          (identity (getf declaration :unit-name))
          (identity-key (with-standard-io-syntax (write-to-string identity)))
          (open (make-package (format nil "SNOWGRAVE.BUILDER.~D" (incf *builder-counter*)) :use '(:cl)))

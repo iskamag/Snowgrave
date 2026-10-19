@@ -4336,6 +4336,7 @@
     (local-function-flow-tests)
     (pending-multiple-value-tests)
     (cold-source-boundary-tests)
+  (cold-symbol-initializer-tests)
     (entry-graph-tests)
     (native-binding-context-tests)
     (graph-state-inference-tests)

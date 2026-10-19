@@ -55,6 +55,7 @@
                (:file "tests/local-function-flow")
                (:file "tests/pending-multiple-values")
                (:file "tests/cold-source-boundary")
+               (:file "tests/cold-symbol-initializers")
                (:file "tests/entry-graphs")
                (:file "tests/native-binding-contexts")
                (:file "tests/graph-state-inference")
