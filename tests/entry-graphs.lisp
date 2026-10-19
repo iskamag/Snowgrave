@@ -203,7 +203,8 @@
   (entry-graph-native-link-tests)
   (entry-graph-public-tests)
   (entry-graph-snapshot-tests)
-  (entry-graph-literal-provenance-tests))
+  (entry-graph-literal-provenance-tests)
+  (entry-graph-sparse-import-tests))
 
 (defun entry-graph-declaration-ownership-tests ()
   ;; The same mutable string can be structural metadata and an EQL operand.
@@ -319,3 +320,112 @@
             (check (eq data (second quoted)))
             (check (eq data (slot-value root data-name)))
             (check (eql 17 (if (arrayp data) (aref data 0) (car data))))))))))
+
+
+(defvar *entry-graph-mutated-literal* nil)
+
+(defun entry-graph-sparse-import-tests ()
+  (let* ((*package* (find-package :snowgrave.entry-graphs.fixture))
+         (forms (entry-graph-test-forms
+                 "((defclass sparse-holder () ((data :initarg :data)))
+                    (defun sparse-entry (root) (length (slot-value root 'data))))"))
+         (class-name (second (first forms))) (entry-name (second (second forms))))
+    (eval (first forms))
+    (labels ((close-data (data &optional (source forms))
+               (let ((root (make-instance class-name :data data)))
+                 (close-entry-graph-test
+                  :sparse-import source (list entry-name)
+                  (list (list entry-name (list (list 'eql root)))) (list (list :data data)))))
+             (manifest (unit)
+               (getf (getf (snowgrave:unit-metadata unit) :configuration) :native-manifest)))
+      ;; A large scalar payload with a few repeated composite edges must keep
+      ;; every alias while leaving opaque scalar contents and native storage
+      ;; untouched. The manifest describes edges, not one entry per cell.
+      (let* ((data (make-array 4096 :initial-element 17)) (child (vector 23)))
+        (setf (aref data 3) child (aref data 4095) child)
+        (let* ((unit (close-data data)) (nodes (getf (manifest unit) :nodes))
+               (outer (find '(4096) nodes :key (lambda (node) (getf node :dimensions)) :test #'equal))
+               (links (getf outer :links)))
+          (check (= 4096 (funcall (entry-graph-bound-function unit entry-name))))
+          (check (= 2 (length nodes)))
+          (check (equal '(3 4095) (mapcar #'first links)))
+          (check (= (second (first links)) (second (second links))))
+          (check (eq child (aref data 3))) (check (eq child (aref data 4095)))
+          (check (= 17 (aref data 4094))) (check (= 23 (aref child 0)))))
+      ;; A displaced view closes over the entire backing allocation, including
+      ;; a cycle through a backing cell outside the view's own visible range.
+      (let* ((backing (vector nil 17 23))
+             (view (make-array 2 :displaced-to backing :displaced-index-offset 1)))
+        (setf (aref backing 0) view)
+        (let* ((unit (close-data view)) (nodes (getf (manifest unit) :nodes))
+               (view-row (find '(2) nodes :key (lambda (node) (getf node :dimensions)) :test #'equal))
+               (backing-row (find '(3) nodes :key (lambda (node) (getf node :dimensions)) :test #'equal)))
+          (check (= 2 (funcall (entry-graph-bound-function unit entry-name))))
+          (check (= 2 (length nodes)))
+          (check (eql (getf backing-row :id) (getf view-row :backing)))
+          (check (equal (list (list 0 (getf view-row :id))) (getf backing-row :links)))
+          (check (null (getf view-row :links)))
+          (check (eq view (aref backing 0)))
+          (check (equalp #(17 23) view))))
+      ;; Scalar omission is a storage optimization, never permission to skip
+      ;; payload admission. Bad leaves at the last physical cell still refuse.
+      (dolist (kind '(:hash-table :function :instance))
+        (let* ((data (make-array 4096 :initial-element 17))
+               (bad (ecase kind
+                      (:hash-table (make-hash-table))
+                      (:function #'identity)
+                      (:instance (make-instance class-name :data nil)))))
+          (setf (aref data 4095) bad)
+          (entry-graph-refusal
+           (lambda () (close-data data))
+           (if (eq kind :instance) :graph-native-content :graph-node-kind))
+          (check (eq bad (aref data 4095)))
+          (check (= 17 (aref data 4094)))))
+      ;; Actual numeric/character storage excludes composite payloads without
+      ;; reading and boxing every cell. These remain ordinary native imports.
+      (dolist (spec (list (list '(unsigned-byte 64) (1- (ash 1 64)))
+                          (list 'double-float 1.25d0) (list 'character #\x) (list 'bit 1)))
+        (let* ((data (make-array 4096 :element-type (first spec) :initial-element (second spec)))
+               (unit (close-data data))
+               (nodes (getf (manifest unit) :nodes)))
+          (check (= 4096 (funcall (entry-graph-bound-function unit entry-name))))
+          (check (= 1 (length nodes)))
+          (check (null (getf (first nodes) :links)))
+          (check (eql (second spec) (aref data 4095)))))
+      ;; Specialized storage does not waive literal snapshot comparison.
+      (let* ((data (make-array 1 :element-type '(unsigned-byte 64) :initial-element (1- (ash 1 64))))
+             (body `(macrolet ((edited (datum) (setf (aref (second datum) 0) 99) datum))
+                      (eq (slot-value root ',(intern "DATA")) (edited ',data))))
+             (edited-forms (list (first forms) `(defun ,entry-name (root) ,body))))
+        (entry-graph-refusal (lambda () (close-data data edited-forms)) :graph-literal-provenance)
+        (check (= (1- (ash 1 64)) (aref data 0))))
+      ;; The snapshot cut follows normalization. Matching explicit host and
+      ;; copied edits are preserved; copied-only/live-only differences refuse.
+      ;; Transitive cons children use the same existing provenance owner.
+      (dolist (kind '(:scalar :child))
+        (dolist (mode '(:copy-only :live-only :both :discarded-copy))
+          (let* ((data (vector (if (eq kind :child) (list 17) 17)))
+                 (*entry-graph-mutated-literal* data)
+                 (copy-edit (if (eq kind :scalar)
+                                '(setf (aref (second datum) 0) 99)
+                                '(setf (car (aref (second datum) 0)) 99)))
+                 (live-edit (if (eq kind :scalar)
+                                '(setf (aref snowgrave.tests::*entry-graph-mutated-literal* 0) 99)
+                                '(setf (car (aref snowgrave.tests::*entry-graph-mutated-literal* 0)) 99)))
+                 (literal `(macrolet ((edited (datum)
+                                       ,@(when (member mode '(:copy-only :both :discarded-copy)) (list copy-edit))
+                                       ,@(when (member mode '(:live-only :both)) (list live-edit))
+                                       datum))
+                             (edited ',data)))
+                 (source (if (eq mode :discarded-copy)
+                             (append forms (list `(defun ,(intern "DROPPED-LITERAL") () ,literal)))
+                             (list (first forms)
+                                   `(defun ,entry-name (root)
+                                      (eq (slot-value root ',(intern "DATA")) ,literal))))))
+            (if (member mode '(:both :discarded-copy))
+                (let ((unit (close-data data source)))
+                  (check (eql (if (eq mode :both) t 1)
+                              (funcall (entry-graph-bound-function unit entry-name)))))
+                (entry-graph-refusal (lambda () (close-data data source)) :graph-literal-provenance))
+            (check (= (if (member mode '(:live-only :both)) 99 17)
+                      (if (eq kind :scalar) (aref data 0) (car (aref data 0)))))))))))

@@ -55,6 +55,17 @@
 (defun graph-source-node (build value)
   (gethash value (build-graph-index build)))
 
+(defun graph-array-geometry-matches-p (array row)
+  (and (arrayp array)
+       (equal (array-dimensions array) (getf row :dimensions))
+       (let ((options (getf row :options)))
+         (and (equal (array-element-type array) (getf options :element-type))
+              (eq (not (null (adjustable-array-p array))) (getf options :adjustable))
+              (eq (not (null (array-has-fill-pointer-p array)))
+                  (not (null (member :fill-pointer options))))
+              (or (not (array-has-fill-pointer-p array))
+                  (eql (fill-pointer array) (getf options :fill-pointer)))))))
+
 (defun graph-literal-origin (build value)
   "Join owned literal copies only when they still describe the captured node."
   (let* ((origin (gethash value (build-source-origins build) value))
@@ -66,9 +77,10 @@
       ;; Compare each copied node once; active entries close native cycles.
       (setf (gethash value (build-graph-literal-states build)) :active)
       (flet ((same-edge (copy expected)
-               (if (graph-source-node build expected)
-                   (eq (graph-literal-origin build copy) expected)
-                   (eql copy expected))))
+               (let ((origin (gethash expected (build-source-origins build) expected)))
+                 (if (graph-source-node build origin)
+                     (eq (graph-literal-origin build copy) origin)
+                     (eql copy origin)))))
         (unless
             (cond
               ((consp origin)
@@ -76,23 +88,21 @@
                     (same-edge (car value) (first (getf row :values)))
                     (same-edge (cdr value) (second (getf row :values)))))
               ((arrayp origin)
-               (and (arrayp value)
-                    (equal (array-dimensions value) (getf row :dimensions))
-                    (let ((options (getf row :options)))
-                      (and (equal (array-element-type value) (getf options :element-type))
-                           (eq (not (null (adjustable-array-p value))) (getf options :adjustable))
-                           (eq (not (null (array-has-fill-pointer-p value)))
-                               (not (null (member :fill-pointer options))))
-                           (or (not (array-has-fill-pointer-p value))
-                               (eql (fill-pointer value) (getf options :fill-pointer)))))
+               (and (graph-array-geometry-matches-p value row)
                     (multiple-value-bind (parent offset) (array-displacement value)
                       (and (= offset (getf row :offset))
                            (if (getf row :backing)
                                (and parent (same-edge parent (getf row :backing)))
                                (and (null parent)
                                     (or (null (array-element-type value))
-                                        (loop for element in (getf row :values) for index from 0
-                                              always (same-edge (row-major-aref value index) element)))))))))
+                                        (if (getf row :import-reference)
+                                            (let ((baseline (getf row :literal-baseline)))
+                                              (and baseline
+                                                   (loop for index below (array-total-size value)
+                                                         always (same-edge (row-major-aref value index)
+                                                                           (row-major-aref baseline index)))))
+                                            (loop for element in (getf row :values) for index from 0
+                                                  always (same-edge (row-major-aref value index) element))))))))))
               (t nil))
           (fail build 'snowgrave:nonreproducible-source :graph-literal-provenance
                 "An owned literal alias was changed during normalization and no longer matches its captured configuration node."
@@ -220,7 +230,8 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                       "An unchanged native import cannot hide a source CLOS instance." :graph-capture))
               (let ((row (list :id (prog1 next-id (incf next-id)) :source value
                                :import-reference import-reference :import-path import-path :class nil :domain nil
-                               :values nil :slots nil :record-edge-p nil :dimensions nil :options nil
+                               :values nil :native-links nil :literal-baseline nil
+                               :slots nil :record-edge-p nil :dimensions nil :options nil
                                :backing nil :offset 0)))
                 ;; Register before following any edge, so cycles close here.
                 (setf (gethash value (build-graph-index build)) row)
@@ -260,16 +271,53 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                          (getf row :options) (snowgrave::array-allocation-options value :graph-backing))
                    (multiple-value-bind (parent offset) (array-displacement value)
                      (setf (getf row :backing) parent (getf row :offset) offset)
-                     (if parent
-                         (visit parent (when import-reference `(nth-value 0 (array-displacement ,import-reference)))
-                                (when import-path (append import-path '((:backing)))))
-                         (unless (null (array-element-type value))
-                           (setf (getf row :values)
-                                 (loop for index below (array-total-size value)
-                                       collect (row-major-aref value index)))
-                           (loop for item in (getf row :values) for index from 0
-                                 do (visit item (when import-reference `(row-major-aref ,import-reference ,index))
-                                           (when import-path (append import-path (list (list :element index)))))))))))
+                     (let ((candidates
+                             (when import-reference
+                               (remove-if-not
+                                (lambda (copy)
+                                  (multiple-value-bind (base-parent base-offset) (array-displacement copy)
+                                    (and (graph-array-geometry-matches-p copy row)
+                                         (= offset base-offset)
+                                         (eq parent (gethash base-parent (build-source-origins build) base-parent)))))
+                                (gethash value (build-source-array-copies build))))))
+                       ;; The final frozen source already owns candidate
+                       ;; literal snapshots. Retain one matching the captured
+                       ;; resource, if any; an unused divergent literal places
+                       ;; no constraint on this configuration. Each emitted
+                       ;; copy is checked against this same baseline later.
+                       (if parent
+                           (visit parent (when import-reference `(nth-value 0 (array-displacement ,import-reference)))
+                                  (when import-path (append import-path '((:backing)))))
+                           (unless (or (null (array-element-type value))
+                                       (and import-reference (null candidates)
+                                            (snowgrave::native-scalar-array-storage-p value)))
+                             (if import-reference
+                                 ;; Opaque scalar contents need admission but no
+                                 ;; retained cell or generated path expression.
+                                 (let ((links nil))
+                                   (dotimes (index (array-total-size value))
+                                     (let ((item (row-major-aref value index)))
+                                       ;; Filter in place: no per-scalar
+                                       ;; closure, candidate list or snapshot.
+                                       (loop with previous = nil
+                                             for cell = candidates then next
+                                             for next = (cdr cell) while cell
+                                             for expected = (row-major-aref (car cell) index)
+                                             do (if (eql item (gethash expected (build-source-origins build) expected))
+                                                    (setf previous cell)
+                                                    (if previous (setf (cdr previous) next)
+                                                        (setf candidates next))))
+                                       (unless (scalarp item)
+                                         (push (cons index item) links)
+                                         (visit item `(row-major-aref ,import-reference ,index)
+                                                (append import-path (list (list :element index)))))))
+                                   (setf (getf row :native-links) (nreverse links)))
+                                 (progn
+                                   (setf (getf row :values)
+                                         (loop for index below (array-total-size value)
+                                               collect (row-major-aref value index)))
+                                   (dolist (item (getf row :values)) (visit item))))))
+                       (setf (getf row :literal-baseline) (car candidates))))))
                 row))))
          (root-reference (value)
            (if (scalarp value) `',value
@@ -319,7 +367,9 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                   (some (lambda (value)
                           (let ((child (graph-source-node build value)))
                             (and child (getf child :class) t)))
-                        (getf row :values)))))
+                        (if (and (getf row :import-reference) (arrayp (getf row :source)))
+                            (mapcar #'cdr (getf row :native-links))
+                            (getf row :values))))))
       (when (build-graph-imports build)
         (let ((resource-name (fresh-name build "NATIVE-RESOURCES")))
           (setf (build-graph-resource-name build) resource-name)
@@ -371,12 +421,14 @@ The existing literal pool consumes these cold node recipes for shell/fill."
               (let ((options (getf row :options)))
                 (append (list :id (getf row :id) :path (getf row :import-path)
                               :kind (if (consp (getf row :source)) :cons :array)
-                              :links (loop for value in (getf row :values) for index from 0
-                                           for target = (graph-source-node build value)
-                                           when target
-                                             collect (list (if (consp (getf row :source))
-                                                               (if (zerop index) :car :cdr) index)
-                                                           (getf target :id))))
+                              :links (if (arrayp (getf row :source))
+                                         (loop for (index . value) in (getf row :native-links)
+                                               collect (list index (getf (graph-source-node build value) :id)))
+                                         (loop for value in (getf row :values) for index from 0
+                                               for target = (graph-source-node build value)
+                                               when target
+                                                 collect (list (if (zerop index) :car :cdr)
+                                                               (getf target :id)))))
                         (when options
                           (list :dimensions (getf row :dimensions)
                                 :element-type (getf options :element-type)
@@ -395,8 +447,19 @@ The existing literal pool consumes these cold node recipes for shell/fill."
        (snowgrave::source-finite-list-p domain) (= (length domain) 3)
        (typep (second domain) '(integer 0 *))))
 
-(defun graph-node-domain (domain)
-  (if (graph-node-domain-p domain) (third domain) domain))
+(defun owned-record-domain-p (domain)
+  ;; A normal-return allocation family, never a singleton identity or EQL key.
+  (and (consp domain) (eq (first domain) :owned-record)
+       (snowgrave::source-finite-list-p domain) (= (length domain) 2)
+       (symbolp (second domain))))
+
+(defun private-record-domain-base (domain)
+  (cond ((graph-node-domain-p domain) (third domain))
+        ((owned-record-domain-p domain) (second domain)) (t domain)))
+
+(defun owned-record-layout (build domain)
+  (when (owned-record-domain-p domain)
+    (find (second domain) (build-layouts build) :key (lambda (row) (getf row :class)) :test #'name=)))
 
 (defun graph-node-row (build domain)
   (when (graph-node-domain-p domain)
@@ -430,6 +493,14 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                (when (and (consp form) (eq (car form) 'slot-value)) (invalidate (third form))))
              (walk (form)
                (when (and (consp form) (not (eq (car form) 'quote)))
+                 ;; Source reinitialization, including a saved/indirect
+                 ;; initialization callable, can replace existing field edges.
+                 ;; Compiler-owned stock delegation is not an authored call.
+                 (when (or (initialization-generic-p (first form))
+                           (and (eq (first form) 'function)
+                                (initialization-generic-p (second form))))
+                   (dolist (layout (build-layouts build))
+                     (dolist (slot (getf layout :slots)) (pushnew slot writes))))
                  (case (car form)
                    (setf (loop for tail on (cdr form) by #'cddr do (place (first tail))))
                    ((incf decf pop) (place (second form)))
@@ -452,12 +523,19 @@ The existing literal pool consumes these cold node recipes for shell/fill."
         (walk form)))
     (setf (build-graph-state-invalidations build) (list :writes writes :unbinds unbinds))))
 
+(defun private-record-slot-row (build domain)
+  (cond ((graph-node-domain-p domain) (graph-node-row build domain))
+        ((owned-record-domain-p domain)
+         (let ((layout (owned-record-layout build domain)))
+           (when (getf layout :construction-state)
+             (list :class (getf layout :class) :slots (getf layout :construction-state)))))))
+
 (defun graph-record-slot-facts (build receiver slot)
-  "Return captured boundness/value facts only for the exact private nodes."
+  "Use the same read owner for exact captures and joined fresh-family facts."
   (let ((alternatives (domain-alternatives receiver)) (value :pending))
-    (when (and alternatives (every #'graph-node-domain-p alternatives))
+    (when alternatives
       (dolist (domain alternatives (values t value))
-        (let* ((row (graph-node-row build domain))
+        (let* ((row (private-record-slot-row build domain))
                (field (assoc slot (getf row :slots))))
           (unless (and (getf row :class) field (second field)
                        (not (member slot (getf (build-graph-state-invalidations build) :unbinds))))
@@ -499,14 +577,27 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   ;; captured subclass and therefore cannot borrow this disjointness proof.
   (some (lambda (part)
           (cond ((member part '(:pending :unknown)) t)
+                ((owned-record-domain-p part) t)
                 ((graph-node-domain-p part)
                  (let ((row (graph-node-row build part)))
                    (or (null row) (not (null (getf row :class))))))
                 (t (some (lambda (row)
                            (let ((class (getf row :class)))
                              (and class (subtype-domain-p build class part))))
-                         (build-graph-nodes build)))))
+                         (append (build-graph-nodes build)
+                                 (remove-if-not (lambda (row) (getf row :construction-reached-p))
+                                                (build-layouts build)))))))
         (domain-alternatives domain)))
+
+(defun private-record-slot-present-p (build domain slot)
+  ;; Presence alone is phase-independent. In initialization methods a nominal
+  ;; receiver must never borrow the normal-return family's boundness/value.
+  (let ((row (private-record-slot-row build domain)))
+    (if row (not (null (assoc slot (getf row :slots))))
+        (let ((layouts (remove-if-not
+                        (lambda (layout) (subtype-domain-p build (getf layout :class) domain))
+                        (build-layouts build))))
+          (and layouts (every (lambda (layout) (member slot (getf layout :slots))) layouts))))))
 
 (defun audit-graph-record-slot (build receiver-form slot-form &key bound)
   (when (and (graph-state-profile-p build) (not *collect-function-flow*)
@@ -515,11 +606,11 @@ The existing literal pool consumes these cold node recipes for shell/fill."
       (let ((alternatives (domain-alternatives (value-domain build receiver-form))))
         (unless (and literalp alternatives
                      (every (lambda (domain)
-                              (let* ((row (graph-node-row build domain)) (field (assoc slot (getf row :slots))))
-                                (and (getf row :class) field
-                                     (or (not bound)
-                                         (and (second field)
-                                              (not (member slot (getf (build-graph-state-invalidations build) :unbinds))))))))
+                              (let* ((row (private-record-slot-row build domain)) (field (assoc slot (getf row :slots))))
+                                (if bound
+                                    (and (getf row :class) field (second field)
+                                         (not (member slot (getf (build-graph-state-invalidations build) :unbinds))))
+                                    (private-record-slot-present-p build domain slot))))
                             alternatives))
           (fail build 'snowgrave:unclosed-class-operation :graph-state-slot-read
                 "A private state record needs an exact existing slot and preserved boundness before an operation could expose it in a slot condition."
@@ -566,3 +657,145 @@ The existing literal pool consumes these cold node recipes for shell/fill."
               "Every public state entry must keep private records and dependent aggregates/callables behind its native result boundary."
               :reachability)))))
 
+
+;;;; Construction shares finalized layout, source, lambda and return owners.
+
+(defun construction-protocol (build class)
+  (let ((layout (find class (build-layouts build) :key (lambda (row) (getf row :class)) :test #'name=)))
+    (or (getf layout :construction-protocol)
+        (let ((host (find-class (mapped-name class (build-open-package build)))))
+          (verify-standard-construction build host)
+          (multiple-value-bind (legal allow) (construction-initarg-contract build host)
+            (setf (getf layout :construction-protocol)
+                  (list :legal legal :allow allow
+                        :stock (every (lambda (operation)
+                                        (every (lambda (method)
+                                                 (eq method (second (assoc operation *standard-initialization-methods*))))
+                                               (initialization-methods build operation host)))
+                                      '(initialize-instance shared-initialize)))))))))
+
+(defun call-in-initializer-environment (build initializer process)
+  (let ((*argument-domains* nil) (*function-bindings* nil)
+        (*local-function-frames* nil) (*value-domain-local-functions* nil)
+        (*mutable-invariant-bindings* nil) (*declared-specials* nil)
+        (*current-method* nil) (*effective-return-proof* nil) (*fixed-effective-arguments* nil)
+        (*immediate-callee-value* nil) (*generated-class-operation* nil)
+        (*tagbody-targets* nil) (*immediate-lambda-domains* nil))
+    (with-build-source-key (build (getf initializer :source-key)) (funcall process))))
+
+(defun construction-initializer-domain (build initializer)
+  (call-in-initializer-environment build initializer
+    (lambda () (value-domain build (getf initializer :form)))))
+
+(defun audit-construction-slot-domain (build layout slot domain)
+  ;; SG-RECORD-WRITE's TYPE-ERROR retains VALUE, not just a nominal type.
+  ;; An existing private object therefore needs actual acceptance proof.
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*))
+    (let* ((index (position slot (getf layout :slots)))
+           (type (nth index (getf layout :slot-types))))
+      (when (and (external-result-domain-p domain)
+                 (snowgrave::class-reference-slot-type-p type (build-classes build)))
+        (fail build 'snowgrave:unclosed-call :external-result-state
+              "An opaque native initarg has no closed class-reference slot ABI." :reachability))
+      (when (and (graph-private-record-domain-p build domain)
+                 (not (subtype-domain-p build domain type)))
+        (fail build 'snowgrave:unclosed-class-operation :construction-private-type-error
+              "A potentially private initializer datum needs proved slot-type acceptance before an error could publish it."
+              :reachability)))))
+
+(defun audit-construction-initarg-domain (build layout key domain)
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*))
+    (let ((targets (loop for slot in (getf layout :slots) for names in (getf layout :slot-initargs)
+                         when (member key names) collect slot)))
+      (when (and (graph-private-record-domain-p build domain) (null targets))
+        (fail build 'snowgrave:unclosed-class-operation :construction-private-initarg
+              "A potentially private initarg needs an accepted slot owner; an ignored key or custom keyword cannot borrow one."
+              :reachability))
+      (dolist (slot targets) (audit-construction-slot-domain build layout slot domain)))))
+
+(defun source-construction-domain (build form)
+  (multiple-value-bind (class literalp) (quoted-value (second form))
+    (unless (and literalp (member-name class (build-classes build)))
+      (return-from source-construction-domain :unknown))
+    (unless (graph-state-profile-p build) (return-from source-construction-domain class))
+    (let* ((layout (find class (build-layouts build) :key (lambda (row) (getf row :class)) :test #'name=))
+           (protocol (construction-protocol build class))
+           (arguments (cddr form)) (plist nil)
+           (recursivep (member class *active-construction-classes* :test #'name=))
+           (*active-construction-classes* (cons class *active-construction-classes*)))
+      (unless (and (evenp (length arguments))
+                   (loop for tail on arguments by #'cddr always (keywordp (first tail))))
+        (return-from source-construction-domain :unknown))
+      (loop for (key value) on arguments by #'cddr
+            for domain = (value-domain build value)
+            do (audit-construction-initarg-domain build layout key domain)
+               (setf plist (append plist (list key domain))))
+      ;; GET-PROPERTIES below mirrors the materializer's first-occurrence
+      ;; selection across all accepted names. Every initializer is still
+      ;; emitted/audited by its original owner, including omitted profiles.
+      (dolist (default (getf layout :default-initargs))
+        (unless (nth-value 2 (get-properties plist (list (first default))))
+          (let* ((initializer (list :form (second default) :source-key (getf (cddr default) :source-key)))
+                 (domain (if recursivep :pending (construction-initializer-domain build initializer))))
+            (audit-construction-initarg-domain build layout (first default) domain)
+            (setf plist (append plist (list (first default) domain))))))
+      (when (and (not *collect-function-flow*)
+                 (loop for tail on plist by #'cddr
+                       thereis (graph-private-record-domain-p build (second tail)))
+                 (not (getf protocol :allow))
+                 (not (let ((allow (getf plist :allow-other-keys '(eql nil))))
+                        (subtype-domain-p build allow '(not null))))
+                 (loop for tail on plist by #'cddr
+                       thereis (not (or (eq (first tail) :allow-other-keys)
+                                        (member (first tail) (getf protocol :legal))))))
+        (fail build 'snowgrave:unclosed-class-operation :construction-private-keywords
+              "A constructor carrying private initargs needs proved keyword acceptance before any validation/error path."
+              :reachability))
+      (let ((state
+              (loop for slot in (getf layout :slots) for names in (getf layout :slot-initargs)
+                    for initializer in (getf layout :slot-initforms)
+                    collect (multiple-value-bind (key value tail) (get-properties plist names)
+                              (declare (ignore key))
+                              (let* ((boundp (and (getf protocol :stock) (or tail initializer)))
+                                     (domain (cond (tail value)
+                                                   (initializer (if recursivep :pending (construction-initializer-domain build initializer)))
+                                                   (t :unknown))))
+                                (when (or tail initializer) (audit-construction-slot-domain build layout slot domain))
+                                (list slot (not (null boundp)) (if boundp domain :unknown)))))))
+        (cond (*collect-function-flow*
+               (let* ((reachedp (getf layout :construction-reached-p))
+                      (old (getf layout :construction-state))
+                      (joined (if reachedp
+                                  (mapcar (lambda (before after)
+                                            (list (first before) (and (second before) (second after))
+                                                  (merge-value-domains build (third before) (third after)))) old state)
+                                  state)))
+                 (unless (and reachedp (equal old joined))
+                   (setf (getf layout :construction-reached-p) t (getf layout :construction-state) joined
+                         *function-flow-changed* t))))
+              ((not (getf layout :construction-reached-p))
+               (fail build 'snowgrave:incomplete-domain :construction-reachability
+                     "A source constructor lacks its joined normal-return family proof." :reachability))))
+      (list :owned-record class))))
+
+(defun audit-initialization-state-inputs (build name arguments)
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*))
+    (let* ((required (if (eq name 'shared-initialize) 2 1))
+           (receiver (value-domain build (first arguments))))
+      (dolist (part (domain-alternatives receiver))
+        (let* ((class (private-record-domain-base part))
+               (layout (find class (build-layouts build) :key (lambda (row) (getf row :class)) :test #'name=)))
+          (unless layout
+            (fail build 'snowgrave:unclosed-class-operation :initialization-state-receiver
+                  "Private initialization needs an admitted record layout." :reachability))
+          (loop for (key value) on (nthcdr required arguments) by #'cddr
+                do (audit-construction-initarg-domain build layout key (value-domain build value))))))))
+
+(defun settle-construction-domains (build)
+  ;; Same quiescent outer fixedpoint, after all selected roots have had their
+  ;; replay. No unknown tail or fictitious successful value count is invented.
+  (when (and *settled-method-roots* (not *function-flow-changed*))
+    (dolist (layout (build-layouts build))
+      (dolist (field (getf layout :construction-state))
+        (when (eq (third field) :pending)
+          (setf (third field) :unknown *function-flow-changed* t))))))

@@ -14,6 +14,7 @@
 (defvar *function-bindings* nil)
 (defvar *generated-class-operation* nil)
 (defvar *current-method* nil)
+(defvar *active-construction-classes* nil)
 (defvar *effective-return-proof* nil)
 (defvar *fixed-effective-arguments* nil)
 (defvar *collect-function-flow* nil)
@@ -101,6 +102,7 @@
   graph-nodes graph-imports graph-root-names graph-root-references graph-resource-name
   graph-state-invalidations
   (source-origins (make-hash-table :test #'eq))
+  (source-array-copies (make-hash-table :test #'eq))
   (graph-literal-states (make-hash-table :test #'eq)))
 
 (defun build-forms (build)
@@ -292,14 +294,18 @@ all other expansions re-enter the same admission and residual audits."
            (list* (car form) (second form) (expression (third form)) (cdddr form)) form))
       (t form))))
 
-(defun source-copy-observer (build)
+(defun source-copy-observer (build &optional snapshotp)
   ;; Transient ownership provenance joins native literals with captured roots.
   ;; Syntax is still copied on every boundary; no source handle is retained in
   ;; the installed unit or in its serialized metadata.
   (when (entry-graph-request-p build)
     (lambda (original copy)
-      (setf (gethash copy (build-source-origins build))
-            (gethash original (build-source-origins build) original)))))
+      (let ((origin (gethash original (build-source-origins build) original)))
+        (setf (gethash copy (build-source-origins build)) origin)
+        ;; Only the frozen normalized output defines candidate literal data
+        ;; at the capture cut. Keep pointers, never another payload copy.
+        (when (and snapshotp (arrayp origin))
+          (push copy (gethash origin (build-source-array-copies build))))))))
 
 (defun normalize-authored-source (build)
   ;; Neither a user expander that destructively edits its argument nor a
@@ -310,7 +316,7 @@ all other expansions re-enter the same admission and residual audits."
          (expanded (loop for original in originals for input in inputs
                          collect (with-build-source-key (build (authored-source-key build original))
                                    (normalize-authored-definition build input))))
-         (frozen (snowgrave::immutable-copy expanded (source-copy-observer build))))
+         (frozen (snowgrave::immutable-copy expanded (source-copy-observer build t))))
     (loop for original in originals for normalized in frozen
           do (setf (gethash normalized (build-normalized-originals build)) original))
     ;; Every pass and every return/call analysis consumes this same snapshot.
@@ -633,7 +639,8 @@ No arbitrary type alias, pointer array, or foreign class is an owner ABI."
       shape))
 
 (defun value-domain-shape (build domain)
-  (cond ((graph-node-domain-p domain) (value-domain-shape build (third domain)))
+  (cond ((owned-record-domain-p domain) (second domain))
+        ((graph-node-domain-p domain) (value-domain-shape build (third domain)))
         ((shaped-domain-p domain) (second domain))
         ((or (eq domain :external-result) (external-value-domain-p build domain)) :unknown)
         ((and (consp domain) (eq (car domain) 'or))
@@ -670,7 +677,7 @@ The stable key names its owner obligation, never a class or slot type."
         (t domain)))
 
 (defun native-data-domain-p (build domain)
-  (and (not (external-result-domain-p domain))
+  (and (not (external-result-domain-p domain)) (not (owned-record-domain-p domain))
        (or (and (graph-node-domain-p domain) (native-data-domain-p build (third domain)))
            (external-value-domain-p build domain)
            (and (consp domain) (eq (car domain) 'or)
@@ -1304,7 +1311,7 @@ The stable key names its owner obligation, never a class or slot type."
   (when *collect-function-flow* (return-from validate-record-slot (build-layouts build)))
   (let* ((domain (value-domain build record-form))
          (layouts (remove-if-not (lambda (layout)
-                                   (some (lambda (actual) (member (graph-node-domain actual) (getf layout :ancestors)))
+                                   (some (lambda (actual) (member (private-record-domain-base actual) (getf layout :ancestors)))
                                          (domain-alternatives domain))) (build-layouts build))))
     (unless (and (record-domain-p build domain) layouts
                  (symbolp slot) (symbol-package slot))
@@ -1654,16 +1661,18 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
   ;; A may-opaque profile covers clean inputs too; UNKNOWN cannot cover an
   ;; actual import origin which its body proof would otherwise reinterpret.
   (or (equal actual expected)
-      (if (graph-node-domain-p expected)
-          (and (graph-node-domain-p actual) (eql (second actual) (second expected))
-               (flow-domain-covered-p build (third actual) (third expected)))
-          (if (external-result-domain-p expected)
-          ;; A may-opaque envelope covers clean callers too, but a shaped
-          ;; envelope still requires geometry from every caller.
-          (or (eq (value-domain-shape build expected) :unknown)
-              (subtype-domain-p build actual (value-domain-shape build expected)))
-          (and (not (external-result-domain-p actual))
-               (or (eq expected :unknown) (subtype-domain-p build actual expected)))))))
+      (if (owned-record-domain-p expected)
+          (and (owned-record-domain-p actual) (name= (second actual) (second expected)))
+          (if (graph-node-domain-p expected)
+              (and (graph-node-domain-p actual) (eql (second actual) (second expected))
+                   (flow-domain-covered-p build (third actual) (third expected)))
+              (if (external-result-domain-p expected)
+                  ;; A may-opaque envelope covers clean callers too, but a
+                  ;; shaped envelope requires geometry from every caller.
+                  (or (eq (value-domain-shape build expected) :unknown)
+                      (subtype-domain-p build actual (value-domain-shape build expected)))
+                  (and (not (external-result-domain-p actual))
+                       (or (eq expected :unknown) (subtype-domain-p build actual expected))))))))
 
 (defun record-local-function-inputs (build binding domains)
   (let* ((frame (local-function-binding-frame binding))
@@ -2123,6 +2132,9 @@ Unknown/native operations retain only their existing primary fact."
               (every (lambda (target) (ordinary-single-value-result-p build target global-targets)) targets))
              (indirect-call-return-summary build form targets global-targets callee-domain)))))
     ((source-call-return-summary build (car form)) (source-call-return-summary build (car form)))
+    ((and (eq (first form) 'make-instance) (graph-state-profile-p build))
+     (let ((domain (source-construction-domain build form)))
+       (make-return-summary (list domain) (owned-record-domain-p domain))))
     ((and (member (car form) '(slot-value snowgrave::%record-read))
           (nth-value 1 (record-slot-read-domain build (second form) (third form))))
      (make-return-summary (list (value-domain build form)) t))
@@ -2476,8 +2488,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
          ;; bounds affect mutation, not the returned sequence's provenance.
          (values (value-domain build (second form)) t))
         ((and (consp form) (eq (car form) 'make-instance))
-         (multiple-value-bind (class constantp) (quoted-value (cadr form))
-           (if (and constantp (member-name class (build-classes build))) class :unknown)))
+         (values (source-construction-domain build form) t))
         ((and (consp form) (immediate-lambda-form build form))
          (values (return-summary-primary (immediate-lambda-return-summary build form)) t))
         ((and (consp form) (member (car form) '(funcall apply multiple-value-call)))
@@ -2493,7 +2504,10 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         (t :unknown)))
 
 (defun subtype-domain-p (build actual expected)
-  (cond ((graph-node-domain-p expected)
+  (cond ((owned-record-domain-p expected)
+         (and (owned-record-domain-p actual) (name= (second actual) (second expected))))
+        ((owned-record-domain-p actual) (subtype-domain-p build (second actual) expected))
+        ((graph-node-domain-p expected)
          (and (graph-node-domain-p actual) (eql (second actual) (second expected))
               (subtype-domain-p build (third actual) (third expected))))
         ((graph-node-domain-p actual) (subtype-domain-p build (third actual) expected))
@@ -2537,7 +2551,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
   (if (and (consp domain) (eq (car domain) 'or)) (cdr domain) (list domain)))
 
 (defun record-domain-p (build domain)
-  (every (lambda (actual) (member-name (graph-node-domain actual) (build-classes build)))
+  (every (lambda (actual) (member-name (private-record-domain-base actual) (build-classes build)))
          (domain-alternatives domain)))
 
 (defun builtin-type-test (build type value)
@@ -2675,7 +2689,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                       (setf selected (merge-value-domains build selected part) compatiblep t))
                      ;; A broad declared caller can occupy this class cell,
                      ;; but cannot lend it a particular graph node qualifier.
-                     ((subtype-domain-p build cell (graph-node-domain part))
+                     ((subtype-domain-p build cell (private-record-domain-base part))
                       (setf selected (merge-value-domains build selected cell) compatiblep t))))
              (values selected compatiblep)))))
 
@@ -2801,6 +2815,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
 
 (defun audit-initialization-call (build name arguments)
   (when (and (initialization-generic-p name) (not *generated-class-operation*))
+    (audit-initialization-state-inputs build name arguments)
     (let* ((required (if (eq name 'shared-initialize) 2 1))
            (keys (nthcdr required arguments)))
       (unless (and (>= (length arguments) required) (evenp (length keys))
@@ -3075,12 +3090,12 @@ reflection, lexical rebinding and class values still require their own ABI."
            (fail build 'snowgrave:unsupported-definition :lexical-control
                  "GO needs an enclosing normalized TAGBODY target."))
          `(go ,(cdr target))))
-      ((and (graph-state-profile-p build) (not open) (not *collect-function-flow*)
-            (eq (car form) 'make-instance))
-       (fail build 'snowgrave:unclosed-class-operation :graph-state-construction
-             "Source construction requires its graph-bearing initarg/error escape proof; cold captured graph shells are separate."
-             :reachability))
       ((eq (car form) 'the)
+       (when (and (not open) (not *collect-function-flow*) (graph-state-profile-p build)
+                  (graph-private-record-domain-p build (value-domain build (third form)))
+                  (not (subtype-domain-p build (value-domain build (third form)) (second form))))
+         (fail build 'snowgrave:unclosed-class-operation :private-type-assertion-error
+               "A checked assertion could publish a private record as its failing TYPE-ERROR datum." :reachability))
        (unless (or (native-value-type-p (second form)) (member (second form) '(t list cons)))
          (fail build 'snowgrave:unclosed-class-operation :type-assertion
                "THE needs an admitted native type or explicit closed representation mapping."))
@@ -3391,7 +3406,8 @@ reflection, lexical rebinding and class values still require their own ABI."
                       (loop for tail on (cddr form) by #'cddr always (keywordp (car tail))))
            (fail build 'snowgrave:unclosed-class-operation :construction-initargs
                  "Constructor sites need literal keyword names with a proven argument shape."))
-         (when (and (not open) (not *collect-function-flow*)
+         (unless open (source-construction-domain build form))
+         (when (and (not open) (not *collect-function-flow*) (not (graph-state-profile-p build))
                     (loop for (key value) on (cddr form) by #'cddr
                           thereis (external-result-domain-p (value-domain build value))))
            (fail build 'snowgrave:unclosed-call :external-result-state
@@ -4067,6 +4083,7 @@ not a second inheritance or initialization algorithm."
           (fail build 'snowgrave:unsupported-definition :class-slot
                 "Class slots require shared closed storage." :materialization))
         (push (list :class name :identity (list (build-identity build) name :version 1)
+                    :construction-protocol nil :construction-reached-p nil :construction-state nil
                     :class-token (snowgrave::class-identity-token (list (build-identity build) name :version 1) name)
                     :error-mapping (slot-error-mapping build class)
                     :slots (mapcar #'sb-mop:slot-definition-name slots)
@@ -4237,7 +4254,11 @@ not a second inheritance or initialization algorithm."
                                     (snowgrave::%record-write
                                      ,record ',slot
                                      ,(with-build-source-key (build (getf initform :source-key))
-                                        (transform-form build (getf initform :form) (build-output-package build))) '(,class))))))))
+                                        (call-in-initializer-environment build initform
+                                          (lambda ()
+                                            (audit-construction-slot-domain build description slot
+                                              (value-domain build (getf initform :form)))
+                                            (transform-form build (getf initform :form) (build-output-package build))))) '(,class))))))))
                   (getf description :slots) (getf description :slot-initargs) (getf description :slot-initforms))
                ,record))
           (build-generated build))
@@ -4353,7 +4374,12 @@ not a second inheritance or initialization algorithm."
                            (setf ,defaults (append ,defaults
                                                   (list ,(car default)
                                                         ,(with-build-source-key (build (getf (cddr default) :source-key))
-                                                           (transform-form build (cadr default) (build-output-package build))))))))
+                                                           (call-in-initializer-environment
+                                                             build (list :source-key (getf (cddr default) :source-key))
+                                                             (lambda ()
+                                                               (audit-construction-initarg-domain build description (car default)
+                                                                 (value-domain build (cadr default)))
+                                                               (transform-form build (cadr default) (build-output-package build))))))))))
                       (getf description :default-initargs))
                    (let ((,arguments (append ,arguments ,defaults)))
                      ,@(unless allow
@@ -4379,7 +4405,11 @@ not a second inheritance or initialization algorithm."
                                        `((t (snowgrave::%record-write
                                              ,record ',slot
                                              ,(with-build-source-key (build (getf initform :source-key))
-                                                (transform-form build (getf initform :form) (build-output-package build))) '(,class))))))))
+                                                (call-in-initializer-environment build initform
+                                                  (lambda ()
+                                                    (audit-construction-slot-domain build description slot
+                                                      (value-domain build (getf initform :form)))
+                                                    (transform-form build (getf initform :form) (build-output-package build))))) '(,class))))))))
                         (getf description :slots) (getf description :slot-initargs) (getf description :slot-initforms)))
                      ,record))))
               (build-generated build))
@@ -4990,6 +5020,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
                  ;; only where no actual caller proof exists, using the same
                  ;; argument/return fixed point to retain their dependencies.
                  (setf *settled-method-roots* t *function-flow-changed* t)))
+             (settle-construction-domains build)
              (unless *function-flow-changed* (return)))
            (setf (build-function-flow-evidence build)
                  (list :method :finite-argument-binding-fixed-point :iterations iterations
@@ -5299,7 +5330,10 @@ This is hosted compiled-root evidence, not target or whole-image admission."
                                    (format nil "A named compiled call ~S has no admitted function binding." reference)))
                             (walk (fdefinition reference)))))))))
          (walk (object)
-           (unless (gethash object seen)
+           ;; Terminal values have no executable edges. Do not retain a hash
+           ;; entry for every distinct boxed scalar in a general native array.
+           (unless (or (numberp object) (characterp object) (stringp object) (pathnamep object)
+                       (gethash object seen))
              (setf (gethash object seen) t)
              (cond
                ((symbolp object)
@@ -5310,7 +5344,6 @@ This is hosted compiled-root evidence, not target or whole-image admission."
                 ;; source classes are not executable references from a name.
                 (let ((cell (assoc object special-values :test #'eq)))
                   (when (and cell (second cell)) (walk (third cell)))))
-               ((or (numberp object) (characterp object) (stringp object) (pathnamep object)) nil)
                ((consp object) (walk (car object)) (walk (cdr object)))
                ((functionp object) (walk-function object))
                ((sb-kernel:fdefn-p object)
@@ -5365,8 +5398,9 @@ This is hosted compiled-root evidence, not target or whole-image admission."
                 (walk (snowgrave::closed-record-bound object)))
                ((arrayp object)
                 (let ((parent (array-displacement object))) (when parent (walk parent)))
-                ;; NIL storage has geometry but no element values to inspect.
-                (unless (null (array-element-type object))
+                ;; Physical scalar storage cannot retain executable roots.
+                ;; Still follow its backing allocation before this leaf check.
+                (unless (snowgrave::native-scalar-array-storage-p object)
                   (dotimes (i (array-total-size object)) (walk (row-major-aref object i)))))
                ((packagep object)
                 (when (eq object (build-open-package build))
@@ -5580,6 +5614,7 @@ implemented here. A nominal native class is never an imported graph proof."
                   (getf description :default-initargs)))
     (remf result :slot-initforms)
     (remf result :default-initargs)
+    (remf result :construction-protocol)
     result))
 
 (defun close-source (source declaration)
@@ -5592,6 +5627,7 @@ implemented here. A nominal native class is never an imported graph proof."
   (let* ((*argument-domains* nil) (*cell-domains* nil) (*function-bindings* nil)
          (*generated-class-operation* nil) (*current-method* nil)
          (*effective-return-proof* nil) (*fixed-effective-arguments* nil)
+         (*active-construction-classes* nil)
          (*collect-function-flow* nil) (*function-flow-changed* nil) (*settled-method-roots* nil)
          (*immediate-callee-value* nil) (*value-domain-local-functions* nil)
          (*local-function-frames* nil) (*local-function-scope-cache* nil)

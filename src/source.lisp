@@ -23,6 +23,8 @@
 
 (defun immutable-copy (value &optional copy-observer)
   "Own mutable cons/array data, preserving sharing, cycles and array geometry."
+  (unless (or (consp value) (arrayp value))
+    (return-from immutable-copy value))
   (let ((copies (make-hash-table :test #'eq)) (displacements (make-hash-table :test #'eq)))
     (labels ((copy-array (array)
                (or (gethash array copies)

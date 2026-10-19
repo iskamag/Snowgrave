@@ -18,6 +18,16 @@
                      (t nil))))
       (walk value))))
 
+(defun native-scalar-array-storage-p (array)
+  "Actual specialized numeric/character storage cannot hold composite edges."
+  (let ((type (array-element-type array)))
+    (or (not (null (member type '(nil bit number integer rational ratio real complex float
+                                 short-float single-float double-float long-float fixnum bignum
+                                 character base-char standard-char))))
+        (and (consp type)
+             (not (null (member (car type) '(integer rational real float short-float single-float
+                                            double-float long-float signed-byte unsigned-byte mod complex))))))))
+
 (defun native-binding-error (identity feature detail)
   (reject 'unsupported-definition :installation feature detail :path (list identity)))
 
@@ -25,16 +35,16 @@
   (unless (and (binding-key-p identity) (source-finite-list-p bindings))
     (native-binding-error identity :native-binding-context
                           "A resource context needs a stable unit key and finite binding list."))
-  (let ((owned nil))
+  (let ((owned (make-hash-table :test #'equal)))
     (dolist (binding bindings)
       (unless (and (source-finite-list-p binding) (= (length binding) 2)
                    (binding-key-p (first binding)) (arrayp (second binding))
-                   (not (assoc (first binding) owned :test #'equal)))
+                   (not (nth-value 1 (gethash (first binding) owned))))
         (native-binding-error identity :native-binding-context
                               "Each native resource needs one unique stable key and an actual array."))
-      (push (list (immutable-copy (first binding)) (second binding)) owned))
+      (setf (gethash (immutable-copy (first binding)) owned) (second binding)))
     (let ((*native-binding-contexts*
-            (acons (immutable-copy identity) (nreverse owned) *native-binding-contexts*)))
+            (acons (immutable-copy identity) owned *native-binding-contexts*)))
       (funcall function))))
 
 (defmacro with-native-bindings ((identity bindings) &body body)
@@ -46,31 +56,30 @@ the resources alive after this scope; ending the scope releases no authority."
 (defun native-binding-path (identity path bindings)
   (unless (and (source-finite-list-p path) (eq (first path) :resource) (cdr path))
     (native-binding-error identity :native-binding-path "A native path starts at a named resource."))
-  (let ((binding (assoc (second path) bindings :test #'equal)))
-    (unless binding
+  (multiple-value-bind (value presentp) (gethash (second path) bindings)
+    (unless presentp
       (native-binding-error identity :native-binding-missing "A required native resource has no binding."))
-    (let ((value (second binding)))
-      (dolist (step (cddr path) value)
-        (unless (and (source-finite-list-p step) step)
-          (native-binding-error identity :native-binding-path "A native path has an invalid step."))
-        (setf value
-              (case (first step)
-                (:element
-                 (unless (and (= (length step) 2) (arrayp value) (array-element-type value)
-                              (integerp (second step)) (<= 0 (second step))
-                              (< (second step) (array-total-size value)))
-                   (native-binding-error identity :native-binding-path "A native element path is out of bounds."))
-                 (row-major-aref value (second step)))
-                ((:car :cdr)
-                 (unless (and (= (length step) 1) (consp value))
-                   (native-binding-error identity :native-binding-path "A native list path needs a cons."))
-                 (if (eq (first step) :car) (car value) (cdr value)))
-                (:backing
-                 (unless (and (= (length step) 1) (arrayp value) (array-displacement value))
-                   (native-binding-error identity :native-binding-path "A native backing path needs a displaced array."))
-                 (array-displacement value))
-                (otherwise
-                 (native-binding-error identity :native-binding-path "An unsupported native path step was supplied."))))))))
+    (dolist (step (cddr path) value)
+      (unless (and (source-finite-list-p step) step)
+        (native-binding-error identity :native-binding-path "A native path has an invalid step."))
+      (setf value
+            (case (first step)
+              (:element
+               (unless (and (= (length step) 2) (arrayp value) (array-element-type value)
+                            (integerp (second step)) (<= 0 (second step))
+                            (< (second step) (array-total-size value)))
+                 (native-binding-error identity :native-binding-path "A native element path is out of bounds."))
+               (row-major-aref value (second step)))
+              ((:car :cdr)
+               (unless (and (= (length step) 1) (consp value))
+                 (native-binding-error identity :native-binding-path "A native list path needs a cons."))
+               (if (eq (first step) :car) (car value) (cdr value)))
+              (:backing
+               (unless (and (= (length step) 1) (arrayp value) (array-displacement value))
+                 (native-binding-error identity :native-binding-path "A native backing path needs a displaced array."))
+               (array-displacement value))
+              (otherwise
+               (native-binding-error identity :native-binding-path "An unsupported native path step was supplied.")))))))
 
 (defun %resolve-native-bindings (identity manifest)
   "Resolve the complete cold manifest before any configuration is callable."
@@ -78,8 +87,8 @@ the resources alive after this scope; ending the scope releases no authority."
          (bindings (cdr context)) (resources (getf manifest :resources))
          (nodes (getf manifest :nodes))
          (by-id (make-hash-table :test #'eql)) (by-value (make-hash-table :test #'eq)))
-    (unless (and context (= (length bindings) (length resources))
-                 (every (lambda (resource) (assoc (getf resource :key) bindings :test #'equal)) resources))
+    (unless (and context (= (hash-table-count bindings) (length resources))
+                 (every (lambda (resource) (nth-value 1 (gethash (getf resource :key) bindings))) resources))
       (native-binding-error identity :native-binding-missing
                             "The native binding context must match the complete resource manifest."))
     (dolist (node nodes)
@@ -104,7 +113,7 @@ the resources alive after this scope; ending the scope releases no authority."
         (setf (gethash id by-id) value (gethash value by-value) id)))
     (dolist (node nodes)
       (let ((value (gethash (getf node :id) by-id))
-            (links (make-hash-table :test #'eql)))
+            (links (when (getf node :links) (make-hash-table :test #'eql))))
         ;; Index once: a dense native vector must not scan all links for each
         ;; physical cell. This table exists only during cold installation.
         (dolist (link (getf node :links))
@@ -119,7 +128,7 @@ the resources alive after this scope; ending the scope releases no authority."
                                     "A native link needs one valid edge and admitted target."))
             (setf (gethash step links) (second link))))
         (flet ((check-edge (step element)
-                 (multiple-value-bind (target linkedp) (gethash step links)
+                 (multiple-value-bind (target linkedp) (when links (gethash step links))
                    (unless (if linkedp
                                (eq element (gethash target by-id))
                                (or (numberp element) (characterp element)
@@ -137,12 +146,16 @@ the resources alive after this scope; ending the scope releases no authority."
                                   (null backing))
                               (= offset (getf node :offset 0)))
                    (native-binding-error identity :native-binding-alias "A native displacement relation changed.")))
-               (unless (or backing (null (array-element-type value)))
+               (when (and (native-scalar-array-storage-p value) (getf node :links))
+                 (native-binding-error identity :native-binding-manifest
+                                       "Specialized scalar storage cannot have composite data links."))
+               (unless (or backing (null (array-element-type value))
+                           (native-scalar-array-storage-p value))
                  (dotimes (index (array-total-size value))
                    (check-edge index (row-major-aref value index))))))))))
     (map 'vector
          (lambda (resource)
-           (let ((value (second (assoc (getf resource :key) bindings :test #'equal))))
+           (let ((value (gethash (getf resource :key) bindings)))
              (unless (and (nth-value 1 (gethash (getf resource :node) by-id))
                           (eq value (gethash (getf resource :node) by-id)))
                (native-binding-error identity :native-binding-alias "A native root no longer names its admitted node."))
