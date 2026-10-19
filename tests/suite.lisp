@@ -4327,6 +4327,7 @@
     (layout-matching-tests)
     (sequence-fill-tests)
     (sequence-coerce-tests)
+    (sequence-shape-tests)
     (native-aggregate-result-tests)
     (immediate-callee-tests)
     (selected-method-root-tests)

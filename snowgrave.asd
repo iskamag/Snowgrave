@@ -42,6 +42,7 @@
                (:file "tests/layout-matching")
                (:file "tests/sequence-fill")
                (:file "tests/sequence-coerce")
+               (:file "tests/sequence-shape")
                (:file "tests/native-aggregate-results")
                (:file "tests/immediate-callees")
                (:file "tests/selected-method-roots")

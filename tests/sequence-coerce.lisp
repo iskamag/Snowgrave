@@ -156,7 +156,9 @@
                  (dotimes (index depth)
                    (setf form `(multiple-value-call #'coerce (values ,form 'vector))))
                  (setf visits 0)
-                 (check (eq origin (snowgrave.sbcl::value-domain build form)))
+                 (check (equal (if (eq origin :external-result)
+                                   '(:shaped vector :external-result) origin)
+                               (snowgrave.sbcl::value-domain build form)))
                  (check (<= visits (+ (* 5 depth) 5)))))))
       (setf (fdefinition 'snowgrave.sbcl::raw-value-domain) raw))))
 

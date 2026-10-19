@@ -520,7 +520,10 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
                              ;; Compiler-selected, bounds-checked AREF for a
                              ;; general vector (including adjustable/string).
                              sb-kernel:vector-hairy-data-vector-ref/check-bounds
-                             sb-impl::vector-reverse
+                             ;; SEQTRAN's REVERSE rewrite-full-call selects
+                             ;; these ordinary LIST/VECTOR implementations.
+                             ;; LIST-REVERSE is the ENDP/POP/PUSH cons loop.
+                             sb-impl::list-reverse sb-impl::vector-reverse
                              sb-impl::append2 sb-c::check-ds-list/&rest))
         when (fboundp name) collect (cons name (fdefinition name))))
 
@@ -598,9 +601,30 @@ No arbitrary type alias, pointer array, or foreign class is an owner ABI."
          (progn (typep nil domain) t)))
    (error () nil)))
 
+(defun shaped-domain-p (domain)
+  ;; An internal product in the existing flow lattice, never a public CL type.
+  (and (consp domain) (eq (car domain) :shaped)
+       (snowgrave::source-finite-list-p domain) (= (length domain) 3)
+       (eq (third domain) :external-result)))
+
 (defun external-result-domain-p (domain)
-  (or (eq domain :external-result)
+  (or (eq domain :external-result) (shaped-domain-p domain)
       (and (consp domain) (eq (car domain) 'or) (some #'external-result-domain-p (cdr domain)))))
+
+(defun qualify-domain-origin (shape origin)
+  ;; A shape establishes geometry, not an aggregate's element representation.
+  (if (external-result-domain-p origin)
+      (if (eq shape :unknown) :external-result (list :shaped shape :external-result))
+      shape))
+
+(defun value-domain-shape (build domain)
+  (cond ((shaped-domain-p domain) (second domain))
+        ((or (eq domain :external-result) (external-value-domain-p build domain)) :unknown)
+        ((and (consp domain) (eq (car domain) 'or))
+         (reduce (lambda (left right) (merge-value-domains build left right))
+                 (mapcar (lambda (part) (value-domain-shape build part)) (cdr domain))
+                 :initial-value :pending))
+        (t domain)))
 
 (defun external-value-domain-p (build domain)
   "An unchanged value established by an actual installed-owner predicate.
@@ -629,15 +653,16 @@ The stable key names its owner obligation, never a class or slot type."
         (t domain)))
 
 (defun native-data-domain-p (build domain)
-  (or (external-value-domain-p build domain)
-      (and (consp domain) (eq (car domain) 'or)
-           (every (lambda (part) (native-data-domain-p build part)) (cdr domain)))
-      (and (consp domain) (eq (car domain) 'eql)
-           (or (numberp (cadr domain)) (symbolp (cadr domain)) (characterp (cadr domain))))
-      (native-value-type-p domain)
-      (and (not (eq domain :unknown))
-           (or (subtype-domain-p build domain 'number) (subtype-domain-p build domain 'symbol)
-               (subtype-domain-p build domain 'string) (subtype-domain-p build domain 'character)))))
+  (and (not (external-result-domain-p domain))
+       (or (external-value-domain-p build domain)
+           (and (consp domain) (eq (car domain) 'or)
+                (every (lambda (part) (native-data-domain-p build part)) (cdr domain)))
+           (and (consp domain) (eq (car domain) 'eql)
+                (or (numberp (cadr domain)) (symbolp (cadr domain)) (characterp (cadr domain))))
+           (native-value-type-p domain)
+           (and (not (eq domain :unknown))
+                (or (subtype-domain-p build domain 'number) (subtype-domain-p build domain 'symbol)
+                    (subtype-domain-p build domain 'string) (subtype-domain-p build domain 'character))))))
 
 (defun native-data-form-p (build form)
   (cond ((and (consp form) (eq (car form) 'quote)) (serializable-tree-p (cadr form)))
@@ -969,20 +994,22 @@ The stable key names its owner obligation, never a class or slot type."
   ;; records. It does not classify an opaque external aggregate's contents.
   (let ((input (value-domain build (first arguments))))
     (multiple-value-bind (target constantp) (quoted-value (second arguments))
-      (values (cond ((external-result-domain-p input) :external-result)
-                    ((and constantp (coerce-sequence-target-p target)) target)
-                    (t :unknown)) t))))
+      (values (qualify-domain-origin
+               (if (and constantp (coerce-sequence-target-p target)) target :unknown) input)
+              t))))
 
 (defun native-sequence-result-domain (build input)
   ;; Sequence shape says nothing about element representation. Filtering may
   ;; turn a CONS into NIL; retain only the sequence family, and opaque origin.
   (let ((domain (value-domain build input)))
-    (cond ((external-result-domain-p domain) :external-result)
-          ((eq domain :pending) :pending)
-          ((subtype-domain-p build domain 'list) 'list)
-          ((subtype-domain-p build domain 'string) 'string)
-          ((subtype-domain-p build domain 'vector) 'vector)
-          (t :unknown))))
+    (if (eq domain :pending) :pending
+        (qualify-domain-origin
+         (cond ((subtype-domain-p build domain 'list) 'list)
+               ((subtype-domain-p build domain 'string) 'string)
+               ((subtype-domain-p build domain 'vector) 'vector)
+               ((subtype-domain-p build domain '(or list vector)) '(or list vector))
+               (t :unknown))
+         domain))))
 
 (defun ordinary-call-argument-plan (build form &key required-count)
   "Use the existing ordered producer owner for every MVC tuple."
@@ -1006,35 +1033,55 @@ The stable key names its owner obligation, never a class or slot type."
        (declare (ignore bindings))
        (values arguments domains completep)))))
 
-(defun asserted-sequence-expression (build source expression)
-  ;; Export the already proved native shape to the host compiler. Without it
-  ;; COERCE/LENGTH may leave an unreachable extended-sequence/MOP branch in code.
-  (let ((domain (value-domain build source)))
-    `(the ,(cond ((subtype-domain-p build domain 'list) 'list)
-                 ((subtype-domain-p build domain 'vector) 'vector)
-                 (t '(or list vector))) ,expression)))
+(defun native-sequence-argument-position (name)
+  (case name ((coerce length fill reverse) 0) ((remove delete) 1)))
 
-(defun native-sequence-indirect-arguments (build form transformed)
-  "Annotate only the actual first argument; retain call/value producer order."
+(defun asserted-sequence-expression (build source expression)
+  ;; Export only already proved LIST/VECTOR geometry to the host compiler.
+  ;; COERCE/LENGTH/FILL audit it as an admission requirement; sequence-family
+  ;; operations may use it when available without assuming an unproved shape.
+  (let* ((domain (value-domain build source))
+         (shape (cond ((subtype-domain-p build domain 'list) 'list)
+                      ((subtype-domain-p build domain 'vector) 'vector)
+                      ((subtype-domain-p build domain '(or list vector)) '(or list vector)))))
+    (if shape `(the ,shape ,expression) expression)))
+
+(defun asserted-sequence-arguments (build sources arguments position)
+  ;; APPLY retains a final tail form even when its flattened source tuple has
+  ;; no additional values. Never truncate the emitted invocation to that tuple.
+  (loop for argument in arguments for index from 0
+        collect (if (and (= index position) (< position (length sources)))
+                    (asserted-sequence-expression build (nth position sources) argument) argument)))
+
+(defun native-sequence-indirect-arguments (build form transformed position)
+  "Annotate the actual receiver once, preserving call/value producer order."
   (multiple-value-bind (arguments domains completep) (ordinary-call-argument-plan build form)
-    (if (not completep) transformed
-        (let ((source (first arguments)) (*argument-domains* (append domains *argument-domains*)))
+    (if (or (not completep) (>= position (length arguments))) transformed
+        (let ((source (nth position arguments)) (*argument-domains* (append domains *argument-domains*)))
           (case (car form)
-            (funcall (cons (asserted-sequence-expression build source (first transformed)) (cdr transformed)))
+            (funcall (asserted-sequence-arguments build arguments transformed position))
             (apply
-             (cond ((cdr transformed)
-                    (cons (asserted-sequence-expression build source (first transformed)) (cdr transformed)))
-                   ((eq (car (car (last (cddr form)))) 'list)
-                    (let ((tail (first transformed)))
-                      (list (list* 'list (asserted-sequence-expression build source (second tail)) (cddr tail)))))
-                   (t transformed)))
+             (let ((prefix (1- (length transformed))))
+               (if (< position prefix)
+                   (asserted-sequence-arguments build arguments transformed position)
+                   (let ((tail (car (last transformed))))
+                     (if (and (consp tail) (eq (car tail) 'list))
+                         (append (butlast transformed)
+                                 (list (cons 'list (asserted-sequence-arguments
+                                                    build (nthcdr prefix arguments) (cdr tail) (- position prefix)))))
+                         transformed)))))
             (multiple-value-call
-             (let ((firstp t))
+             (let ((offset 0))
                (mapcar (lambda (producer)
-                         (if (and firstp (cdr producer))
-                             (progn (setf firstp nil)
-                                    (list* 'values (asserted-sequence-expression build source (second producer))
-                                           (cddr producer))) producer)) transformed)))
+                         (let* ((count (length (cdr producer)))
+                                (annotated
+                                  (if (<= offset position (+ offset count -1))
+                                      (cons 'values
+                                            (loop for argument in (cdr producer) for index from offset
+                                                  collect (if (= index position)
+                                                              (asserted-sequence-expression build source argument) argument)))
+                                      producer)))
+                           (incf offset count) annotated)) transformed)))
             (otherwise transformed))))))
 
 (defun ordinary-scalar-result-domain (build name &optional global-targets)
@@ -1565,9 +1612,14 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
   ;; Opacity is an origin envelope joined with UNKNOWN, not a native class.
   ;; A may-opaque profile covers clean inputs too; UNKNOWN cannot cover an
   ;; actual import origin which its body proof would otherwise reinterpret.
-  (or (equal actual expected) (external-result-domain-p expected)
-      (and (not (external-result-domain-p actual))
-           (or (eq expected :unknown) (subtype-domain-p build actual expected)))))
+  (or (equal actual expected)
+      (if (external-result-domain-p expected)
+          ;; A may-opaque envelope covers clean callers too, but a shaped
+          ;; envelope still requires geometry from every caller.
+          (or (eq (value-domain-shape build expected) :unknown)
+              (subtype-domain-p build actual (value-domain-shape build expected)))
+          (and (not (external-result-domain-p actual))
+               (or (eq expected :unknown) (subtype-domain-p build actual expected))))))
 
 (defun record-local-function-inputs (build binding domains)
   (let* ((frame (local-function-binding-frame binding))
@@ -1831,9 +1883,16 @@ This proves a branch, not a field declaration or arbitrary external alias ABI."
           (symbolp (second test)) (assoc (second test) *argument-domains*)
           (not (special-variable-p build (second test))))
      (multiple-value-bind (class quotedp) (quoted-value (third test))
-       (if (and quotedp (or (member-name class (build-classes build)) (native-value-type-p class)))
-           (let ((previous (binding-value-domain (second test))))
-             (acons (second test) (if (subtype-domain-p build previous class) previous class) *argument-domains*))
+       (if (and quotedp (or (member-name class (build-classes build))
+                           (native-value-type-p class) (member class '(list vector))))
+           (let* ((previous (binding-value-domain (second test)))
+                  (refined
+                    (cond ((and (member class '(list vector))
+                                (external-value-observation-p build previous)) previous)
+                          ((subtype-domain-p build previous class) previous)
+                          ((member class '(list vector)) (qualify-domain-origin class previous))
+                          (t class))))
+             (acons (second test) refined *argument-domains*))
            *argument-domains*)))
     (t *argument-domains*)))
 
@@ -2253,7 +2312,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ((and (consp form) (eq (car form) 'tagbody)) '(eql nil))
         ((and (consp form) (eq (car form) 'the))
          (let ((input (value-domain build (third form))))
-           (values (cond ((external-result-domain-p input) :external-result)
+           (values (cond ((external-result-domain-p input) input)
                          ((member (second form) '(list cons)) (second form))
                          (t input)) t)))
         ((and (consp form) (eq (car form) 'if))
@@ -2373,7 +2432,9 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         (t :unknown)))
 
 (defun subtype-domain-p (build actual expected)
-  (cond ((eq expected t) t)
+  (cond ((shaped-domain-p actual) (subtype-domain-p build (second actual) expected))
+        ((shaped-domain-p expected) (subtype-domain-p build actual (second expected)))
+        ((eq expected t) t)
         ((member actual '(:unknown :pending :external-result)) nil)
         ((and (consp actual) (eq (car actual) 'or))
          (every (lambda (alternative) (subtype-domain-p build alternative expected)) (cdr actual)))
@@ -2431,7 +2492,11 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ;; UNKNOWN must not erase the fact that a possible return came from
         ;; an opaque native boundary. Otherwise a join can authorize a closed
         ;; class observation of the actual original CLOS object.
-        ((or (external-result-domain-p previous) (external-result-domain-p additional)) :external-result)
+        ((or (external-result-domain-p previous) (external-result-domain-p additional))
+         (qualify-domain-origin
+          (merge-value-domains build (value-domain-shape build previous)
+                                    (value-domain-shape build additional))
+          :external-result))
         ((or (eq previous :unknown) (eq additional :unknown)) :unknown)
         (t
          (let ((alternatives (remove-duplicates (append (domain-alternatives previous)
@@ -3046,29 +3111,25 @@ reflection, lexical rebinding and class values still require their own ABI."
              ;; same-named FLET. Local-name membership cannot waive its tuple.
              (when (and value-count-complete-p (indirect-argument-audit-p build name local global-targets))
                (when (eq (car form) 'apply)
-                 (let ((last (car (last arguments)))
-                       (prefix (butlast arguments))
-                       (required (if (ordinary-function-form build name)
+                 (let ((required (if (ordinary-function-form build name)
                                      (length (ordinary-lambda-list build (caddr (ordinary-function-form build name))))
                                      (if (or (member name '(eq eql equal equalp))
                                              (member name *representation-sensitive-ordinary-operations*)
                                              (member-name name (getf (build-declaration build) :external-operations)))
                                          (length (ordinary-lambda-list build (sb-introspect:function-lambda-list (fdefinition name))))
                                          (length (generic-domain-roots build name))))))
-                   (cond ((and (consp last) (eq (car last) 'list))
-                          (setf arguments (append (butlast arguments) (cdr last))))
-                         ((and (consp last) (eq (car last) 'quote) (listp (cadr last)))
-                          (setf arguments (append (butlast arguments)
-                                                  (mapcar (lambda (x) (list 'quote x)) (cadr last)))))
-                         ((>= (length prefix) required)
-                          (when (and (initialization-generic-p name) (not *generated-class-operation*))
-                            (fail build 'snowgrave:unclosed-class-operation :initialization-apply-tail
-                                  "A variable initialization APPLY tail needs a proven keyword/error shape." :reachability))
-                          (setf arguments prefix
-                                variable-tail (if (external-result-domain-p (value-domain build last))
-                                                  :external-result t)))
-                         (t (fail build 'snowgrave:incomplete-domain :apply-arguments
-                                  "A variable APPLY tail cannot prove that every execution supplies the required tuple." :reachability)))))
+                   ;; The same tuple owner used by flow and receiver emission
+                   ;; distinguishes actual NIL/(LIST) tails from unknown tails.
+                   (multiple-value-bind (tuple bindings completep tail-domain)
+                       (ordinary-call-argument-plan build form :required-count required)
+                     (declare (ignore bindings))
+                     (unless completep
+                       (fail build 'snowgrave:incomplete-domain :apply-arguments
+                             "A variable APPLY tail cannot prove that every execution supplies the required tuple." :reachability))
+                     (when (and tail-domain (initialization-generic-p name) (not *generated-class-operation*))
+                       (fail build 'snowgrave:unclosed-class-operation :initialization-apply-tail
+                             "A variable initialization APPLY tail needs a proven keyword/error shape." :reachability))
+                     (setf arguments tuple variable-tail tail-domain))))
                (when (eq (car form) 'multiple-value-call)
                  (setf arguments
                        (if value-bindings value-arguments
@@ -3083,9 +3144,9 @@ reflection, lexical rebinding and class values still require their own ABI."
                (when (eq name 'equalp)
                  (setf equality-realization
                        (record-equality-realization build arguments :variable-tail variable-tail))))))))
-         (let ((native-sequence-p
-                 (and (not open) (not *collect-function-flow*)
-                      (and (= (length targets) 1) (member (first targets) '(coerce length)))))
+         (let ((native-sequence-position
+                 (and (not open) (not *collect-function-flow*) (= (length targets) 1)
+                      (native-sequence-argument-position (first targets))))
                (callee (let ((*immediate-callee-value* (second form))
                              (*immediate-lambda-domains*
                                (let ((lambda (immediate-lambda-form build form)))
@@ -3102,9 +3163,11 @@ reflection, lexical rebinding and class values still require their own ABI."
                          (invocation
                            `(funcall ,(if (eq equality-realization :identity)
                                           `(if (eq ,binding #'equalp) #'eq ,binding) binding)
-                                     ,@(cond (native-sequence-p
-                                              (cons (asserted-sequence-expression build (first value-arguments) (first arguments))
-                                                    (cdr arguments)))
+                                     ,@(cond (native-sequence-position
+                                              (asserted-sequence-arguments
+                                               build value-arguments
+                                               (if mapping-plans (equality-arguments arguments mapping-plans binding) arguments)
+                                               native-sequence-position))
                                              (mapping-plans (equality-arguments arguments mapping-plans binding))
                                              (t arguments)))))
                     `(let ((,binding ,callee))
@@ -3119,11 +3182,16 @@ reflection, lexical rebinding and class values still require their own ABI."
                  `(let ((,binding ,callee))
                     (,(car form) ,(if (eq equality-realization :identity)
                                       `(if (eq ,binding #'equalp) #'eq ,binding) binding)
-                     ,@(if mapping-plans (call-equality-arguments form binding mapping-plans)
-                           (body (cddr form)))))))
+                     ,@(let ((arguments (if mapping-plans (call-equality-arguments form binding mapping-plans)
+                                            (body (cddr form)))))
+                         (if native-sequence-position
+                             (native-sequence-indirect-arguments build form arguments native-sequence-position)
+                             arguments))))))
                  (t (let ((expression `(,(car form) ,callee
                                            ,@(let ((arguments (body (cddr form))))
-                                               (if native-sequence-p (native-sequence-indirect-arguments build form arguments) arguments)))))
+                                               (if native-sequence-position
+                                                   (native-sequence-indirect-arguments build form arguments native-sequence-position)
+                                                   arguments)))))
                       (if (and (not open) (= (length targets) 1))
                           (declared-external-result-expression build (first targets) expression) expression)))))))))
       ((member (car form) '(setq setf incf decf push pushnew pop))
@@ -3206,7 +3274,7 @@ reflection, lexical rebinding and class values still require their own ABI."
            (fail build 'snowgrave:unclosed-call :external-value-class-observation
                  "An unchanged imported value has no cohort class/layout interpretation merely from its owner key." :reachability))
          (unless (or (member-name type (build-classes build)) (native-value-type-p type)
-                     (and (symbolp type) (or (member type '(t function compiled-function))
+                     (and (symbolp type) (or (member type '(t function compiled-function list))
                                             (typep (find-class type nil) 'built-in-class))))
            (fail build 'snowgrave:unclosed-class-operation :type-observation
                  "Compound types and noncohort CLOS/structure classes need an exact record type lowering."))
@@ -3260,9 +3328,15 @@ reflection, lexical rebinding and class values still require their own ABI."
                  (standard-operation-meaning-p build 'coerce local))
             `(coerce ,(asserted-sequence-expression build (second form) (walk (second form)))
                      ,(walk (third form))))
-           ((and (eq (car form) 'length) (not open) (not *collect-function-flow*)
-                 (standard-operation-meaning-p build 'length local))
-            `(length ,(asserted-sequence-expression build (second form) (walk (second form)))))
+           ((and (native-sequence-argument-position (car form)) (not open) (not *collect-function-flow*)
+                 (standard-operation-meaning-p build (car form) local))
+            `(,(car form) ,@(asserted-sequence-arguments
+                            build (cdr form)
+                            (if mapping-realization
+                                (equality-arguments (cdr form)
+                                                    (mapcar (lambda (position) (list position (car form))) mapping-realization))
+                                (body (cdr form)))
+                            (native-sequence-argument-position (car form)))))
            (mapping-realization
              `(,(target (car form))
                 ,@(equality-arguments (cdr form)
