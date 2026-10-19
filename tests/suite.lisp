@@ -4340,6 +4340,7 @@
   (deployment-root-tests)
   (cold-method-combination-tests)
   (open-host-operation-tests)
+  (cold-integer-initializer-tests)
     (entry-graph-tests)
     (native-binding-context-tests)
     (graph-state-inference-tests)

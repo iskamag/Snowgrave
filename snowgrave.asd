@@ -61,6 +61,7 @@
                (:file "tests/deployment-roots")
                (:file "tests/cold-method-combinations")
                (:file "tests/open-host-operations")
+               (:file "tests/cold-integer-initializers")
                (:file "tests/entry-graphs")
                (:file "tests/native-binding-contexts")
                (:file "tests/graph-state-inference")

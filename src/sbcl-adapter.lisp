@@ -116,7 +116,7 @@
   layouts generated constructors method-names reference-domain-name layout-names
   normalized-forms
   (normalized-originals (make-hash-table :test #'eq))
-  (sequence 0) (dependencies nil) (source-key nil)
+  (sequence 0) (dependencies nil) (source-key nil) (integer-constants nil)
   (literal-pools nil)
   (literal-states (make-hash-table :test #'eq))
   function-domains function-returns generic-call-shapes function-flow-evidence
@@ -536,7 +536,7 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
 
 (defparameter *ordinary-operations*
   '(+ - * / 1+ 1- = /= < > <= >= zerop plusp minusp max min abs mod rem floor
-    ceiling truncate round ash integer-length logand logior logxor lognot evenp oddp
+    ceiling truncate round ash logand logior logxor lognot integer-length evenp oddp
     values values-list list list* cons car cdr caar cadr cdar cddr first second
     third fourth rest nth nthcdr endp null not atom consp symbolp numberp
     integerp rationalp floatp realp complexp stringp characterp vectorp arrayp
@@ -550,6 +550,9 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
     condition-name type-error-datum type-error-expected-type
     unbound-slot-instance cell-error-name))
 
+(defparameter *reproducible-global-operations*
+  '(list list* cons vector make-array))
+
 (defparameter *reproducible-integer-operations*
   ;; Each result is an integer when every argument is an integer. The host
   ;; still owns arity, exceptional inputs and secondary values. No floating
@@ -557,9 +560,16 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
   '(+ - * 1+ 1- min max abs mod rem floor ceiling truncate round ash
     logand logior logxor lognot integer-length))
 
-
-(defparameter *reproducible-global-operations*
-  '(list list* cons vector make-array))
+(defparameter *standard-integer-constants*
+  ;; Only actual COMMON-LISP constant bindings enter this host ABI snapshot.
+  ;; An arbitrary ambient DEFCONSTANT/CONSTANTP is not source provenance.
+  (let ((constants nil))
+    (do-external-symbols (name :common-lisp)
+      (when (and (eq (symbol-package name) (find-package :common-lisp))
+                 (eq (sb-int:info :variable :kind name) :constant)
+                 (boundp name) (integerp (symbol-value name)))
+        (push (cons name (symbol-value name)) constants)))
+    constants))
 
 (defparameter *representation-sensitive-ordinary-operations*
   ;; These standard operators observe logical values or invoke callbacks. Their
@@ -4202,16 +4212,9 @@ An unknown name makes that name and the remainder uncertain, never absent."
   (let ((*cold-global-initializer* t))
     (transform-form build form package :open open)))
 
-(defun reproducible-integer-operation-p (build name &optional local)
-  "A stable primitive identity for callers that prove integer arguments."
-  (let ((native (assoc name *native-ordinary-functions*)))
-    (and (member name *reproducible-integer-operations*)
-         (standard-operation-meaning-p build name local)
-         native (fboundp name) (eq (fdefinition name) (cdr native)))))
-
-
 (defun reproducible-global-p (build form &optional fresh-symbols-p)
-  (cond ((atom form) (or (numberp form) (stringp form) (characterp form)
+  (cond ((reproducible-integer-p build form) t)
+        ((atom form) (or (numberp form) (stringp form) (characterp form)
                         (keywordp form) (eq form t) (null form)))
         ((eq (car form) 'quote) (serializable-literal-graph-p (cadr form) (build-literal-states build)))
         ((and fresh-symbols-p (fresh-symbol-initializer-p build form)) t)
@@ -4220,6 +4223,37 @@ An unknown name makes that name and the remainder uncertain, never absent."
         ((member (car form) *reproducible-global-operations*)
          (every (lambda (x) (reproducible-global-p build x fresh-symbols-p)) (cdr form)))
         (t nil)))
+
+(defun reproducible-integer-operation-p (build name &optional local)
+  "A stable primitive identity for callers that prove integer arguments."
+  (let ((native (assoc name *native-ordinary-functions*)))
+    (and (member name *reproducible-integer-operations*)
+         (standard-operation-meaning-p build name local)
+         native (fboundp name) (eq (fdefinition name) (cdr native)))))
+
+(defun reproducible-integer-p (build form)
+  ;; This is a structural result/effect proof, not a constant evaluator.
+  ;; The original expression executes in both compilations and installations.
+  (cond
+    ((integerp form) t)
+    ((symbolp form)
+     (let ((constant (assoc form *standard-integer-constants*)))
+       (when (and constant (not (member form (build-globals build)))
+                  (eq (sb-int:info :variable :kind form) :constant)
+                  (boundp form) (eql (symbol-value form) (cdr constant)))
+         (pushnew (list :name-key (snowgrave::function-name-key form)
+                        :host-value (cdr constant))
+                  (build-integer-constants build) :test #'equal)
+         t)))
+    ((and (consp form) (eq (first form) 'quote))
+     (and (= (length form) 2) (integerp (second form))))
+    ((and (consp form) (reproducible-integer-operation-p build (first form)))
+     (every (lambda (argument) (reproducible-integer-p build argument)) (rest form)))
+    (t nil)))
+
+(defun cold-integer-constant-evidence (build)
+  (sort (copy-tree (build-integer-constants build)) #'string<
+        :key (lambda (constant) (prin1-to-string (getf constant :name-key)))))
 
 (defun staged-special-form (form specials)
   (if (member (cadr form) specials)
@@ -5851,7 +5885,13 @@ This is hosted compiled-root evidence, not target or whole-image admission."
                 (dolist (method (copy-list (sb-mop:generic-function-methods function)))
                   (remove-method function method))))
             (fmakunbound name)))
-        (when (boundp symbol) (makunbound symbol))))
+        (when (boundp symbol)
+          ;; These bindings belong exclusively to the discarded namespace.
+          ;; Retire its compiler constant declaration before clearing its cell;
+          ;; ordinary MAKUNBOUND must otherwise signal constant modification.
+          (when (eq (sb-int:info :variable :kind symbol) :constant)
+            (sb-int:clear-info :variable :kind symbol))
+          (makunbound symbol))))
     (delete-package package)))
 
 (defun validate-external-value-contracts (build)
@@ -6089,6 +6129,7 @@ implemented here. A nominal native class is never an imported graph proof."
                            (build-output-package build)))
                   (metadata (list :abi-version 3 :identity identity :entries entries
                                   :deployment (deployment-evidence build)
+                                  :cold-integer-constants (cold-integer-constant-evidence build)
                                   :configuration (configuration-metadata build)
                                   :source-normalization
                                   '(:method :sbcl-lexical-host-macroexpansion
@@ -6120,6 +6161,7 @@ implemented here. A nominal native class is never an imported graph proof."
                                   :ordinary-function-flow (build-function-flow-evidence build)))
                   (report (list :implementation :snowgrave-sbcl :claim :semantically-closed
                                 :deployment (deployment-evidence build)
+                                :cold-integer-constants (cold-integer-constant-evidence build)
                                 :fragment :standard-method-and-authored-initialization-contracts
                                 :declaration (snowgrave::immutable-copy declaration)
                                 :argument-forwarding :whole-original-argument-list
