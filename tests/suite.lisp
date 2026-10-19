@@ -4218,6 +4218,7 @@
   (let ((*checks* 0))
     (source-owner-tests)
     (method-source-context-tests)
+    (annotation-form-tests)
     (vector-constant-tests)
     (literal-identity-tests)
     (predicate-refinement-tests)

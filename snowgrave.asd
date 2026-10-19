@@ -26,6 +26,7 @@
                (:file "tests/suite")
                (:file "tests/method-call-bindings")
                (:file "tests/macro-normalization")
+               (:file "tests/annotation-forms")
                (:file "tests/authored-combinations")
                (:file "tests/vector-constants")
                (:file "tests/literal-identity")

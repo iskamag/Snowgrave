@@ -208,6 +208,26 @@ all other expansions re-enter the same admission and residual audits."
                 (values (walk `(let ((,cell ,(second form)) (,value ,(third form)))
                                  (setf (,(if (eq (car form) 'rplaca) 'car 'cdr) ,cell) ,value)
                                  ,cell) env) t)))
+             ((eq (car form) 'sb-kernel:the*)
+              ;; SBCL supplies a walker macrofunction even though THE* is a
+              ;; special operator. USE-ANNOTATIONS is PROGN, not a LIST cast.
+              ;; Other profiles can lose secondary values or error context;
+              ;; only the annotation-only, context-free profile is admitted.
+              (destructuring-bind
+                  (operator (type &key context silent-conflict derive-type-only
+                                       truly source-form use-annotations restart) operand) form
+                (declare (ignore operator silent-conflict source-form operand))
+                (when (or (not use-annotations) context derive-type-only truly restart)
+                  (fail build 'snowgrave:unsupported-definition :host-annotation-options
+                        "This THE* option profile has no equivalent admitted walker expansion."))
+                (unless (or (native-value-type-p type) (member type '(t list cons)))
+                  (fail build 'snowgrave:unsupported-definition :host-annotation-type
+                        "THE* needs an admitted native type; arbitrary type expanders are not a normalization contract."))
+                (multiple-value-bind (expansion expandedp) (macroexpand-1 form env)
+                  (unless expandedp
+                    (fail build 'snowgrave:unsupported-definition :host-normalization
+                          "This host does not supply THE*'s walker expansion."))
+                  (values (walk expansion env) t))))
              ((eq (car form) 'sb-ext:truly-the)
               (values `(the ,(second form) ,(walk (third form) env)) t))
              ((and (symbolp (car form)) (not (eq (car form) 'lambda))
