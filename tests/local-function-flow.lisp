@@ -47,6 +47,7 @@
             (check (equal native-events (reverse snowgrave.local-flow.fixture::*events*))))))))
 
 (defun local-function-flow-tests ()
+  (local-flow-immutable-binding-cost-test)
   ;; Direct, literal indirect, and immutable local aliases share one actual
   ;; lexical return owner. Native record returns remain logical records.
   (dolist (call '("(produce)" "(funcall #'produce)" "(let ((saved #'produce)) (funcall saved))"))
@@ -204,6 +205,28 @@
     (check-local-flow (list 'variable-tail-clean-omitted-default kind)
                       (format nil "(let ((tail nil))
                                     (apply #'(lambda (~A (payload 17)) payload) tail))" kind) '(17))))
+
+(defun local-flow-immutable-binding-cost-test ()
+  ;; An unchanged LET binding must not turn nested pure local functions into
+  ;; repeated recursive solves. Count cold work instead of timing the host.
+  (let ((solve (symbol-function 'snowgrave.sbcl::solve-local-function-scope))
+        (calls 0)
+        (body 'snowgrave.local-flow.fixture::held))
+    (dotimes (index 6)
+      (setf body `(flet ((produce () ,body)) (produce))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'snowgrave.sbcl::solve-local-function-scope)
+                 (lambda (&rest arguments) (incf calls) (apply solve arguments)))
+           (let* ((forms `((defclass snowgrave.local-flow.fixture::marker () ())
+                          (defun snowgrave.local-flow.fixture::entry ()
+                            (let ((snowgrave.local-flow.fixture::held 17)) ,body))))
+                  (unit (close-local-flow forms :immutable-binding-cost)))
+             (check (= 17 (funcall (snowgrave:unit-function unit 'snowgrave.local-flow.fixture::entry))))
+             ;; The baseline needs 66 solves. Leave room for ordinary solver
+             ;; changes while rejecting the observed 158843-solve regression.
+             (check (< calls 200))))
+      (setf (symbol-function 'snowgrave.sbcl::solve-local-function-scope) solve))))
 
 (defun local-flow-underarity-tests ()
   ;; Keep lexical binding/error identity even when an underarity call has no

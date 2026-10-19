@@ -1971,7 +1971,15 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
         *value-domain-local-functions*
         (mapcar (lambda (frame) (cons frame (local-function-frame-version frame))) *local-function-frames*)
         *declared-specials* *current-method* *tagbody-targets* *immediate-lambda-domains*
-        (mapcar (lambda (fact) (list (first fact) (second fact) (third fact))) *mutable-invariant-bindings*)))
+        (mapcar (lambda (fact)
+                  (list (first fact) (second fact) (copy-tree (third fact)) (fourth fact) (fifth fact)))
+                *mutable-invariant-bindings*)))
+
+(defun mutable-local-function-context-p ()
+  ;; Initial custody facts never change after binding. A body fixed point
+  ;; can widen its candidate facts in place, so only that context disables
+  ;; lexical memoization; the immutable facts remain part of the cache key.
+  (some (lambda (fact) (not (eq (fifth fact) :initial))) *mutable-invariant-bindings*))
 
 (defun call-with-local-function-scope (build form process &rest options &key open &allow-other-keys)
   ;; A memo belongs only to this lexical solve and its nested scopes. Source
@@ -1984,13 +1992,13 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
          ;; emission or invent output names during that earlier phase.
          (*local-function-scope-cache* (or *local-function-scope-cache* (make-hash-table :test #'eq)))
          (key (local-function-context-key build))
-         (cached (unless (or open *mutable-invariant-bindings*)
+         (cached (unless (or open (mutable-local-function-context-p))
                    (assoc key (gethash form *local-function-scope-cache*) :test #'equal))))
     (if cached
         (call-in-local-function-environment build (second cached) nil (lambda () (funcall process (second cached))))
         (apply #'solve-local-function-scope build form
                (lambda (frame)
-                 (unless (or open *mutable-invariant-bindings*)
+                 (unless (or open (mutable-local-function-context-p))
                    (push (list key frame) (gethash form *local-function-scope-cache*)))
                  (funcall process frame)) :open open options))))
 (defun source-call-return-summary (build name &optional global-targets relations-p)
