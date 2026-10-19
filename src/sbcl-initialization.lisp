@@ -111,8 +111,8 @@
           ((member (relational-base domain) '(:pending :unknown :external-result)) :may)
           ((record-flow-domains-overlap-p build domain (third target)) :may))))
 
-(defun phase-slot-update (build receiver slot status value)
-  (let* ((domain (value-domain build receiver)) (alternatives (domain-alternatives domain))
+(defun phase-slot-update (build receiver slot status value &optional (saved-receiver nil savedp))
+  (let* ((domain (if savedp saved-receiver (value-domain build receiver))) (alternatives (domain-alternatives domain))
          (records (or (initialization-phase-records *initialization-phase*)
                       (when (initialization-phase-key *initialization-phase*)
                         (list (list nil (initialization-phase-key *initialization-phase*)
@@ -144,14 +144,17 @@
            (member-name (first form) (getf (build-declaration build) :closed-generics))
            (some (lambda (part) (initialization-effectful-form-p build part)) (rest form)))))
 
-(defun note-initialization-place-write (build place domain)
+(defun note-initialization-place-write (build place domain &optional (saved-receiver nil savedp))
   ;; Called by the existing SETF owner after one storing form has completed,
   ;; before evaluation of the next pair. The value domain is captured at its
   ;; actual RHS evaluation point, after place subforms and before RHS effects.
   (when *initialization-phase*
     (if (and (consp place) (eq (first place) 'slot-value))
         (multiple-value-bind (slot literalp) (quoted-value (third place))
-          (if literalp (phase-slot-update build (second place) slot t domain)
+          (if literalp
+              (let ((receiver (if savedp saved-receiver (value-domain build (second place)))))
+                (note-graph-field-write build place receiver slot t domain)
+                (phase-slot-update build (second place) slot t domain receiver))
               (forget-initialization-state)))
         (unless (symbolp place) (forget-initialization-state)))))
 
@@ -229,15 +232,16 @@
     ((atom form) (funcall emit))
     ((and (eq (first form) 'call-next-method) (null (rest form)) *initialization-next*)
      (funcall *initialization-next*))
-    ((member (first form) '(return-from error))
+    ((member (first form) '(return-from error throw))
      ;; Source admission still visits trailing forms, but they cannot justify
      ;; the state of an earlier successful nonlocal method exit.
      (let ((code (funcall emit)))
        (setf (initialization-phase-slots *initialization-phase*)
-             (if (and (eq (first form) 'error) (standard-operation-meaning-p build 'error))
+             (if (or (eq (first form) 'throw)
+                     (and (eq (first form) 'error) (standard-operation-meaning-p build 'error)))
                  :no-normal :unknown-control))
        code))
-    ((member (first form) '(handler-case handler-bind catch throw tagbody go cond case ecase))
+    ((member (first form) '(handler-case handler-bind catch tagbody go cond case ecase))
      (forget-initialization-state)
      (let ((*initialization-phase* nil)) (funcall emit)))
     ((member (first form) '(flet labels))
@@ -267,6 +271,8 @@
          (when (and unknown-call-p (not (record-flow-owned-call-p build form)))
          (forget-initialization-state))
          (when unbinding
+           (note-graph-field-write build form (value-domain build (second form))
+                                   (second (third form)) :unbound :unknown)
            (phase-slot-update build (second form) (second (third form)) :unbound :unknown))
          (when (member (first form) '(incf decf push pushnew pop))
            (note-initialization-place-write

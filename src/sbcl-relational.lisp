@@ -77,19 +77,26 @@
            (cons 'or (mapcar (lambda (part) (normalize-record-flow-domain part arguments)) (rest base))))
           (t base))))
 
+(defun record-flow-field-facts (build domain)
+  ;; Capture rows supply keys and schema, not mutable entry values. All value
+  ;; and boundness premises come through the same effective field read owner.
+  (let* ((parts (domain-alternatives (relational-base domain)))
+         (rows (mapcar (lambda (part) (private-record-slot-row build part)) parts)))
+    (when (every #'identity rows)
+      (reduce (lambda (left right) (merge-record-flow-fields build left right))
+              (mapcar (lambda (part row)
+                        (loop for field in (getf row :slots)
+                              collect (multiple-value-bind (status value presentp)
+                                          (record-slot-entry-fact build part (first field))
+                                        (declare (ignore presentp))
+                                        (list (first field) status value)))) parts rows)))))
+
 (defun record-flow-entry-fields (build domain arguments)
   (when (flow-record-domain-p build domain)
-    (let ((rows (mapcar (lambda (part) (private-record-slot-row build part)) (domain-alternatives domain))))
-      (when (every #'identity rows)
-        (reduce (lambda (left right) (merge-record-flow-fields build left right))
-                (mapcar
-                 (lambda (part row)
-                   (loop for field in (getf row :slots)
-                         collect (multiple-value-bind (status value presentp)
-                                     (record-slot-entry-fact build part (first field))
-                                   (declare (ignore presentp))
-                                   (list (first field) status (normalize-record-flow-domain value arguments)))))
-                 (domain-alternatives domain) rows))))))
+    (mapcar (lambda (field)
+              (list (first field) (second field)
+                    (normalize-record-flow-domain (third field) arguments)))
+            (record-flow-field-facts build domain))))
 
 (defun record-flow-domains-overlap-p (build left right)
   ;; Two incomparable superclasses can share a sealed multiple-inheritance
@@ -317,10 +324,8 @@
 
 (defun live-record-flow-fields (build arguments)
   (loop for domain in arguments for index from 0
-        for rows = (mapcar (lambda (part) (getf (private-record-slot-row build part) :slots))
-                          (domain-alternatives domain))
-        when (and rows (every #'identity rows))
-          collect (list index (reduce (lambda (a b) (merge-record-flow-fields build a b)) rows))))
+        for fields = (record-flow-field-facts build domain)
+        when fields collect (list index fields)))
 
 (defun apply-record-flow-effects (build effects arguments before)
   ;; A nonlocal/unsupported control state has no normal row to update.
@@ -505,7 +510,9 @@
 (defun persistent-record-flow-domain (domain)
   (cond ((initializing-record-domain-p domain)
          (let ((record (find (second domain) *flow-record-origins* :key #'second :test #'eq)))
-           (if (and record (or (graph-node-domain-p (fourth record)) (owned-record-domain-p (fourth record))))
+           (if (and record
+                    (every (lambda (part) (or (graph-node-domain-p part) (owned-record-domain-p part)))
+                           (domain-alternatives (fourth record))))
                (fourth record) (third domain))))
         ((relational-value-domain-p domain) (persistent-record-flow-domain (third domain)))
         ((and (consp domain) (eq (first domain) 'or))

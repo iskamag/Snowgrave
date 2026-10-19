@@ -4356,6 +4356,7 @@
     (parser-input-tests)
     (initialization-phase-tests)
     (relational-state-tests)
+    (configured-edge-envelope-tests)
     (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)

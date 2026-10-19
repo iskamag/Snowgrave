@@ -126,6 +126,8 @@
   (graph-index (make-hash-table :test #'eq))
   graph-nodes graph-imports graph-root-names graph-root-references graph-resource-name
   graph-state-invalidations
+  (graph-field-envelopes (make-hash-table :test #'equal))
+  (graph-field-writes (make-hash-table :test #'eq))
   (source-origins (make-hash-table :test #'eq))
   (source-array-copies (make-hash-table :test #'eq))
   (graph-literal-states (make-hash-table :test #'eq)))
@@ -3785,6 +3787,9 @@ reflection, lexical rebinding and class values still require their own ABI."
                                  (unless open (audit-missing-slot-writer build place value))
                                  (unless open (audit-place-writer build place value local))
                                  (let* ((location (transform-place build place package open local))
+                                        (receiver (when (and *initialization-phase* (consp place)
+                                                             (eq (first place) 'slot-value))
+                                                    (value-domain build (second place))))
                                         (checked (when (and (not open) *initialization-phase*)
                                                    (audit-external-place-value build place value)))
                                         (value-code (walk value))
@@ -3792,7 +3797,9 @@ reflection, lexical rebinding and class values still require their own ABI."
                                    (declare (ignore checked))
                                    (when (and *initialization-phase* (not open))
                                      (audit-external-place-value build place value))
-                                   (note-initialization-place-write build place domain)
+                                   (if (and (consp place) (eq (first place) 'slot-value))
+                                       (note-initialization-place-write build place domain receiver)
+                                       (note-initialization-place-write build place domain))
                                    (list location value-code))))))
          ((incf decf pop)
           (let* ((place (second form))
@@ -5649,6 +5656,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
            (loop
              (incf iterations)
              (setf *function-flow-changed* nil)
+             (when (graph-state-profile-p build) (begin-graph-field-iteration build))
              (seed-entry-function-domains build)
              ;; Each iteration is an analysis scratch generation. Keep only
              ;; the persistent domain/return facts across the fixed point,
@@ -5716,6 +5724,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
                  ;; argument/return fixed point to retain their dependencies.
                  (setf *settled-method-roots* t *function-flow-changed* t)))
              (settle-construction-domains build)
+             (unless *function-flow-changed* (settle-graph-field-envelopes build))
              (unless *function-flow-changed* (return)))
            (setf (build-function-flow-evidence build)
                  (list :method :finite-argument-binding-fixed-point :iterations iterations

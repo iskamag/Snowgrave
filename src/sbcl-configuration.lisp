@@ -451,7 +451,10 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   (cond ((relational-value-domain-p domain) (private-record-domain-base (third domain)))
         ((initializing-record-domain-p domain) (third domain))
         ((graph-node-domain-p domain) (third domain))
-        ((owned-record-domain-p domain) (second domain)) (t domain)))
+        ((owned-record-domain-p domain) (second domain))
+        ((and (consp domain) (eq (first domain) 'or))
+         (cons 'or (mapcar #'private-record-domain-base (rest domain))))
+        (t domain)))
 
 (defun owned-record-layout (build domain)
   (when (owned-record-domain-p domain)
@@ -546,21 +549,32 @@ The existing literal pool consumes these cold node recipes for shell/fill."
       (graph-private-callable-domain-p build domain)))
 
 (defun prepare-graph-state-proof (build)
-  ;; Conservative complete-source preservation, independent of reachability
-  ;; guesses. A write invalidates captured value facts; an unbind additionally
-  ;; invalidates boundness. Mutable scalar fields are never snapshot constants.
+  ;; Inventory the complete source obligation before caller inference. Finite
+  ;; captured fields may close inductively; unresolved writes retain the old
+  ;; conservative invalidation. Mutable scalars are never snapshot constants.
   (audit-graph-state-entry-profile build)
   ;; Captured native containers may retain private records. Their transitive
   ;; payload proof is consumed at observable operations, not a global ban on
   ;; retaining an otherwise unused container in the private installation.
-  (let ((writes nil) (unbinds nil))
-    (labels ((invalidate (slot-form &optional unbindp)
+  (clrhash (build-graph-field-writes build))
+  (let ((writes nil) (unbinds nil) (forced-writes nil) (forced-unbinds nil))
+    (labels ((invalidate (slot-form &optional unbindp site)
                (multiple-value-bind (slot literalp) (quoted-value slot-form)
-                 (when literalp
-                   (pushnew slot writes)
-                   (when unbindp (pushnew slot unbinds)))))
+                 (if literalp
+                     (progn
+                       (pushnew slot writes)
+                       (when unbindp (pushnew slot unbinds))
+                       (if site (register-graph-field-write build site slot unbindp)
+                           (progn (pushnew slot forced-writes)
+                                  (when unbindp (pushnew slot forced-unbinds)))))
+                     ;; A dynamic name has no finite effective-slot owner.
+                     ;; Final source admission still applies its own refusal.
+                     (dolist (layout (build-layouts build))
+                       (dolist (name (getf layout :slots))
+                         (pushnew name writes) (pushnew name forced-writes)
+                         (when unbindp (pushnew name unbinds) (pushnew name forced-unbinds)))))))
              (place (form)
-               (when (and (consp form) (eq (car form) 'slot-value)) (invalidate (third form))))
+               (when (and (consp form) (eq (car form) 'slot-value)) (invalidate (third form) nil form)))
              (walk (form)
                (when (and (consp form) (not (eq (car form) 'quote)))
                  ;; Source reinitialization, including a saved/indirect
@@ -570,16 +584,17 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                            (and (eq (first form) 'function)
                                 (initialization-generic-p (second form))))
                    (dolist (layout (build-layouts build))
-                     (dolist (slot (getf layout :slots)) (pushnew slot writes))))
+                     (dolist (slot (getf layout :slots)) (pushnew slot writes) (pushnew slot forced-writes))))
                  (case (car form)
                    (setf (loop for tail on (cdr form) by #'cddr do (place (first tail))))
                    ((incf decf pop) (place (second form)))
                    ((push pushnew) (place (third form)))
-                   (slot-makunbound (invalidate (third form) t))
+                   (slot-makunbound (invalidate (third form) t form))
                    ((snowgrave::%record-write snowgrave::%record-unbind)
                     (invalidate (third form) (eq (car form) 'snowgrave::%record-unbind))))
                  (mapc #'walk form))))
       (dolist (form (build-forms build))
+        (with-build-source-key (build (authored-source-key build form))
         ;; A selected generated writer remains a root even without an early
         ;; caller. Its write cannot be omitted from the state obligation.
         (when (eq (defining-kind form) :class)
@@ -589,9 +604,11 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                     when (and (member option '(:writer :accessor))
                               (member-name (if (eq option :accessor) (list 'setf name) name)
                                            (getf (build-declaration build) :closed-generics)))
-                    do (pushnew (first slot) writes)))))
-        (walk form)))
-    (setf (build-graph-state-invalidations build) (list :writes writes :unbinds unbinds))))
+                    do (pushnew (first slot) writes) (pushnew (first slot) forced-writes)))))
+        (walk form))))
+    (setf (build-graph-state-invalidations build)
+          (list :writes writes :unbinds unbinds :forced-writes forced-writes :forced-unbinds forced-unbinds))
+    (initialize-graph-field-envelopes build)))
 
 (defun private-record-slot-row (build domain)
   (when (relational-value-domain-p domain)
@@ -609,20 +626,24 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   ;; entry projection. Origin invalidation is identical for all three.
   (let* ((row (private-record-slot-row build domain))
          (field (assoc slot (getf row :slots)))
-         (currentp (initialization-domain-current-p domain)))
+         (currentp (and (initialization-domain-current-p domain)
+                        (initialization-record-row domain))))
     (when (and (getf row :class) field)
       (let* ((prior (third field))
              (invalidations (build-graph-state-invalidations build))
-             (status (if (and (not currentp) (member slot (getf invalidations :unbinds))) nil (second field)))
-             (value (if (and (not currentp) (member slot (getf invalidations :writes)))
+             (envelope (unless currentp (graph-field-envelope build domain slot)))
+             (status (if envelope (first envelope)
+                         (if (and (not currentp) (member slot (getf invalidations :unbinds))) nil (second field))))
+             (value (if envelope (second envelope)
+                        (if (and (not currentp) (member slot (getf invalidations :writes)))
                         (merge-value-domains build (if (external-value-observation-p build prior)
                                                       :external-result prior) :unknown)
-                        prior)))
+                        prior))))
         (values status value t)))))
 
 (defun graph-record-slot-facts (build receiver slot)
   "Use the same read owner for exact captures and joined fresh-family facts."
-  (let ((alternatives (domain-alternatives receiver)) (value :pending))
+  (let ((alternatives (domain-alternatives (relational-base receiver))) (value :pending))
     (when alternatives
       (dolist (domain alternatives (values t value))
         (multiple-value-bind (status current presentp) (record-slot-entry-fact build domain slot)
