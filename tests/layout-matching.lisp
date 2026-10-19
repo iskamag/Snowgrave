@@ -1,0 +1,75 @@
+(defpackage #:snowgrave.layout-matching.fixture (:use #:cl))
+(in-package #:snowgrave.tests)
+
+(defun layout-matching-tests ()
+  (let* ((identity '(:layout-matching))
+         (row (list :identity (list identity 'a :version 1) :class 'a :ancestors '(a)
+                    :slots '(payload) :slot-types '((unsigned-byte 8)) :error-mapping nil))
+         (family-rows (list row (list :identity (list identity 'b :version 1) :class 'b
+                                     :ancestors '(b) :slots nil :slot-types nil :error-mapping nil)))
+         (family (snowgrave:make-reference-domain identity family-rows))
+         (plain (snowgrave:make-layout (getf row :identity) 'a '(a) '(payload)
+                                      :slot-types '((unsigned-byte 8))))
+         (qualified (snowgrave:make-layout (getf row :identity) 'a '(a) '(payload)
+                                          :slot-types '((unsigned-byte 8)) :reference-domain family))
+         (plain-record (snowgrave:sg-make-record plain))
+         (qualified-record (snowgrave:sg-make-record qualified)))
+    (check (snowgrave:sg-record-matches-layout-p plain-record plain))
+    (check (snowgrave:sg-record-matches-layout-p qualified-record plain))
+    (check (not (snowgrave:sg-record-matches-layout-p plain-record qualified)))
+    (check (snowgrave:sg-record-matches-layout-p qualified-record qualified))
+    (check (not (snowgrave:sg-record-matches-layout-p nil plain)))
+    (let* ((independent (snowgrave:make-reference-domain identity (reverse family-rows)))
+           (compatible (reference-layout-record row independent)))
+      (check (snowgrave:sg-record-matches-layout-p compatible qualified)))
+    (let* ((other-rows (list row (list :identity (list identity 'c :version 1) :class 'c
+                                     :ancestors '(c) :slots nil :slot-types nil :error-mapping nil)))
+           (other-family (snowgrave:make-reference-domain identity other-rows))
+           (record (reference-layout-record row other-family)))
+      (check (snowgrave:sg-record-matches-layout-p record plain))
+      (check (not (snowgrave:sg-record-matches-layout-p record qualified))))
+    (dolist (change '(:identity :ancestors :slots :slot-types :error-mapping))
+      (let ((changed (copy-tree row)))
+        (ecase change
+          (:identity (setf (getf changed :identity) '((:different-unit) a :version 1)))
+          (:ancestors (setf (getf changed :ancestors) '(a b)))
+          (:slots (setf (getf changed :slots) '(different-slot)))
+          (:slot-types (setf (getf changed :slot-types) '((unsigned-byte 16))))
+          (:error-mapping (setf (getf changed :error-mapping)
+                               (list :host-type (lisp-implementation-type)
+                                     :host-version (lisp-implementation-version)))))
+        (let ((record (snowgrave:sg-make-record
+                       (snowgrave:make-layout (getf changed :identity) 'a (getf changed :ancestors)
+                                             (getf changed :slots) :slot-types (getf changed :slot-types)
+                                             :error-mapping (getf changed :error-mapping)))))
+          (check (not (snowgrave:sg-record-matches-layout-p record plain))))))
+    ;; Raw MAKE-LAYOUT permits names that authored source cannot serialize.
+    ;; Keep detailed matching intact; these rows acquire no fast proof.
+    (let* ((slots (list (gensym "UNSTABLE")))
+           (raw (snowgrave:make-layout (getf row :identity) 'a '(a) slots))
+           (record (snowgrave:sg-make-record raw)))
+      (check (snowgrave:sg-record-layout-p record (getf row :identity) 'a '(a) slots))
+      (check (not (snowgrave:sg-record-matches-layout-p record raw)))))
+  ;; This cohort never constructs an object. Its entry must still have a cold
+  ;; admitted layout, including in a freshly compiled runtime-only artifact.
+  (let* ((*package* (find-package :snowgrave.layout-matching.fixture))
+         (forms (read-from-string
+                 "((defclass cell () ((payload :type (unsigned-byte 8))))
+                   (defun bound (record) (slot-boundp record 'payload)))"))
+         (unit (snowgrave:close-source-unit
+                (list :forms forms) :unit-name '(:layout-without-constructor)
+                :closed-classes (read-from-string "(cell)") :universe (read-from-string "(cell)")
+                :entries (read-from-string "(bound)") :external-domains (read-from-string "((bound (cell)))")))
+         (root (asdf:system-source-directory "snowgrave"))
+         (source (merge-pathnames ".build/fresh-layout-matching.lisp" root))
+         (metadata (merge-pathnames ".build/fresh-layout-matching.metadata" root)))
+    (with-open-file (out source :direction :output :if-exists :supersede)
+      (snowgrave:write-unit-source unit out))
+    (with-open-file (out metadata :direction :output :if-exists :supersede)
+      (snowgrave:write-unit-metadata unit out))
+    (check (search "Fresh layout without constructor executed."
+                   (uiop:run-program
+                    (list "sbcl" "--no-sysinit" "--no-userinit" "--script"
+                          (namestring (merge-pathnames "scripts/fresh-layout-matching.lisp" root))
+                          (namestring source) (namestring metadata)) :output :string))))
+  t)

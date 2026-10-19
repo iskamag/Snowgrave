@@ -19,6 +19,8 @@
     (cond ((member (car form) '(defclass cl:defclass)) :class)
           ((member (car form) '(defgeneric cl:defgeneric)) :generic)
           ((member (car form) '(defmethod cl:defmethod)) :method)
+          ((member (car form) '(define-method-combination cl:define-method-combination))
+           :method-combination)
           ((eq (car form) 'cl:defun) :function)
           ((member (car form) '(defvar defparameter defconstant)) :global))))
 

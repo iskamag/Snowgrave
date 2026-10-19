@@ -535,7 +535,14 @@
              "(let ((result (multiple-value-call #'mapc
                               (values #'equalp (list p p)) (values (list p q)))))
                 (list (eq p (car result)) (eq p (cadr result)) (length result)))"
-             "(mapcar #'equalp (list p) nil)"))
+             "(mapcar #'equalp (list p) nil)"
+             ;; P's first list is evaluated before P changes. The other
+             ;; sequence still contains proven records, so identity is exact.
+             "(mapcar #'equalp (list p)
+                      (progn (setq p (list 17)) (list q)))"
+             "(mapcar (progn (push :callback *effects*) #'equalp)
+                      (progn (push :left *effects*) (list p))
+                      (progn (push :right *effects*) (setq p (list 17)) (list q)))"))
          (entries (loop for index below (length cases) collect (intern (format nil "MAPPING-~D" index))))
          (forms (append prefix
                         (loop for expression in cases for entry in entries collect
@@ -583,9 +590,7 @@
           (refuse expression :equalp-callback))
         (refuse "(mapcar (if flag #'equalp 17) (list p) (list q))" :callback-target)
         (refuse "(mapcar (choose-callback flag) (list p))" :compiler-failure)
-        (refuse "(mapcar (choose-callback flag) (list p) (list q) (list p))" :compiler-failure)
-        (refuse "(mapcar #'equalp (list p)
-                          (progn (setq p (list 17)) (list q)))" :value-domain-mutation))
+        (refuse "(mapcar (choose-callback flag) (list p) (list q) (list p))" :compiler-failure))
       (let* ((root (asdf:system-source-directory "snowgrave"))
              (source (merge-pathnames ".build/fresh-mapping-equality.lisp" root))
              (data (merge-pathnames ".build/fresh-mapping-equality.metadata" root))
@@ -721,7 +726,9 @@
         (refuse "(count p (list q) :test (if flag #'equalp 17))" :callback-target)
         (refuse "(count p (list q) :test #'equalp :test-not #'equalp)" :compiler-failure)
         (refuse "(apply #'count p (list q) (identity (list :test #'equalp)))" :callback-target)
-        (refuse "(count p (progn (setq p (list 17)) (list q)) :test #'equalp)" :value-domain-mutation)
+        ;; Invalidating P's class fact prevents an item-based identity proof.
+        ;; This keyword consumer does not infer a sequence-element proof.
+        (refuse "(count p (progn (setq p (list 17)) (list q)) :test #'equalp)" :equalp-callback)
         (refuse "(count 17 (list q) :test #'equalp :key #'identity)" :equalp-callback)
         (refuse "(count p q :test #'equalp)" :callback-sequence-domain)
         (refuse "(count p (list q) :test #'snowgrave.tests::observe-higher-record)"
@@ -3977,12 +3984,17 @@
         (check (equal (funcall entry 7) '(:foreign 7)))
         (check *mutable-foreign-invoked*))
       (let ((condition (handler-case (close-it '(mvsetq-capture-mutation) forms '(t))
-                         (snowgrave:unsupported-definition (condition) condition))))
-        (check (typep condition 'snowgrave:unsupported-definition))
-        (check (eq (snowgrave:error-feature condition) :value-domain-mutation)))
+                         (snowgrave:unclosed-call (condition) condition))))
+        ;; Mutation clears the old callee fact; the consuming call must still
+        ;; refuse an unproved foreign function rather than reuse LOCAL-CALL.
+        (check (typep condition 'snowgrave:unclosed-call))
+        (check (eq (snowgrave:error-feature condition) :computed-function)))
       (let ((changed (replace-entry-body forms "ENTRY"
                                         (read-from-string "(let ((f #'local-call)) (multiple-value-setq (x f) (values x (snowgrave.tests::provide-foreign-callable))) (funcall f x))"))))
-        (signals snowgrave:unsupported-definition (close-it '(mvsetq-secondary-mutation) changed '(t))))
+        (let ((condition (handler-case (close-it '(mvsetq-secondary-mutation) changed '(t))
+                           (snowgrave:unclosed-call (condition) condition))))
+          (check (typep condition 'snowgrave:unclosed-call))
+          (check (eq (snowgrave:error-feature condition) :computed-function))))
       (let ((computed (append (butlast forms)
                               (read-from-string "((defun entry (f x) (multiple-value-call f (values x))))"))))
         (dolist (form computed) (eval form))
@@ -4214,6 +4226,10 @@
     (external-value-guard-tests)
     (fixed-generic-call-tests)
     (typed-slot-tests)
+    (closed-reference-slot-tests)
+    (layout-matching-tests)
+    (sequence-fill-tests)
+    (sequence-coerce-tests)
   (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)
@@ -4231,6 +4247,8 @@
     (multiple-value-binding-tests)
     (generic-method-value-tests)
     (method-call-binding-tests)
+    (macro-normalization-tests)
+    (authored-combination-tests)
     (check (search "ACTUAL-CHECKPOINT-OWNER-CLOSED:"
                    (uiop:run-program
                     (list "sbcl" "--no-sysinit" "--no-userinit" "--script"

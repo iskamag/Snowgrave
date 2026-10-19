@@ -132,8 +132,10 @@
       (refused "(let* ((held nil) (same (and (typep held 'box) (eq expected held)))) (declare (special held)) same)")
       (refused "(and (typep *held* 'box) (eq expected *held*))"
                (list `(defparameter ,(intern "*HELD*") nil)))
+      ;; The mutable binding loses its earlier BOX fact. Its later identity
+      ;; observation is refused by the logical-value consumer, not by SETQ.
       (refused "(let ((held (slot-value owner 'held))) (and (typep held 'box) (progn (setq held nil) (eq expected held))))"
-               nil :value-domain-mutation)
+               nil :external-logical-identity)
       (refused "(let ((held (slot-value owner 'held))) (flet ((typep (x y) (declare (ignore x y)) t)) (and (typep held 'box) (eq expected held))))")
       (refused "(typep expected 'box owner)" nil :type-environment)
       (refused "(typep expected 'box nil nil)" nil :typep-arity))))

@@ -14,13 +14,28 @@
          (progn
            (setf (fdefinition 'snowgrave.sbcl::raw-value-domain)
                  (lambda (build form) (incf visits) (funcall raw build form)))
-           (dolist (operator '(reverse car list* append values load-time-value identity))
+           (dolist (operator '(reverse car list* append values identity))
              (dolist (origin '(:unknown :external-result))
                (let ((form 'x) (snowgrave.sbcl::*argument-domains* (list (cons 'x origin))))
                  (dotimes (i 64) (setf form (list operator form)))
                  (setf visits 0)
                  (check (eq origin (snowgrave.sbcl::value-domain build form)))
                  (check (= visits 65)))))
+           ;; LOAD-TIME-VALUE has a null lexical environment. A surrounding
+           ;; lexical X fact cannot classify its free X, even across nested
+           ;; load-time forms. Keep the same linear-visit bound separately.
+           (dolist (origin '(:unknown :external-result))
+             (let ((form 'x) (snowgrave.sbcl::*argument-domains* (list (cons 'x origin))))
+               (dotimes (i 64) (setf form (list 'load-time-value form)))
+               (setf visits 0)
+               (check (eq :unknown (snowgrave.sbcl::value-domain build form)))
+               (check (= visits 65))))
+           ;; The same boundary applies to function names: the local IDENTITY
+           ;; does not shadow the ordinary global capture inside LTV.
+           (let ((snowgrave.sbcl::*value-domain-local-functions* '(identity)))
+             (check (eq :unknown (snowgrave.sbcl::value-domain build '(function identity))))
+             (check (equal '(:function-target identity)
+                           (snowgrave.sbcl::value-domain build '(load-time-value #'identity)))))
            (dolist (origin '(:unknown :external-result))
              (let ((form 'x) (snowgrave.sbcl::*argument-domains* (list (cons 'x origin))))
                (dotimes (i 64) (setf form (list 'car (list 'list form))))

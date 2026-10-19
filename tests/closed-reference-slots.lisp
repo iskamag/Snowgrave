@@ -1,0 +1,178 @@
+(defpackage #:snowgrave.closed-reference-slots.fixture (:use #:cl))
+(in-package #:snowgrave.tests)
+
+(defun closed-reference-slot-forms ()
+  (let ((*package* (find-package :snowgrave.closed-reference-slots.fixture)))
+    (read-from-string
+     "((defclass component () ())
+        (defclass leaf (component) ((next :type component :accessor next)))
+        (defclass other () ())
+        (defclass holder () ((item :type component :initarg :item :accessor item)))
+        (defclass narrow (holder) ((item :type leaf)))
+        (defun boot-component () (make-instance 'component))
+        (defun boot-leaf () (make-instance 'leaf))
+        (defun boot-other () (make-instance 'other))
+        (defun boot-holder (value) (make-instance 'holder :item value))
+        (defun boot-narrow (value) (make-instance 'narrow :item value))
+        (defun read-item (record) (item record))
+        (defun write-item (record value) (setf (item record) value))
+        (defun read-next (record) (next record))
+        (defun write-next (record value) (setf (next record) value))
+        (defun reload (record) (next (item record)))
+        (defun reload-raw (record) (next (slot-value record 'item)))
+        (defun next-bound-p (record) (slot-boundp record 'next))
+        (defun clear-next (record) (slot-makunbound record 'next)))")))
+
+(defun close-reference-slot-unit (identity &key (universal t))
+  (let ((*package* (find-package :snowgrave.closed-reference-slots.fixture)))
+    (snowgrave:close-source-unit
+     (list :forms (closed-reference-slot-forms)) :unit-name identity
+     :closed-classes (read-from-string "(component leaf other holder narrow)")
+     :universe (read-from-string (if universal "(component leaf other holder narrow t)"
+                                    "(component leaf other holder narrow)"))
+     :closed-generics (read-from-string "(next (setf next) item (setf item))")
+     :entries (read-from-string
+               "(boot-component boot-leaf boot-other boot-holder boot-narrow
+                 read-item write-item read-next write-next reload reload-raw next-bound-p clear-next)")
+     :external-domains (read-from-string
+                       "((boot-component ()) (boot-leaf ()) (boot-other ())
+                         (boot-holder (component)) (boot-narrow (leaf))
+                         (read-item (holder)) (write-item (holder t))
+                         (read-next (leaf)) (write-next (leaf t))
+                         (reload (narrow)) (reload-raw (narrow))
+                         (next-bound-p (leaf)) (clear-next (leaf)))"))))
+
+(defun reference-layout-record (row domain)
+  (snowgrave:sg-make-record
+   (snowgrave:make-layout (getf row :identity) (getf row :class)
+                         (getf row :ancestors) (getf row :slots)
+                         :slot-types (getf row :slot-types)
+                         :error-mapping (getf row :error-mapping)
+                         :reference-domain domain)))
+
+(defun closed-reference-slot-tests ()
+  (let* ((*package* (find-package :snowgrave.closed-reference-slots.fixture))
+         (unit (close-reference-slot-unit '(:closed-reference-slots)))
+         (metadata (snowgrave:unit-metadata unit))
+         (component (funcall (test-unit-function unit "BOOT-COMPONENT")))
+         (leaf (funcall (test-unit-function unit "BOOT-LEAF")))
+         (other (funcall (test-unit-function unit "BOOT-OTHER")))
+         (holder (funcall (test-unit-function unit "BOOT-HOLDER") leaf))
+         (narrow (funcall (test-unit-function unit "BOOT-NARROW") leaf))
+         (layouts (getf metadata :record-layouts))
+         (leaf-row (find (intern "LEAF") layouts :key (lambda (row) (getf row :class)))))
+    (check (equal (getf leaf-row :slot-types) (list (intern "COMPONENT"))))
+    (check (eq leaf (funcall (test-unit-function unit "READ-ITEM") holder)))
+    (check (eq leaf (funcall (test-unit-function unit "WRITE-NEXT") leaf leaf)))
+    (check (eq leaf (funcall (test-unit-function unit "RELOAD") narrow)))
+    (check (eq leaf (funcall (test-unit-function unit "RELOAD-RAW") narrow)))
+    (check (eq component (funcall (test-unit-function unit "WRITE-ITEM") holder component)))
+    (funcall (test-unit-function unit "WRITE-ITEM") holder leaf)
+    (dolist (invalid (list nil :invalid other component))
+      (signals type-error (funcall (test-unit-function unit "WRITE-ITEM") narrow invalid))
+      (check (eq leaf (funcall (test-unit-function unit "READ-ITEM") narrow))))
+    (check (eq (snowgrave::record-layout-reference-domain (snowgrave::closed-record-layout leaf))
+               (snowgrave::record-layout-reference-domain (snowgrave::closed-record-layout holder))))
+    (closed-reference-slot-admission-tests unit metadata leaf holder)
+    (closed-reference-slot-capture-tests metadata)
+    (closed-reference-slot-fresh-tests unit)
+    t))
+
+(defun closed-reference-slot-admission-tests (unit metadata leaf holder)
+  (let* ((layouts (getf metadata :record-layouts))
+         (leaf-row (find (intern "LEAF") layouts :key (lambda (row) (getf row :class)))))
+    (let ((fresh (funcall (test-unit-function unit "BOOT-LEAF"))))
+      (check (not (funcall (test-unit-function unit "NEXT-BOUND-P") fresh)))
+      (signals type-error (funcall (test-unit-function unit "WRITE-NEXT") fresh :invalid))
+      (check (not (funcall (test-unit-function unit "NEXT-BOUND-P") fresh)))
+      (signals unbound-slot (funcall (test-unit-function unit "READ-NEXT") fresh))
+      ;; An unbound-slot USE-VALUE restart need not satisfy the field's type.
+      ;; This prohibits treating a declaration as an unconditional read fact.
+      (check (= 7 (handler-bind ((unbound-slot (lambda (condition) (use-value 7 condition))))
+                    (funcall (test-unit-function unit "READ-NEXT") fresh))))
+      (funcall (test-unit-function unit "WRITE-NEXT") fresh leaf)
+      (check (eq fresh (funcall (test-unit-function unit "CLEAR-NEXT") fresh)))
+      (check (not (funcall (test-unit-function unit "NEXT-BOUND-P") fresh))))
+    (signals snowgrave:incomplete-domain
+      (close-reference-slot-unit '(:restricted-reference-read) :universal nil))
+    (dolist (form (closed-reference-slot-forms)) (eval form))
+    (let ((open (make-instance (intern "LEAF"))))
+      (signals type-error (funcall (test-unit-function unit "WRITE-ITEM") holder open))
+      (check (eq leaf (funcall (test-unit-function unit "READ-ITEM") holder))))
+    (let* ((other-unit (close-reference-slot-unit '(:closed-reference-slots-other)))
+           (foreign (funcall (test-unit-function other-unit "BOOT-LEAF"))))
+      (signals type-error (funcall (test-unit-function unit "WRITE-ITEM") holder foreign))
+      (signals snowgrave:domain-violation (funcall (test-unit-function unit "READ-NEXT") foreign))
+      (check (eq leaf (funcall (test-unit-function unit "READ-ITEM") holder))))
+    (let* ((domain (snowgrave:make-reference-domain (getf metadata :identity) (reverse layouts)))
+           (compatible (reference-layout-record leaf-row domain)))
+      (check (eq compatible (funcall (test-unit-function unit "WRITE-ITEM") holder compatible)))
+      (funcall (test-unit-function unit "WRITE-ITEM") holder leaf)
+      (signals error
+        (snowgrave:make-layout (getf leaf-row :identity) (getf leaf-row :class)
+                              (getf leaf-row :ancestors) (getf leaf-row :slots)
+                              :slot-types '(t) :error-mapping (getf leaf-row :error-mapping)
+                              :reference-domain domain)))
+    (dolist (mode '(:slot-type :error-mapping))
+      (let* ((changed (copy-tree layouts))
+             (row (find (intern "LEAF") changed :key (lambda (row) (getf row :class)))))
+        (ecase mode
+          (:slot-type (setf (getf row :slot-types) (list (intern "LEAF"))))
+          (:error-mapping (setf (getf (getf row :error-mapping) :writer-control)
+                               "Different observable mapping ~S")))
+        (let* ((domain (snowgrave:make-reference-domain (getf metadata :identity) changed))
+               (impostor (reference-layout-record row domain)))
+          (signals type-error (funcall (test-unit-function unit "WRITE-ITEM") holder impostor))
+          (signals snowgrave:domain-violation (funcall (test-unit-function unit "READ-NEXT") impostor))
+          (check (eq leaf (funcall (test-unit-function unit "READ-ITEM") holder))))))
+    (let ((out (make-string-output-stream)))
+      (signals snowgrave:unsupported-definition (snowgrave:write-mezzano-unit-source unit out))
+      (check (string= "" (get-output-stream-string out))))))
+
+(defun closed-reference-slot-capture-tests (metadata)
+  (let* ((domain (snowgrave:make-reference-domain (getf metadata :identity) (getf metadata :record-layouts)))
+         (builder (make-package (symbol-name (gensym "REFERENCE-AUDIT-BUILDER-")) :use nil))
+         (build (snowgrave.sbcl::make-build
+                 :identity '(:reference-capture-audit)
+                 :source (snowgrave:make-authored-source nil)
+                 :open-package builder :declaration nil)))
+    (unwind-protect
+         (progn
+           (check (null (getf (snowgrave.sbcl::compiled-root-audit
+                              build nil (list (list 'frozen-reference-domain t domain))) :builder-objects)))
+           ;; Inject after construction: serialized schema admission already
+           ;; rejects MOP objects, so this independently tests structural audit.
+           (setf (snowgrave::reference-schema-error-mapping
+                  (aref (snowgrave::reference-domain-schemas domain) 0))
+                 (list :hidden (find-class 'standard-object)))
+           (let ((condition (handler-case
+                                (progn (snowgrave.sbcl::compiled-root-audit
+                                        build nil (list (list 'frozen-reference-domain t domain))) nil)
+                              (snowgrave:residual-metaobject (condition) condition))))
+             (check condition)
+             (check (eq :compiled-metaobject (snowgrave:error-feature condition))))
+           (let* ((captured domain)
+                  (root (lambda () captured))
+                  (condition (handler-case
+                                 (progn (snowgrave.sbcl::compiled-root-audit
+                                         build (list (cons 'captured-reference-schema root)) nil) nil)
+                               (snowgrave:residual-metaobject (condition) condition))))
+             (check condition)
+             (check (eq :compiled-metaobject (snowgrave:error-feature condition)))))
+      (delete-package builder))))
+
+(defun closed-reference-slot-fresh-tests (unit)
+  (let* ((root (asdf:system-source-directory "snowgrave"))
+         (script (merge-pathnames "scripts/fresh-closed-reference-slots.lisp" root)))
+    (uiop:with-temporary-file (:stream source-out :pathname source :type "lisp" :direction :output)
+      (uiop:with-temporary-file (:stream metadata-out :pathname data :type "metadata" :direction :output)
+        (snowgrave:write-unit-source unit source-out)
+        (snowgrave:write-unit-metadata unit metadata-out)
+        (finish-output source-out)
+        (finish-output metadata-out)
+        (unwind-protect
+             (check (search "Fresh closed reference slots executed."
+                            (uiop:run-program (list "sbcl" "--no-sysinit" "--no-userinit" "--script"
+                                                    (namestring script) (namestring source) (namestring data))
+                                              :output :string)))
+          (ignore-errors (delete-file (compile-file-pathname source))))))))

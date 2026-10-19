@@ -10,6 +10,26 @@
       (error "Native record ABI needs an exact compiler-owned literal: ~S" form))
     (second form))
 
+  (defun admitted-logical-layout (arguments layouts)
+    "Resolve a complete cold logical row before emitting its native header test."
+    (let* ((identity (literal-value (first arguments)))
+           (class (literal-value (second arguments)))
+           (layout (find class layouts :key (lambda (row) (getf row :class))))
+           (keys (nthcdr 4 arguments)))
+      (unless (and layout (equal identity (getf layout :identity))
+                   (equal (literal-value (third arguments)) (getf layout :ancestors))
+                   (equal (literal-value (fourth arguments)) (getf layout :slots))
+                   (equal (literal-value (getf keys :slot-types)) (getf layout :slot-types))
+                   (equal (literal-value (getf keys :error-mapping)) (getf layout :error-mapping))
+                   (evenp (length keys))
+                   (loop for (key value) on keys by #'cddr
+                         always (and (member key '(:slot-types :error-mapping :reference-domain))
+                                     ;; Native class-reference families need
+                                     ;; their own physical field/type mapping.
+                                     (or (not (eq key :reference-domain)) (null value)))))
+        (error "Changed or unmapped logical record descriptor in native source."))
+      layout))
+
   (defun native-slot-domain (type)
     (multiple-value-bind (domain validp) (snowgrave.mezzano-access::record-slot-domain type)
       (when validp (return-from native-slot-domain domain)))
@@ -102,17 +122,7 @@
                     (:unitp (let ((identity (literal-value (second arguments))))
                               (remove-if-not (lambda (x) (equal identity (first (getf x :identity)))) layouts)))
                     (:layoutp
-                     (let* ((identity (literal-value (second arguments)))
-                            (class (literal-value (third arguments)))
-                            (layout (find class layouts :key (lambda (x) (getf x :class))))
-                            (keys (nthcdr 5 arguments)))
-                       (unless (and layout (equal identity (getf layout :identity))
-                                    (equal (literal-value (fourth arguments)) (getf layout :ancestors))
-                                    (equal (literal-value (fifth arguments)) (getf layout :slots))
-                                    (equal (literal-value (getf keys :slot-types)) (getf layout :slot-types))
-                                    (equal (literal-value (getf keys :error-mapping)) (getf layout :error-mapping)))
-                         (error "Changed logical record descriptor in native source."))
-                       (list layout))))))
+                     (list (admitted-logical-layout (rest arguments) layouts))))))
            `(let ((,record ,(first arguments))) (or ,@(mapcar (lambda (x) (header-test record x)) selected)))))
         (otherwise (error "Unsupported native record operation ~S" operation)))))
 
@@ -249,9 +259,7 @@
       (dolist (form forms)
         (when (and (eq (car form) 'defparameter) (consp (third form))
                    (eq (car (third form)) 'snowgrave:make-layout))
-          (let* ((class (literal-value (third (third form))))
-                 (description (find class descriptions :key (lambda (x) (getf x :class)))))
-            (unless description (error "Unknown constructor layout."))
+          (let ((description (admitted-logical-layout (cdr (third form)) descriptions)))
             (push (cons (second form) description) layout-vars))))
       (labels ((walk (form)
                  (cond ((atom form) form)
@@ -278,6 +286,20 @@
                           (unless binding (error "No native generic identity for miss."))
                           `(apply #'no-applicable-method ,(third binding)
                                   ,(walk (getf (cddr error-form) :args)))))
+                       ((eq (car form) 'snowgrave:sg-record-matches-layout-p)
+                        (let ((description (and (= (length form) 3)
+                                                (cdr (assoc (third form) layout-vars)))))
+                          (unless description (error "Dynamic native admitted-layout proof."))
+                          ;; The descriptor was validated cold against the
+                          ;; complete metadata row. Reuse the existing native
+                          ;; layout operation; no hosted descriptor lookup or
+                          ;; new runtime protocol reaches the target.
+                          `(,(first (find :layoutp operations :key #'second))
+                            ,(walk (second form))
+                            ',(getf description :identity) ',(getf description :class)
+                            ',(getf description :ancestors) ',(getf description :slots)
+                            :slot-types ',(getf description :slot-types)
+                            :error-mapping ',(getf description :error-mapping))))
                        ((eq (car form) 'snowgrave:sg-make-record)
                         (let ((description (cdr (assoc (second form) layout-vars))))
                           (unless description (error "Dynamic native constructor layout."))

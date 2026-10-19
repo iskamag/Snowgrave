@@ -1,0 +1,138 @@
+(defpackage #:snowgrave.authored-combinations.fixture
+  (:use #:cl)
+  (:shadowing-import-from #:snowgrave #:defclass #:defgeneric #:defmethod
+                          #:define-method-combination))
+(defpackage #:snowgrave.short-combinations.fixture
+  (:use #:cl)
+  (:shadowing-import-from #:snowgrave #:defclass #:defgeneric #:defmethod
+                          #:define-method-combination))
+(in-package #:snowgrave.tests)
+
+(defun authored-combination-forms ()
+  (let ((*package* (find-package :snowgrave.authored-combinations.fixture)))
+    (read-from-string
+     "((defclass counter () ((value :initarg :value)))
+       (defclass scaled (counter) ())
+       (define-method-combination observe-after (order)
+         ((observations (observe) :order order)
+          (primaries () :required t))
+         `(multiple-value-prog1
+              (call-method ,(first primaries) ,(rest primaries))
+            ,@(mapcar (lambda (method) `(call-method ,method)) observations)))
+       (defgeneric execute (object)
+         (:method-combination observe-after :most-specific-last))
+       (defmethod execute ((object counter))
+         (values (slot-value object 'value) :primary))
+       (defmethod execute ((object scaled))
+         (multiple-value-bind (value tag) (call-next-method)
+           (values (+ value 100) tag)))
+       (defmethod execute observe ((object counter))
+         (incf (slot-value object 'value)))
+       (defmethod execute observe ((object scaled))
+         (setf (slot-value object 'value) (* 10 (slot-value object 'value))))
+       (defun boot () (make-instance 'scaled :value 5))
+       (defun run (object) (execute object))
+       (defun current-value (object) (slot-value object 'value)))")))
+
+(defun close-authored-combination (forms identity &optional (package :snowgrave.authored-combinations.fixture))
+  (let ((*package* (find-package package)))
+    (snowgrave:close-source-unit
+     (list :forms forms) :unit-name identity
+     :closed-classes (read-from-string "(counter scaled)")
+     :closed-generics (read-from-string "(execute)")
+     :universe (read-from-string "(counter scaled)")
+     :entries (read-from-string "(boot run current-value)")
+     :external-domains (read-from-string "((boot ()) (run (counter)) (current-value (counter)))"))))
+
+(defun authored-combination-tests ()
+  (let* ((*package* (find-package :snowgrave.authored-combinations.fixture))
+         (forms (authored-combination-forms))
+         (original (copy-tree forms))
+         (seen nil))
+    (let ((snowgrave::*definition-recorder*
+            (lambda (kind name form) (push (list kind name form) seen))))
+      (dolist (form forms) (eval form)))
+    (check (find :method-combination seen :key #'first))
+    (let* ((unit (close-authored-combination forms '(:authored-combination :version 1)))
+           (open (funcall (intern "BOOT")))
+           (closed (funcall (test-unit-function unit "BOOT"))))
+      (check (equal original forms))
+      (check (equal (multiple-value-list (funcall (intern "RUN") open)) '(105 :primary)))
+      (check (equal (multiple-value-list (funcall (test-unit-function unit "RUN") closed)) '(105 :primary)))
+      (check (= 60 (funcall (intern "CURRENT-VALUE") open)))
+      (check (= 60 (funcall (test-unit-function unit "CURRENT-VALUE") closed)))
+      (check (not (typep (test-unit-function unit "RUN") 'generic-function)))
+      ;; Registering a new open combination must not replace the sealed result.
+      (eval (read-from-string
+             "(define-method-combination observe-after (order)
+                ((observations (observe) :order order)
+                 (primaries () :required t))
+                (declare (ignore observations primaries)) 999)"))
+      (check (equal (multiple-value-list (funcall (test-unit-function unit "RUN") closed)) '(160 :primary)))
+      (check (= 610 (funcall (test-unit-function unit "CURRENT-VALUE") closed)))
+      (let* ((root (asdf:system-source-directory "snowgrave"))
+             (source (merge-pathnames ".build/fresh-authored-combination.lisp" root))
+             (metadata (merge-pathnames ".build/fresh-authored-combination.metadata" root)))
+        (with-open-file (stream source :direction :output :if-exists :supersede)
+          (snowgrave:write-unit-source unit stream))
+        (with-open-file (stream metadata :direction :output :if-exists :supersede)
+          (snowgrave:write-unit-metadata unit stream))
+        (check (search "Fresh authored combination executed."
+                       (uiop:run-program
+                        (list "sbcl" "--no-sysinit" "--no-userinit" "--script"
+                              (namestring (merge-pathnames "scripts/fresh-authored-combination.lisp" root))
+                              (namestring source) (namestring metadata)) :output :string)))))
+    (let* ((first-forms (copy-tree forms))
+           (generic (find-if (lambda (form) (eq (snowgrave:source-defining-kind form) :generic)) first-forms)))
+      (setf (third (assoc :method-combination (cdddr generic))) :most-specific-first)
+      (let* ((unit (close-authored-combination first-forms '(:authored-combination :version 2)))
+             (record (funcall (test-unit-function unit "BOOT"))))
+        (check (equal (multiple-value-list (funcall (test-unit-function unit "RUN") record)) '(105 :primary)))
+        (check (= 51 (funcall (test-unit-function unit "CURRENT-VALUE") record)))))
+    ;; A prior registration is not provenance for another closing unit.
+    (let ((without-definition
+            (remove-if (lambda (form)
+                         (eq (snowgrave:source-defining-kind form) :method-combination)) forms)))
+      (check (handler-case
+                 (progn (close-authored-combination without-definition '(:missing-combination-source)) nil)
+               (snowgrave:unsupported-definition (condition)
+                 (eq :method-combination-provenance (snowgrave:error-feature condition))))))
+    ;; Owning the defining form does not authorize retaining its MOP objects.
+    ;; This combination deliberately returns its actual primary METHOD as
+    ;; ordinary quoted result data, rather than invoking CALL-METHOD.
+    (let* ((leaking (copy-tree forms))
+           (combination (find-if (lambda (form)
+                                   (eq (snowgrave:source-defining-kind form) :method-combination))
+                                 leaking)))
+      (setf (cddddr combination)
+            (read-from-string
+             "((declare (ignore order observations))
+               (list 'quote (first primaries)))"))
+      (check (handler-case
+                 (progn (close-authored-combination leaking '(:combination-method-leak)) nil)
+               (snowgrave:residual-metaobject (condition)
+                 (eq :effective-method-quote (snowgrave:error-feature condition)))))))
+  (let* ((*package* (find-package :snowgrave.short-combinations.fixture))
+         (forms (read-from-string
+                 "((defclass counter () ((value :initarg :value)))
+                   (defclass scaled (counter) ())
+                   (define-method-combination gather :operator list)
+                   (defgeneric execute (object)
+                     (:method-combination gather :most-specific-last))
+                   (defmethod execute gather ((object counter))
+                     (declare (ignore object)) :base)
+                   (defmethod execute gather ((object scaled))
+                     (declare (ignore object)) :scaled)
+                   (defun boot () (make-instance 'scaled :value 5))
+                   (defun run (object) (execute object))
+                   (defun current-value (object) (slot-value object 'value)))")))
+    (dolist (form forms) (eval form))
+    (let* ((unit (close-authored-combination forms '(:authored-short-combination)
+                                            :snowgrave.short-combinations.fixture))
+           (record (funcall (test-unit-function unit "BOOT"))))
+      (check (equal (funcall (intern "RUN") (funcall (intern "BOOT"))) '(:base :scaled)))
+      (check (equal (funcall (test-unit-function unit "RUN") record) '(:base :scaled)))
+      (let* ((dispatch (first (getf (snowgrave:unit-metadata unit) :dispatch)))
+             (methods (getf (first (getf dispatch :cells)) :methods)))
+        (check (every (lambda (method) (equal (first method) (list (intern "GATHER")))) methods)))))
+  t)

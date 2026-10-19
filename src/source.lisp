@@ -46,3 +46,9 @@
      (eval-when (:compile-toplevel :load-toplevel :execute)
        (record-authored-definition :method ',name ',form))
      (cl:defmethod ,name ,@tail)))
+
+(defmacro define-method-combination (&whole form name &rest definition)
+  `(progn
+     (eval-when (:compile-toplevel :load-toplevel :execute)
+       (record-authored-definition :method-combination ',name ',form))
+     (cl:define-method-combination ,name ,@definition)))

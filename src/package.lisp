@@ -1,8 +1,8 @@
 (defpackage #:snowgrave
   (:use #:common-lisp)
-  (:shadow #:defclass #:defgeneric #:defmethod)
+  (:shadow #:defclass #:defgeneric #:defmethod #:define-method-combination)
   (:export
-   #:defclass #:defgeneric #:defmethod #:close-source-unit
+   #:defclass #:defgeneric #:defmethod #:define-method-combination #:close-source-unit
    #:snowgrave-error #:unsupported-definition #:unclosed-call
    #:unclosed-class-operation #:nonreproducible-source #:mop-failure
    #:incomplete-domain #:residual-metaobject #:audit-failure
@@ -10,8 +10,9 @@
    #:domain-violation #:violation-unit #:violation-name #:violation-arguments
    #:closed-unit #:closed-unit-p #:unit-metadata #:unit-source
    #:unit-function #:unit-report #:write-unit-source #:write-unit-metadata
-   #:make-layout #:layout-identity #:sg-make-record #:sg-record-p
-   #:sg-record-class #:sg-record-typep #:sg-record-unit-p #:sg-record-layout-p #:sg-record-boundp #:sg-record-read
+   #:make-reference-domain #:make-layout #:layout-identity #:sg-make-record #:sg-record-p
+   #:sg-record-class #:sg-record-typep #:sg-record-unit-p #:sg-record-layout-p
+   #:sg-record-matches-layout-p #:sg-record-boundp #:sg-record-read
    #:sg-record-write #:sg-record-unbind #:sg-domain-violation
    #:write-mezzano-unit-source #:register-source-adapter
    #:source-name-key #:source-defining-kind #:make-authored-source #:authored-source

@@ -1,4 +1,4 @@
-(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-introspect))
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-introspect) (require :sb-cltl2))
 (in-package #:snowgrave.sbcl)
 
 ;; This adapter admits a deliberately explicit source fragment. The proof of
@@ -21,6 +21,9 @@
 (defvar *immediate-function-reference* nil)
 (defvar *value-domain-local-functions* nil)
 (defvar *declared-specials* nil)
+(defvar *mutable-invariant-bindings* nil)
+(defvar *tagbody-targets* nil)
+(defvar *immediate-lambda-domains* nil)
 
 (defparameter *standard-miss-methods*
   (loop for (name specializers) in '((no-next-method (standard-generic-function standard-method))
@@ -62,9 +65,9 @@
         collect (cons name (fdefinition name))))
 
 (defparameter *record-runtime-functions*
-  (loop for name in '(snowgrave:make-layout snowgrave:sg-make-record
+  (loop for name in '(snowgrave:make-layout snowgrave:make-reference-domain snowgrave:sg-make-record
                      snowgrave:sg-record-p snowgrave:sg-record-class
-                     snowgrave:sg-record-layout-p snowgrave:sg-record-typep
+                     snowgrave:sg-record-layout-p snowgrave:sg-record-matches-layout-p snowgrave:sg-record-typep
                      snowgrave:sg-record-unit-p snowgrave:sg-record-read
                      (setf snowgrave:sg-record-read) snowgrave:sg-record-write
                      snowgrave:sg-record-boundp snowgrave:sg-record-unbind
@@ -80,20 +83,26 @@
 
 (defstruct build
   identity source declaration open-package output-package
-  layouts generated constructors method-names
+  layouts generated constructors method-names reference-domain-name layout-names
+  normalized-forms
+  (normalized-originals (make-hash-table :test #'eq))
   (sequence 0) (dependencies nil) (source-key nil)
   (literal-pools nil)
   (literal-states (make-hash-table :test #'eq))
   function-domains function-returns generic-call-shapes function-flow-evidence)
 
-(defun build-forms (build) (snowgrave:authored-source-forms (build-source build)))
+(defun build-forms (build)
+  (or (build-normalized-forms build) (snowgrave:authored-source-forms (build-source build))))
 (defun build-classes (build) (snowgrave:authored-source-names (build-source build) :class))
 (defun build-generics (build) (snowgrave:authored-source-names (build-source build) :generic))
 (defun build-functions (build) (snowgrave:authored-source-names (build-source build) :function))
 (defun build-globals (build) (snowgrave:authored-source-names (build-source build) :global))
-(defun build-method-sources (build) (snowgrave:authored-source-kind-forms (build-source build) :method))
+(defun build-method-sources (build)
+  (remove-if-not (lambda (form) (eq (defining-kind form) :method)) (build-forms build)))
 (defun authored-source-key (build form)
-  (list (build-identity build) (snowgrave:authored-form-position (build-source build) form)))
+  (list (build-identity build) (snowgrave:authored-form-position
+                                (build-source build)
+                                (gethash form (build-normalized-originals build) form))))
 
 (defun fail (build type feature detail &optional (phase :source-admission))
   (snowgrave::reject type phase feature detail
@@ -105,6 +114,166 @@
     `(let* ((,owner ,build) (,previous (build-source-key ,owner)))
        (unwind-protect (progn (setf (build-source-key ,owner) ,key) ,@body)
          (setf (build-source-key ,owner) ,previous)))))
+
+(defun normalized-definition-form (build definition)
+  (let ((original (snowgrave:authored-definition-form definition)))
+    (or (find original (build-normalized-forms build)
+              :key (lambda (form) (gethash form (build-normalized-originals build))))
+        original)))
+
+(defun normalization-environment (build)
+  ;; Authored global functions shadow host macros just as their pass-one
+  ;; definitions will. Local MACROLET/FLET environments extend this boundary.
+  (sb-cltl2:augment-environment
+   nil :function (append (build-functions build) (build-generics build))))
+
+(defun normalize-source-expression (build expression &optional environment)
+  "Expand ordinary host macros once, retaining the adapter's audited syntax.
+The host walker owns lexical environments and binders, including macro lambda
+lists and &ENVIRONMENT. This is not a second implementation of LOOP. Macros
+which already have semantic lowering retain their places, keys and binders;
+all other expansions re-enter the same admission and residual audits."
+  (let ((global-environment (normalization-environment build))
+        (sb-walker::*walk-form-expand-macros-p* t)
+        (wrapper nil))
+    (labels
+        ((walk (form env) (sb-walker:walk-form form env #'visit))
+         (body (forms env)
+           (multiple-value-bind (prefix executable) (snowgrave::source-body-parts forms)
+             (append prefix (mapcar (lambda (form) (walk form env)) executable))))
+         (bound-body (variables forms env)
+           ;; A synthetic lambda delegates declaration/binding shadowing to
+           ;; the host; only its normalized body is retained.
+           (cddr (walk `(lambda ,variables ,@forms) env)))
+         (visit (form context env)
+           (cond
+             ((or (not (eq context :eval)) (atom form)) form)
+             ((and (member (car form) '(macrolet symbol-macrolet)) (not (eq form wrapper)))
+              ;; Let the host establish the local definitions, then discard
+              ;; compile-time wrappers. Their expanded executable bodies are
+              ;; the only inputs to either materialization pass.
+              (let* ((previous wrapper)
+                     (normalized (unwind-protect (progn (setf wrapper form) (walk form env))
+                                   (setf wrapper previous))))
+                (values `(locally ,@(cddr normalized)) t)))
+             ((eq (car form) 'load-time-value)
+              (values `(load-time-value ,(walk (second form) global-environment) ,@(cddr form)) t))
+             ((member (car form) '(setf incf decf push pushnew pop multiple-value-setq))
+              (values
+               (case (car form)
+                 (multiple-value-setq `(multiple-value-setq ,(second form) ,(walk (third form) env)))
+                 (otherwise (cons (car form) (mapcar (lambda (part) (walk part env)) (cdr form))))) t))
+             ((member (car form) '(and or when unless))
+              (values (cons (car form) (mapcar (lambda (part) (walk part env)) (cdr form))) t))
+             ((eq (car form) 'cond)
+              (values `(cond ,@(mapcar (lambda (clause)
+                                        (mapcar (lambda (part) (walk part env)) clause))
+                                        (conditional-clauses build form))) t))
+             ((member (car form) '(case ecase))
+              (values `(,(car form) ,(walk (second form) env)
+                         ,@(mapcar (lambda (clause) (cons (car clause) (body (cdr clause) env)))
+                                   (case-clauses build form))) t))
+             ((eq (car form) 'multiple-value-bind)
+              (values `(multiple-value-bind ,(second form) ,(walk (third form) env)
+                         ,@(bound-body (second form) (cdddr form) env)) t))
+             ((eq (car form) 'destructuring-bind)
+              ;; The admitted destructuring profile has required bindings;
+              ;; the shared portable owner still validates its exact grammar.
+              (let ((variables (required-binding-variables build form)))
+                (values `(destructuring-bind ,(second form) ,(walk (third form) env)
+                           ,@(bound-body variables (cdddr form) env)) t)))
+             ((eq (car form) 'handler-case)
+              (values `(handler-case ,(walk (second form) env)
+                         ,@(mapcar (lambda (clause)
+                                     (list* (car clause) (second clause)
+                                            (bound-body (handler-binding-variables build clause) (cddr clause) env)))
+                                   (cddr form))) t))
+             ((eq (car form) 'handler-bind)
+              (values `(handler-bind
+                           ,(mapcar (lambda (binding) (list (first binding) (walk (second binding) env)))
+                                    (second form))
+                         ,@(body (cddr form) env)) t))
+             ;; The host's LOOP collector emits a stack-allocation hint, not
+             ;; a client ABI. Its documented source transform is (LIST arg).
+             ;; Lower that exact primitive, never allow arbitrary SB-* calls.
+             ((eq (car form) 'sb-kernel:unaligned-dx-cons)
+              (unless (= (length form) 2)
+                (fail build 'snowgrave:unsupported-definition :host-normalization
+                      "Unexpected host cons primitive shape."))
+              (values `(list ,(walk (second form) env)) t))
+             ((and (member (car form) '(rplaca rplacd)) (= (length form) 3))
+              ;; Reuse the existing ordinary-place audit while preserving both
+              ;; argument evaluations and RPLACx's original-cons result.
+              (let ((cell (gensym "CONS-CELL")) (value (gensym "CONS-VALUE")))
+                (values (walk `(let ((,cell ,(second form)) (,value ,(third form)))
+                                 (setf (,(if (eq (car form) 'rplaca) 'car 'cdr) ,cell) ,value)
+                                 ,cell) env) t)))
+             ((eq (car form) 'sb-ext:truly-the)
+              (values `(the ,(second form) ,(walk (third form) env)) t))
+             ((and (symbolp (car form)) (not (eq (car form) 'lambda))
+                   (not (special-operator-p (car form))) (macro-function (car form) env))
+              ;; Explicitly retain this expansion result. WALK-FORM otherwise
+              ;; may reconstruct the authored macro when no child changes.
+              (multiple-value-bind (expansion expandedp) (macroexpand-1 form env)
+                (if expandedp (values (walk expansion env) t) form)))
+             (t form))))
+      (handler-case (walk expression (or environment global-environment))
+        (snowgrave:snowgrave-error (condition) (error condition))
+        (error (condition)
+          (fail build 'snowgrave:unsupported-definition :host-macroexpansion
+                (format nil "Host lexical normalization failed: ~A" condition)))))))
+
+(defun normalize-authored-definition (build form)
+  (labels ((expression (value) (normalize-source-expression build value))
+           (lambda-form (lambda-list body)
+             (expression `(lambda ,lambda-list ,@body))))
+    (case (defining-kind form)
+      (:function
+       (let ((normalized (lambda-form (third form) (cdddr form))))
+         (list* (car form) (second form) (second normalized) (cddr normalized))))
+      (:method
+       (multiple-value-bind (qualifiers lambda-list body) (method-parts form)
+         (let* ((requiredp t)
+                (ordinary (mapcar (lambda (item)
+                                    (when (member item lambda-list-keywords) (setf requiredp nil))
+                                    (if (and requiredp (consp item)) (first item) item)) lambda-list))
+                (normalized (lambda-form ordinary body))
+                (requiredp t)
+                (normalized-list
+                  (loop for original in lambda-list for item in (second normalized)
+                        do (when (member original lambda-list-keywords) (setf requiredp nil))
+                        collect (if (and requiredp (consp original)) original item))))
+           `(,(car form) ,(second form) ,@qualifiers ,normalized-list ,@(cddr normalized)))))
+      (:class
+       `(,(car form) ,(second form) ,(third form)
+         ,(mapcar (lambda (slot)
+                    (if (symbolp slot) slot
+                        (cons (car slot) (loop for (key value) on (cdr slot) by #'cddr
+                                               append (list key (if (eq key :initform) (expression value) value))))))
+                  (fourth form))
+         ,@(mapcar (lambda (option)
+                     (if (eq (car option) :default-initargs)
+                         (cons (car option) (loop for (key value) on (cdr option) by #'cddr
+                                                  append (list key (expression value)))) option)) (cddddr form))))
+      (:global
+       (if (> (length form) 2)
+           (list* (car form) (second form) (expression (third form)) (cdddr form)) form))
+      (t form))))
+
+(defun normalize-authored-source (build)
+  ;; Neither a user expander that destructively edits its argument nor a
+  ;; returned, globally aliased expansion can mutate the authored provenance
+  ;; or the pass-two input. Own both graphs, preserving literal EQ sharing.
+  (let* ((originals (snowgrave:authored-source-forms (build-source build)))
+         (inputs (snowgrave::immutable-copy originals))
+         (expanded (loop for original in originals for input in inputs
+                         collect (with-build-source-key (build (authored-source-key build original))
+                                   (normalize-authored-definition build input))))
+         (frozen (snowgrave::immutable-copy expanded)))
+    (loop for original in originals for normalized in frozen
+          do (setf (gethash normalized (build-normalized-originals build)) original))
+    ;; Every pass and every return/call analysis consumes this same snapshot.
+    (setf (build-normalized-forms build) frozen)))
 
 (defun name= (a b)
   (labels ((namep (x)
@@ -213,7 +382,7 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
   ;; The portable source owner supplies identity, order and duplicate checks.
   ;; Only host/environment-specific admission belongs in this adapter.
   (dolist (definition (snowgrave:authored-source-definitions (build-source build)))
-    (let ((form (snowgrave:authored-definition-form definition))
+    (let ((form (normalized-definition-form build definition))
           (name (snowgrave:authored-definition-name definition)))
       (setf (build-source-key build) (authored-source-key build form))
       (case (snowgrave:authored-definition-kind definition)
@@ -279,7 +448,7 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
     eq eql equal equalp identity vector length reverse nreverse append copy-list
     copy-tree member assoc getf gethash remhash aref svref sbit bit char
     subseq concatenate mapcar mapc maplist mapcan reduce find position count
-    remove remove-if delete delete-if sort stable-sort copy-seq
+    remove remove-if delete delete-if sort stable-sort copy-seq fill coerce
     make-array make-hash-table make-string string string= string-equal
     symbol-name keywordp char-code code-char format princ prin1 print terpri
     error signal warn break cerror invoke-restart find-restart abort
@@ -294,7 +463,7 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
   ;; contract follows the actual finite callee, independent of call syntax.
   '(gethash remhash make-hash-table mapcar mapc maplist mapcan reduce remove-if
     delete-if sort stable-sort member assoc find position count remove delete
-    format princ prin1 print))
+    format princ prin1 print fill coerce))
 
 (defparameter *native-ordinary-functions*
   ;; Restricted compiler/runtime boundary. SYS provenance alone would also
@@ -302,7 +471,10 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
   ;; cover the admitted ordinary operations and the compiler's materialized
   ;; error, list append and destructuring contracts.
   (loop for name in (append *ordinary-operations*
-                           '(apply typep get-properties write-string write-char sb-int:%simple-error
+                           '(apply typep get-properties write-string write-char
+                             ;; COERCE's compiler expansion copies between the
+                             ;; audited built-in sequences via ordinary REPLACE.
+                             replace sb-kernel:vector-to-list sb-int:%simple-error
                              sb-kernel:with-simple-condition-restarts
                              sb-kernel:%member-eq
                              ;; Actual SBCL list/sequence specialization helpers
@@ -310,6 +482,11 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
                              ;; runtime boundary is not target residency proof.
                              sb-kernel:%assoc-eq sb-kernel:%find-position sb-int:delq
                              sb-kernel:two-arg-string-equal
+                             ;; SEQTRAN's FILL specializations for ordinary data.
+                             sb-kernel:list-fill sb-kernel:vector-fill
+                             ;; Compiler-selected, bounds-checked AREF for a
+                             ;; general vector (including adjustable/string).
+                             sb-kernel:vector-hairy-data-vector-ref/check-bounds
                              sb-impl::vector-reverse
                              sb-impl::append2 sb-c::check-ds-list/&rest))
         when (fboundp name) collect (cons name (fdefinition name))))
@@ -431,6 +608,11 @@ The stable key names its owner obligation, never a class or slot type."
         ((and (consp form) (member (car form) '(list list* cons)))
          (every (lambda (x) (native-data-form-p build x)) (cdr form)))
         (t (native-data-domain-p build (value-domain build form)))))
+
+(defun native-sequence-form-p (build form)
+  ;; LIST/VECTOR shape proof is distinct from native element-tree proof.
+  ;; The general SEQUENCE superclass includes host extension methods.
+  (subtype-domain-p build (value-domain build form) '(or list vector)))
 
 (defun audit-external-call (build name arguments &key variable-tail)
   ;; Keeping an opaque host operation's function binding preserves its effects,
@@ -639,10 +821,122 @@ The stable key names its owner obligation, never a class or slot type."
         when (member (car rest) '(:test :test-not))
           do (pushnew (car rest) seen)))
 
+(defun coerce-sequence-target-p (type)
+  "Finite built-in sequence type syntax, without user DEFTYPE or MOP queries."
+  (labels ((sizep (size) (or (eq size '*) (and (integerp size) (<= 0 size))))
+           (elementp (element) (or (member element '(t * bit)) (native-value-type-p element))))
+    (or (member type '(list vector simple-vector string simple-string base-string
+                      simple-base-string bit-vector simple-bit-vector))
+        (and (snowgrave::source-finite-list-p type)
+             (case (car type)
+               (vector (and (member (length type) '(2 3)) (elementp (second type))
+                            (or (= (length type) 2) (sizep (third type)))))
+               ((array simple-array)
+                (and (= (length type) 3) (elementp (second type))
+                     (snowgrave::source-finite-list-p (third type))
+                     (= (length (third type)) 1) (sizep (first (third type)))))
+               ((simple-vector string simple-string base-string simple-base-string
+                 bit-vector simple-bit-vector)
+                (and (= (length type) 2) (sizep (second type)))))))))
+
+(defun coerce-result-domain (build arguments)
+  ;; Copying an ordinary sequence preserves its elements, including logical
+  ;; records. It does not classify an opaque external aggregate's contents.
+  (let ((input (value-domain build (first arguments))))
+    (multiple-value-bind (target constantp) (quoted-value (second arguments))
+      (values (cond ((external-result-domain-p input) :external-result)
+                    ((and constantp (coerce-sequence-target-p target)) target)
+                    (t :unknown)) t))))
+
+(defun ordinary-call-argument-plan (build form)
+  "Use the existing ordered producer owner for every MVC tuple."
+  (case (car form)
+    (funcall (values (cddr form) nil t))
+    (apply
+     (let ((tail (car (last form))))
+       (cond ((and (consp tail) (eq (car tail) 'list))
+              (values (append (butlast (cddr form)) (cdr tail)) nil t))
+             ((and (consp tail) (eq (car tail) 'quote)
+                   (snowgrave::source-finite-list-p (second tail)))
+              (values (append (butlast (cddr form))
+                              (mapcar (lambda (value) (list 'quote value)) (second tail))) nil t)))))
+    (multiple-value-call
+     (multiple-value-bind (arguments bindings domains completep)
+         (multiple-value-call-plan build (cddr form) :literal-proofs nil)
+       (declare (ignore bindings))
+       (values arguments domains completep)))))
+
+(defun asserted-sequence-expression (build source expression)
+  ;; Export the already proved native shape to the host compiler. Without it
+  ;; COERCE may leave an unreachable extended-sequence/MOP branch in code.
+  (let ((domain (value-domain build source)))
+    `(the ,(cond ((subtype-domain-p build domain 'list) 'list)
+                 ((subtype-domain-p build domain 'vector) 'vector)
+                 (t '(or list vector))) ,expression)))
+
+(defun coerce-indirect-arguments (build form transformed)
+  "Annotate only the actual first argument; retain call/value producer order."
+  (multiple-value-bind (arguments domains completep) (ordinary-call-argument-plan build form)
+    (if (not completep) transformed
+        (let ((source (first arguments)) (*argument-domains* (append domains *argument-domains*)))
+          (case (car form)
+            (funcall (cons (asserted-sequence-expression build source (first transformed)) (cdr transformed)))
+            (apply
+             (cond ((cdr transformed)
+                    (cons (asserted-sequence-expression build source (first transformed)) (cdr transformed)))
+                   ((eq (car (car (last (cddr form)))) 'list)
+                    (let ((tail (first transformed)))
+                      (list (list* 'list (asserted-sequence-expression build source (second tail)) (cddr tail)))))
+                   (t transformed)))
+            (multiple-value-call
+             (let ((firstp t))
+               (mapcar (lambda (producer)
+                         (if (and firstp (cdr producer))
+                             (progn (setf firstp nil)
+                                    (list* 'values (asserted-sequence-expression build source (second producer))
+                                           (cddr producer))) producer)) transformed)))
+            (otherwise transformed))))))
+
+(defun ordinary-indirect-result-domain (build form)
+  (when (member (car form) '(funcall apply multiple-value-call))
+    (let ((targets (known-function-targets build (second form))))
+      (when (and targets (every (lambda (target) (member target '(fill coerce))) targets))
+        (multiple-value-bind (arguments domains completep) (ordinary-call-argument-plan build form)
+          (when completep
+            (let ((*argument-domains* (append domains *argument-domains*)))
+             (values (reduce (lambda (old target)
+                              (merge-value-domains build old
+                                (if (eq target 'coerce) (coerce-result-domain build arguments)
+                                    (value-domain build (first arguments)))))
+                            targets :initial-value :pending) t))))))))
+
 (defun audit-ordinary-operation (build name arguments local open &key variable-tail)
   "Apply one logical observation/callback policy to direct and indirect calls."
   (let ((equality-positions nil))
   (unless (member-name name local)
+    (when (eq name 'coerce)
+      (unless (and (not variable-tail) (= (length arguments) 2))
+        (fail build 'snowgrave:unclosed-call :coerce-arguments
+              "COERCE needs a complete object/target tuple."))
+      (multiple-value-bind (type constantp) (quoted-value (second arguments))
+        (unless (and constantp (coerce-sequence-target-p type))
+          (fail build 'snowgrave:unclosed-call :coerce-target
+                "COERCE admits only literal built-in sequence targets; FUNCTION, dynamic types and user type expanders need separate closure.")))
+      (unless (or open *collect-function-flow* (native-sequence-form-p build (first arguments)))
+        (fail build 'snowgrave:unclosed-call :coerce-sequence-domain
+              "COERCE needs an ordinary LIST/VECTOR input proof; extended sequence methods are not an intrinsic.")))
+    (when (and (eq name 'fill) (not open))
+      ;; FILL is an ordinary aggregate write with the same alias/state
+      ;; obligation as its element setter. This synthetic place is proof
+      ;; input only; the host FILL retains all actual evaluation, bounds,
+      ;; keyword, mutation and result-identity semantics.
+      (unless (>= (length arguments) 2)
+        (fail build 'snowgrave:unclosed-call :fill-arguments
+              "FILL needs a proved sequence/value prefix before its write can be audited."))
+      (audit-external-place-value build `(aref ,(first arguments) 0) (second arguments))
+      (unless (or *collect-function-flow* (native-sequence-form-p build (first arguments)))
+        (fail build 'snowgrave:unclosed-call :fill-sequence-domain
+              "FILL needs a proved ordinary list/vector receiver; host sequence extension methods are not implicit dependencies.")))
     (when (and (not open) (member name '(gethash remhash)))
       (when (and variable-tail (build-classes build) (< (length arguments) 2))
         (fail build 'snowgrave:unclosed-class-operation :record-hash-table-domain
@@ -741,7 +1035,7 @@ The stable key names its owner obligation, never a class or slot type."
 
 (defun captured-function (build variable)
   (let* ((definition (snowgrave:find-authored-definition (build-source build) :global variable))
-         (form (and definition (snowgrave:authored-definition-form definition))))
+         (form (and definition (normalized-definition-form build definition))))
     (when form
       (let ((initializer (caddr form)))
         (when (and (consp initializer) (eq (car initializer) 'load-time-value))
@@ -753,7 +1047,7 @@ The stable key names its owner obligation, never a class or slot type."
   (if (special-variable-p build variable) :unknown
       (let ((binding (assoc variable *function-bindings*)))
         (or (and binding (not (eq (cdr binding) :unknown)) (cdr binding))
-            (domain-function-target (cdr (assoc variable *argument-domains*)))
+            (domain-function-target (binding-value-domain variable))
             (if binding :unknown (captured-function build variable))))))
 
 (defun domain-function-target (domain)
@@ -772,6 +1066,17 @@ The stable key names its owner obligation, never a class or slot type."
   (loop while (and (consp form) (eq (car form) 'load-time-value))
         do (setf form (cadr form)))
   (when (and (consp form) (eq (car form) 'function)) form))
+
+(defun immediate-lambda-form (build call)
+  ;; Only this literal FUNCALL occurrence establishes its binding tuple. An
+  ;; escaping lambda or a separately stored/called closure gets no such fact.
+  (when (eq (car call) 'funcall)
+    (let ((callee (second call)))
+      (when (and (consp callee) (eq (car callee) 'function)) (setf callee (second callee)))
+      (when (and (consp callee) (eq (car callee) 'lambda))
+        (let ((contract (lambda-contract build (second callee))))
+          (unless (or (getf contract :optional) (getf contract :keyp) (getf contract :rest))
+            callee))))))
 
 (defun known-function-targets (build form)
   "Return a complete finite target set, or NIL when any alternative is unknown."
@@ -806,13 +1111,119 @@ The stable key names its owner obligation, never a class or slot type."
              (acons name (if specialp :unknown (cdr fact)) (cdr scope)))))
    :source-key (build-source-key build) :path (list (build-identity build)))))
 
+(defun source-mutations (forms)
+  "Collect conservative writes without using stale value/callable facts.
+Nested scopes may add extra obligations for a same-named outer binding, but
+can never hide a captured write or a write reached by a backedge."
+  (let ((result nil))
+    (labels ((write-to (place value)
+               (when (symbolp place) (push (cons place value) result)))
+             (walk (form)
+               (when (consp form)
+                 (case (car form)
+                   ((quote declare) nil)
+                   ((setq setf)
+                    (loop for (place value) on (cdr form) by #'cddr do
+                      (write-to place value) (unless (symbolp place) (walk place)) (walk value)))
+                   ((incf decf) (write-to (second form) '(+ 0)) (mapc #'walk (cddr form)))
+                   ((push pushnew) (write-to (third form) '(cons nil nil)) (mapc #'walk (cdr form)))
+                   (pop (write-to (second form) '(cdr nil)))
+                   (multiple-value-setq
+                    (dolist (variable (second form)) (write-to variable :unknown))
+                    (walk (third form)))
+                   (function (when (and (consp (second form)) (eq (caadr form) 'lambda))
+                               (walk (second form))))
+                   (otherwise (mapc #'walk form))))))
+      (mapc #'walk forms))
+    result))
+
+(defun numeric-declaration-type-p (type)
+  ;; Do not invoke an arbitrary user DEFTYPE/SATISFIES expander while proving
+  ;; an invariant. LOOP's ordinary numeric declarations include intersections.
+  (and (or (native-value-type-p type)
+           (and (consp type) (eq (car type) 'and) (cdr type)
+                (every #'numeric-declaration-type-p (cdr type))))
+       (subtypep type 'number)))
+
+(defun body-numeric-declarations (body)
+  (multiple-value-bind (prefix executable) (snowgrave::source-body-parts body)
+    (declare (ignore executable))
+    (loop for form in prefix when (and (consp form) (eq (car form) 'declare))
+          append (loop for declaration in (cdr form)
+                       for type = (if (eq (car declaration) 'type) (second declaration) (car declaration))
+                       for names = (if (eq (car declaration) 'type) (cddr declaration) (cdr declaration))
+                       when (numeric-declaration-type-p type) append (copy-list names)))))
+
+(defun mutable-binding-fact (name)
+  (let ((binding (assoc name *function-bindings*)))
+    (find-if (lambda (fact) (and (eq name (first fact)) (eq binding (second fact))))
+             *mutable-invariant-bindings*)))
+
+(defun binding-value-domain (name)
+  ;; Predicate refinement cannot restore an initial or path-local fact across
+  ;; an admitted write. Only the proved broad invariant survives for this
+  ;; exact binding; a shadowing binder gets an independent fact.
+  (let ((mutable (mutable-binding-fact name)))
+    (if mutable (third mutable) (or (cdr (assoc name *argument-domains*)) :unknown))))
+
+(defun source-body-flow-facts (build body)
+  "Invalidate assigned lexical value/callee facts before every body analysis.
+NUMBER/LIST are optional precision improvements, proved jointly against all
+writes under widened bindings. Failure widens to UNKNOWN, never rejects SETQ
+by itself. Existing consumers still demand their own representation/call proof."
+  (let* ((specials (body-special-domains body))
+         (domains (append specials (copy-tree *argument-domains*)))
+         (functions (append specials (copy-list *function-bindings*)))
+         (writes (source-mutations body))
+         (numeric (body-numeric-declarations body))
+         (invariants (copy-list *mutable-invariant-bindings*))
+         (candidates nil))
+    (dolist (name (remove-duplicates (mapcar #'car writes)))
+      (let ((fact (assoc name domains)))
+        (when (and fact (not (or (assoc name specials) (special-variable-p build name))))
+          (let* ((previous (binding-value-domain name))
+                 (domain (cond ((or (member name numeric) (subtype-domain-p build previous 'number)) 'number)
+                               ((subtype-domain-p build previous 'list) 'list)
+                               (t :unknown)))
+                 (binding (assoc name functions)))
+            ;; Do not mutate a captured outer alist cell. Keeping already
+            ;; unknown binding-cons identity preserves enclosing invariants.
+            (unless (and binding (eq (cdr binding) :unknown))
+              (setf functions (acons name :unknown (remove name functions :key #'car)))
+              (setf binding (assoc name functions)))
+            (setf (cdr fact) domain)
+            (let ((candidate (list name binding domain)))
+              (push candidate candidates) (push candidate invariants))))))
+    (let ((*argument-domains* domains) (*function-bindings* functions)
+          (*mutable-invariant-bindings* invariants))
+      ;; At most one widening per candidate. Recheck dependencies after any
+      ;; loss of precision; no assignment may borrow a failed neighbor's fact.
+      (loop with changed = nil do
+        (setf changed nil)
+        (dolist (candidate candidates)
+          (when (and (not (eq (third candidate) :unknown))
+                     (not (every (lambda (write)
+                                   (or (not (eq (car write) (first candidate)))
+                                       (subtype-domain-p build (value-domain build (cdr write))
+                                                         (third candidate)))) writes)))
+            (setf (third candidate) :unknown
+                  (cdr (assoc (first candidate) domains)) :unknown
+                  changed t)))
+        (unless changed (return))))
+    (values domains functions invariants (mapcar #'car specials))))
+
 (defmacro with-source-body-facts ((body) &body code)
-  (let ((specials (gensym "BODY-SPECIALS")))
-    `(let* ((,specials (body-special-domains ,body))
-            (*argument-domains* (append ,specials *argument-domains*))
-            (*function-bindings* (append ,specials *function-bindings*))
-            (*declared-specials* (append (mapcar #'car ,specials) *declared-specials*)))
-       ,@code)))
+  (let ((domains (gensym "BODY-DOMAINS")) (functions (gensym "BODY-FUNCTIONS"))
+        (invariants (gensym "BODY-INVARIANTS")) (specials (gensym "BODY-SPECIALS")))
+    `(multiple-value-bind (,domains ,functions ,invariants ,specials)
+         (source-body-flow-facts build ,body)
+       (let ((*argument-domains* ,domains) (*function-bindings* ,functions)
+             (*mutable-invariant-bindings* ,invariants)
+             (*declared-specials* (append ,specials *declared-specials*)))
+         ,@code))))
+
+(defun admitted-mutation-p (name)
+  (not (null (mutable-binding-fact name))))
 
 (defstruct (return-summary (:constructor make-return-summary (domains completep)))
   domains completep)
@@ -855,9 +1266,10 @@ The stable key names its owner obligation, never a class or slot type."
               (source-return-domains build executable #'form-return-summary)
               :initial-value (body-return-summary build executable)))))
 
-(defun lambda-return-summary (build lambda-list domains body &key method)
+(defun lambda-return-summary (build lambda-list domains body &key method lexical)
   ;; Methods and ordinary helpers share the same binding/escape analysis.
-  (let ((*argument-domains* nil) (*function-bindings* nil))
+  (let ((*argument-domains* (when lexical *argument-domains*))
+        (*function-bindings* (when lexical *function-bindings*)))
     (multiple-value-bind (scope ordinary initializers)
         (analyze-lambda-scope build lambda-list domains :method method :returns #'form-return-summary
                              :specials (body-special-domains body))
@@ -913,7 +1325,7 @@ This proves a branch, not a field declaration or arbitrary external alias ABI."
           (not (special-variable-p build (second test))))
      (multiple-value-bind (class quotedp) (quoted-value (third test))
        (if (and quotedp (or (member-name class (build-classes build)) (native-value-type-p class)))
-           (let ((previous (cdr (assoc (second test) *argument-domains*))))
+           (let ((previous (binding-value-domain (second test))))
              (acons (second test) (if (subtype-domain-p build previous class) previous class) *argument-domains*))
            *argument-domains*)))
     (t *argument-domains*)))
@@ -1034,7 +1446,14 @@ Unknown/native operations retain only their existing primary fact."
     ((member (car form) '(multiple-value-prog1 unwind-protect)) (form-return-summary build (cadr form)))
     ((member (car form) '(progn locally)) (body-return-summary build (cdr form)))
     ((eq (car form) 'block) (ordinary-return-summary build (cddr form)))
-    ((eq (car form) 'return-from) :pending)
+    ((member (car form) '(return-from go)) :pending)
+    ((eq (car form) 'tagbody) (make-return-summary (list '(eql nil)) t))
+    ((eq (car form) 'the)
+     (let ((summary (form-return-summary build (third form))))
+       (if (and (return-summary-p summary) (return-summary-domains summary))
+           (make-return-summary (cons (value-domain build form) (cdr (return-summary-domains summary)))
+                                (return-summary-completep summary))
+           summary)))
     ((and (eq (car form) 'error) (not (member-name 'error *value-domain-local-functions*))) :pending)
     ((and (eq (car form) 'call-next-method) *current-method* (null (cdr form)))
      (fourth *current-method*))
@@ -1076,6 +1495,11 @@ Unknown/native operations retain only their existing primary fact."
     ((eq (car form) 'destructuring-bind)
      (with-destructuring-source-facts (build form)
        (body-return-summary build (cdddr form))))
+    ((immediate-lambda-form build form)
+     (let ((lambda (immediate-lambda-form build form)))
+       (lambda-return-summary build (second lambda)
+                              (mapcar (lambda (argument) (value-domain build argument)) (cddr form))
+                              (cddr lambda) :lexical t)))
     ((and (build-function-returns build) (member (car form) '(funcall apply multiple-value-call)))
      (let ((targets (known-function-targets build (cadr form))))
        (if targets
@@ -1123,7 +1547,7 @@ Unknown/native operations retain only their existing primary fact."
        (cons (acons name (car fact) (car scope)) (acons name (cdr fact) (cdr scope)))))
    :source-key (build-source-key build) :path (list (build-identity build))))
 
-(defun multiple-value-call-plan (build producers)
+(defun multiple-value-call-plan (build producers &key (literal-proofs t))
   "Describe a finite complete producer tuple without executing its proof forms.
 Runtime bindings preserve each original producer; opaque domain facts feed the
 existing call audits. Literal VALUES keeps its stronger source-tree proofs."
@@ -1134,7 +1558,7 @@ existing call audits. Literal VALUES keeps its stronger source-tree proofs."
           (return-from multiple-value-call-plan (values nil nil nil nil)))
         (let* ((positions (return-summary-domains summary))
                (variables (loop repeat (length positions) collect (gensym "RETURNED-ARGUMENT")))
-               (literalp (and (consp producer) (eq (car producer) 'values))))
+               (literalp (and literal-proofs (consp producer) (eq (car producer) 'values))))
           (push (list variables producer) bindings)
           (loop for variable in variables for domain in positions
                 for literal = (when literalp (cdr producer)) then (cdr literal)
@@ -1293,12 +1717,18 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
         ((characterp form) 'character)
         ((or (keywordp form) (eq form t) (null form)) (list 'eql form))
         ((symbolp form) (if (special-variable-p build form) :unknown
-                           (or (cdr (assoc form *argument-domains*)) :unknown)))
+                           (binding-value-domain form)))
         ((and (consp form) (member (car form) '(progn locally)))
          (body-value-domain build (cdr form)))
         ((and (consp form) (eq (car form) 'block))
          (primary-return-domain build (cddr form)))
-        ((and (consp form) (eq (car form) 'return-from)) :pending)
+        ((and (consp form) (member (car form) '(return-from go))) :pending)
+        ((and (consp form) (eq (car form) 'tagbody)) '(eql nil))
+        ((and (consp form) (eq (car form) 'the))
+         (let ((input (value-domain build (third form))))
+           (values (cond ((external-result-domain-p input) :external-result)
+                         ((member (second form) '(list cons)) (second form))
+                         (t input)) t)))
         ((and (consp form) (eq (car form) 'if))
          (return-summary-primary (form-return-summary build form)))
         ((and (consp form) (eq (car form) 'next-method-p) *current-method*)
@@ -1337,7 +1767,10 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
          (if (and (snowgrave::source-name-p (second form))
                   (not (member-name (second form) *value-domain-local-functions*)))
              (list :function-target (second form)) :unknown))
-        ((and (consp form) (eq (car form) 'load-time-value)) (value-domain build (second form)))
+        ((and (consp form) (eq (car form) 'load-time-value))
+         (let ((*argument-domains* nil) (*function-bindings* nil)
+               (*declared-specials* nil) (*value-domain-local-functions* nil))
+           (value-domain build (second form))))
         ((and (consp form) (standard-operation-meaning-p build (car form))
               (member (car form) '(typep integerp rationalp floatp realp complexp stringp characterp
                                   vectorp arrayp symbolp consp listp endp null not keywordp numberp
@@ -1375,18 +1808,30 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                          ((subtype-domain-p build input 'string) 'string)
                          ((subtype-domain-p build input 'vector) 'vector)
                          (t :unknown)) t)))
+        ((and (consp form) (eq (car form) 'coerce)
+              (standard-operation-meaning-p build 'coerce))
+         (coerce-result-domain build (cdr form)))
+        ((and (consp form) (eq (car form) 'fill)
+              (standard-operation-meaning-p build 'fill))
+         ;; FILL returns its original sequence by identity. The value and
+         ;; bounds affect mutation, not the returned sequence's provenance.
+         (values (value-domain build (second form)) t))
         ((and (consp form) (eq (car form) 'make-instance))
          (multiple-value-bind (class constantp) (quoted-value (cadr form))
            (if (and constantp (member-name class (build-classes build))) class :unknown)))
-        ((and (consp form) (build-function-returns build)
-              (member (car form) '(funcall apply multiple-value-call)))
-         (let ((targets (known-function-targets build (cadr form))))
-           (if targets
-               (reduce (lambda (previous name)
-                         (merge-value-domains build previous
-                           (return-summary-primary (or (source-call-return-summary build name) :unknown))))
-                       targets :initial-value :pending)
-               :unknown)))
+        ((and (consp form) (immediate-lambda-form build form))
+         (return-summary-primary (form-return-summary build form)))
+        ((and (consp form) (member (car form) '(funcall apply multiple-value-call)))
+         (multiple-value-bind (ordinary precise-p) (ordinary-indirect-result-domain build form)
+           (if precise-p (values ordinary t)
+               (let ((targets (and (build-function-returns build)
+                                   (known-function-targets build (cadr form)))))
+                 (if targets
+                     (reduce (lambda (previous name)
+                               (merge-value-domains build previous
+                                 (return-summary-primary (or (source-call-return-summary build name) :unknown))))
+                             targets :initial-value :pending)
+                     :unknown)))))
         ((and (consp form) (source-call-return-summary build (car form)))
          (return-summary-primary (source-call-return-summary build (car form))))
         (t :unknown)))
@@ -1469,7 +1914,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
 (defun ordinary-function-form (build name)
   (when (and name (not (eq name :unknown)))
     (let ((definition (snowgrave:find-authored-definition (build-source build) :function name)))
-      (when definition (snowgrave:authored-definition-form definition)))))
+      (when definition (normalized-definition-form build definition)))))
 
 (defun call-lambda-domains (build lambda-list supplied variable-tail &key method specials)
   "Project raw caller facts through the shared lambda binding owner."
@@ -1599,6 +2044,9 @@ all call shapes of this generic, without a second applicability algorithm."
                        :reachability))))))))))
 
 (defun audit-function-capture (build name)
+  (when (member name '(fill coerce))
+    (fail build 'snowgrave:unclosed-call :ordinary-function-capture
+          "This ordinary operator needs a proved callable ABI before its unchecked host function can escape; use an audited immediate call."))
   (audit-generic-call-shape build name nil t nil)
   (audit-function-call build name nil :capture t))
 
@@ -1670,7 +2118,8 @@ all call shapes of this generic, without a second applicability algorithm."
   "Use the same mutation policy for single and multiple-value assignments."
   (dolist (place places)
     (when (and (symbolp place)
-               (or (and (assoc place *argument-domains*) (not (member place (source-specials build))))
+               (or (and (assoc place *argument-domains*) (not (member place (source-specials build)))
+                        (not (admitted-mutation-p place)))
                    (and (special-variable-p build place) (captured-function build place))
                    (let ((target (resolved-function build place))) (and target (not (eq target :unknown))))))
       (fail build 'snowgrave:unsupported-definition :value-domain-mutation
@@ -1865,13 +2314,33 @@ reflection, lexical rebinding and class values still require their own ABI."
                              :original original :local inner))))
       ((eq (car form) 'lambda)
        (multiple-value-bind (scope ordinary)
-           (analyze-lambda-scope build (cadr form) nil :package package :open open :local local
+           (analyze-lambda-scope build (cadr form)
+               (cdr (assoc form *immediate-lambda-domains*))
+               :package package :open open :local local
                                 :next next :original original
                                 :specials (body-special-domains (cddr form)))
         (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
          `(lambda ,ordinary
             ,@(when (source-specials build) (list `(declare (special ,@(source-specials build)))))
             ,@(body (cddr form))))))
+      ((eq (car form) 'tagbody)
+       (let* ((targets (loop for part in (cdr form) when (atom part)
+                             collect (cons part (gensym "LEXICAL-TAG"))))
+              (*tagbody-targets* (append targets *tagbody-targets*)))
+         `(tagbody ,@(mapcar (lambda (part)
+                              (if (atom part) (cdr (assoc part targets :test #'eql)) (walk part)))
+                            (cdr form)))))
+      ((eq (car form) 'go)
+       (let ((target (assoc (second form) *tagbody-targets* :test #'eql)))
+         (unless target
+           (fail build 'snowgrave:unsupported-definition :lexical-control
+                 "GO needs an enclosing normalized TAGBODY target."))
+         `(go ,(cdr target))))
+      ((eq (car form) 'the)
+       (unless (or (native-value-type-p (second form)) (member (second form) '(t list cons)))
+         (fail build 'snowgrave:unclosed-class-operation :type-assertion
+               "THE needs an admitted native type or explicit closed representation mapping."))
+       `(the ,(second form) ,(walk (third form))))
       ((member (car form) '(block return-from catch throw))
        `(,(car form) ,(if (member (car form) '(catch throw))
                          (walk (cadr form)) (cadr form))
@@ -1936,7 +2405,13 @@ reflection, lexical rebinding and class values still require their own ABI."
        (unless (reproducible-global-p build (cadr form))
          (fail build 'snowgrave:nonreproducible-source :load-time-capture
                "LOAD-TIME-VALUE must have a reproducible checked constant/function initializer."))
-       `(load-time-value ,(walk (cadr form)) ,@(cddr form)))
+       `(load-time-value
+          ,(let ((*argument-domains* nil) (*function-bindings* nil)
+                 (*declared-specials* nil) (*value-domain-local-functions* nil)
+                 (*mutable-invariant-bindings* nil) (*tagbody-targets* nil)
+                 (*current-method* nil))
+             (transform-form build (cadr form) package :open open))
+          ,@(cddr form)))
       ((member (car form) '(funcall apply multiple-value-call))
        (when (special-variable-p build (cadr form))
          (fail build 'snowgrave:unclosed-call :mutable-function-special
@@ -2005,8 +2480,17 @@ reflection, lexical rebinding and class values still require their own ABI."
              (when (eq name 'equalp)
                (setf equality-realization
                      (record-equality-realization build arguments :variable-tail variable-tail)))))))
-       (let ((callee (let ((*immediate-function-reference*
-                            (immediate-function-reference (cadr form))))
+       (let ((coerce-p (and (not open) (not *collect-function-flow*)
+                             (equal (known-function-targets build (cadr form)) '(coerce))))
+             (callee (let ((*immediate-function-reference*
+                            (immediate-function-reference (cadr form)))
+                           (*immediate-lambda-domains*
+                             (let ((lambda (immediate-lambda-form build form)))
+                               (if lambda
+                                   (acons lambda
+                                          (mapcar (lambda (argument) (value-domain build argument)) (cddr form))
+                                          *immediate-lambda-domains*)
+                                   *immediate-lambda-domains*))))
                        (walk (cadr form)))))
          (cond (value-bindings
                 (let* ((binding (gensym "VALUE-CALLEE"))
@@ -2014,7 +2498,11 @@ reflection, lexical rebinding and class values still require their own ABI."
                        (invocation
                          `(funcall ,(if (eq equality-realization :identity)
                                         `(if (eq ,binding #'equalp) #'eq ,binding) binding)
-                                   ,@(if mapping-plans (equality-arguments arguments mapping-plans binding) arguments))))
+                                   ,@(cond (coerce-p
+                                            (cons (asserted-sequence-expression build (first value-arguments) (first arguments))
+                                                  (cdr arguments)))
+                                           (mapping-plans (equality-arguments arguments mapping-plans binding))
+                                           (t arguments)))))
                   `(let ((,binding ,callee))
                      ,(reduce (lambda (body producer)
                                 `(multiple-value-bind ,(first producer) ,(walk (second producer)) ,body))
@@ -2029,7 +2517,9 @@ reflection, lexical rebinding and class values still require their own ABI."
                                     `(if (eq ,binding #'equalp) #'eq ,binding) binding)
                    ,@(if mapping-plans (call-equality-arguments form binding mapping-plans)
                          (body (cddr form)))))))
-               (t (let ((expression `(,(car form) ,callee ,@(body (cddr form))))
+               (t (let ((expression `(,(car form) ,callee
+                                         ,@(let ((arguments (body (cddr form))))
+                                             (if coerce-p (coerce-indirect-arguments build form arguments) arguments))))
                         (targets (known-function-targets build (cadr form))))
                     (if (and (not open) (= (length targets) 1))
                         (declared-external-result-expression build (first targets) expression) expression)))))))
@@ -2159,15 +2649,20 @@ reflection, lexical rebinding and class values still require their own ABI."
            (audit-generic-call build (car form) (cdr form))
            (audit-function-call build (car form) (cdr form))
            (audit-external-call build (car form) (cdr form)))
-         (if mapping-realization
+         (cond
+           ((and (eq (car form) 'coerce) (not open) (not *collect-function-flow*)
+                 (standard-operation-meaning-p build 'coerce local))
+            `(coerce ,(asserted-sequence-expression build (second form) (walk (second form)))
+                     ,(walk (third form))))
+           (mapping-realization
              `(,(target (car form))
                 ,@(equality-arguments (cdr form)
-                                     (mapcar (lambda (position) (list position (car form))) mapping-realization)))
-             (multiple-value-bind (callee fixedp)
+                                     (mapcar (lambda (position) (list position (car form))) mapping-realization))))
+           (t (multiple-value-bind (callee fixedp)
                  (direct-call-name build (car form) package open local (length (cdr form)))
                (let ((expression `(,callee ,@(body (cdr form)) ,@(when fixedp '(nil)))))
                  (if (or open (member-name (car form) local)) expression
-                     (declared-external-result-expression build (car form) expression)))))))
+                     (declared-external-result-expression build (car form) expression))))))))
       (t (fail build 'snowgrave:unsupported-definition :computed-operator
                "Computed operator forms are not in the audited source fragment.")))))
 
@@ -2341,6 +2836,52 @@ An unknown name makes that name and the remainder uncertain, never absent."
                 (list (car item) (mapped-name (cadr item) (build-open-package build)))
                 item)) lambda-list)))
 
+(defun map-slot-type-classes (build type package)
+  (cond ((and (symbolp type) (member-name type (build-classes build)))
+         (mapped-name type package))
+        ((consp type) (mapcar (lambda (part) (map-slot-type-classes build part package)) type))
+        (t type)))
+
+(defparameter *host-method-combinations*
+  '(standard + and append list max min nconc or progn))
+
+(defun authored-combination-name (build name)
+  (snowgrave:find-authored-definition (build-source build) :method-combination name))
+
+(defun open-generic-option (build option package)
+  (if (eq (car option) :method-combination)
+      (let ((name (second option)))
+        (cond ((authored-combination-name build name)
+               (list* :method-combination (mapped-name name package) (cddr option)))
+              ((member name *host-method-combinations*) option)
+              (t (fail build 'snowgrave:unsupported-definition :method-combination-provenance
+                       "A custom method combination needs its defining form in the ordered source unit."))))
+      option))
+
+(defun source-generic-combination (build generic)
+  (let* ((definition (snowgrave:find-authored-definition (build-source build) :generic generic))
+         (form (when definition (snowgrave:authored-definition-form definition)))
+         (option (assoc :method-combination (cdddr form))))
+    (if option (second option) 'standard)))
+
+(defun authored-short-combination-p (build name)
+  (let* ((definition (snowgrave:find-authored-definition (build-source build) :method-combination name))
+         (form (when definition (snowgrave:authored-definition-form definition))))
+    (and form (or (null (cddr form)) (keywordp (third form))))))
+
+(defun open-method-qualifiers (build generic qualifiers)
+  (let ((name (source-generic-combination build generic)))
+    (if (authored-short-combination-p build name)
+        (substitute (mapped-name name (build-open-package build)) name qualifiers :test #'eq)
+        qualifiers)))
+
+(defun source-method-qualifiers (build generic method)
+  (let ((name (source-generic-combination build generic))
+        (qualifiers (sb-mop:method-qualifiers method)))
+    (if (authored-short-combination-p build name)
+        (substitute name (mapped-name name (build-open-package build)) qualifiers :test #'eq)
+        qualifiers)))
+
 (defun open-definition (build form)
   (setf (build-source-key build) (authored-source-key build form))
   (let ((package (build-open-package build)))
@@ -2369,10 +2910,10 @@ An unknown name makes that name and the remainder uncertain, never absent."
                                            ((member option '(:initarg :documentation))
                                             (list option value))
                                            ((eq option :type)
-                                            (unless (snowgrave::explicit-slot-type-p value)
+                                            (unless (snowgrave::explicit-slot-type-p value (build-classes build))
                                               (fail build 'snowgrave:unsupported-definition :typed-slot
-                                                    "This slot type lacks an explicit numeric/vector declaration contract."))
-                                            (list option value))
+                                                    "This slot type lacks a numeric/vector or sealed class-reference contract."))
+                                            (list option (map-slot-type-classes build value package)))
                                            ((eq option :initform)
                                             (list option (transform-form build value package :open t)))
                                            ((eq option :allocation)
@@ -2389,7 +2930,13 @@ An unknown name makes that name and the remainder uncertain, never absent."
                                 (loop for (key value) on (cdr option) by #'cddr
                                       append (list key (transform-form build value package :open t)))) option))
                     (cddddr form))))
-      (:generic `(cl:defgeneric ,(mapped-name (cadr form) package) ,@(cddr form)))
+      (:method-combination
+       ;; Definition and registration remain in the host's method-combination
+       ;; machinery, under an isolated name with exact authored provenance.
+       `(cl:define-method-combination ,(mapped-name (cadr form) package) ,@(cddr form)))
+      (:generic `(cl:defgeneric ,(mapped-name (cadr form) package) ,(third form)
+                    ,@(mapcar (lambda (option) (open-generic-option build option package))
+                              (cdddr form))))
       (:method
        (multiple-value-bind (qualifiers lambda-list body) (method-parts form)
         (let ((*argument-domains* nil) (*function-bindings* nil))
@@ -2409,7 +2956,8 @@ An unknown name makes that name and the remainder uncertain, never absent."
              (fail build 'snowgrave:unclosed-class-operation :initialization-method-domain
                    "Initialization methods must be selected and specialize a disposable class, with a universal slot-names axis.")))
          `(cl:defmethod ,(if (initialization-generic-p (cadr form)) (cadr form)
-                             (mapped-name (cadr form) package)) ,@qualifiers
+                             (mapped-name (cadr form) package))
+              ,@(open-method-qualifiers build (cadr form) qualifiers)
               ,(append (map-specialized-lambda-list build (subseq lambda-list 0 required))
                        (nthcdr required ordinary))
             (declare (special ,@(source-specials build)))
@@ -2541,7 +3089,7 @@ An unknown name makes that name and the remainder uncertain, never absent."
 
 (defun authored-class-form (build class)
   (let ((definition (snowgrave:find-authored-definition (build-source build) :class (source-class build class))))
-    (and definition (snowgrave:authored-definition-form definition))))
+    (and definition (normalized-definition-form build definition))))
 
 (defun unique-authored-initializer (build candidates feature)
   ;; The MOP chooses the initializer function. Recover only that actual
@@ -2595,7 +3143,12 @@ not a second inheritance or initialization algorithm."
                     :class-token (snowgrave::class-identity-token (list (build-identity build) name :version 1) name)
                     :error-mapping (slot-error-mapping build class)
                     :slots (mapcar #'sb-mop:slot-definition-name slots)
-                    :slot-types (mapcar #'sb-mop:slot-definition-type slots)
+                    :slot-types (mapcar (lambda (slot)
+                                          (let ((type (restore-source-names build (sb-mop:slot-definition-type slot))))
+                                            (unless (snowgrave::explicit-slot-type-p type (build-classes build))
+                                              (fail build 'snowgrave:unsupported-definition :typed-slot
+                                                    "The effective slot type has no closed realization." :materialization))
+                                            type)) slots)
                     :slot-initargs (mapcar #'sb-mop:slot-definition-initargs slots)
                     :slot-initforms (mapcar (lambda (slot)
                                              (when (sb-mop:slot-definition-initfunction slot)
@@ -2795,11 +3348,48 @@ not a second inheritance or initialization algorithm."
     (list :generic generic :lambda-list (sb-mop:generic-function-lambda-list gf)
           :protocol :materialized-initialization :cells (nreverse descriptions))))
 
+(defun ensure-reference-domain (build)
+  (or (build-reference-domain-name build)
+      (when (some (lambda (layout)
+                    (some (lambda (type)
+                            (snowgrave::class-reference-slot-type-p type (build-classes build)))
+                          (getf layout :slot-types))) (build-layouts build))
+        (let ((name (fresh-name build "REFERENCE-DOMAIN")))
+          (push `(defparameter ,name
+                   (snowgrave:make-reference-domain ',(build-identity build) ',(build-layouts build)))
+                (build-generated build))
+          (setf (build-reference-domain-name build) name)))))
+
+(defun ensure-layout (build class)
+  (or (cdr (assoc class (build-layout-names build) :test #'name=))
+      (let* ((description (find class (build-layouts build)
+                                :key (lambda (layout) (getf layout :class)) :test #'name=))
+             (reference-domain (ensure-reference-domain build))
+             (name (fresh-name build "LAYOUT")))
+        (unless description (fail build 'snowgrave:unclosed-class-operation :layout-domain
+                                  "An exact layout needs an admitted class row." :materialization))
+        (push `(defparameter ,name
+                 (snowgrave:make-layout ',(getf description :identity) ',class
+                                        ',(getf description :ancestors) ',(getf description :slots)
+                                        :slot-types ',(getf description :slot-types)
+                                        ,@(when reference-domain `(:reference-domain ,reference-domain))
+                                        :error-mapping ',(getf description :error-mapping)))
+              (build-generated build))
+        (push (cons class name) (build-layout-names build))
+        name)))
+
+(defun ensure-admitted-layouts (build)
+  ;; Called before inference snapshots persistent generated state. Provision
+  ;; descriptors even when the unit never invokes any class's constructor.
+  (ensure-reference-domain build)
+  (dolist (description (build-layouts build))
+    (ensure-layout build (getf description :class))))
+
 (defun ensure-constructor (build class)
   (or (cdr (assoc class (build-constructors build) :test #'name=))
       (let* ((description (find class (build-layouts build) :key (lambda (layout) (getf layout :class)) :test #'name=))
              (name (fresh-name build "CONSTRUCTOR"))
-             (layout (fresh-name build "LAYOUT"))
+             (layout (ensure-layout build class))
              (arguments (fresh-name build "INITARGS"))
              (defaults (fresh-name build "DEFAULTS"))
              (record (fresh-name build "RECORD"))
@@ -2821,12 +3411,6 @@ not a second inheritance or initialization algorithm."
             (fail build 'snowgrave:unclosed-class-operation :initialization-cohort
                   "Authored construction requires both initialization protocol generics in the closed cohort." :materialization)))
         (push (cons class name) (build-constructors build))
-        (push `(defparameter ,layout
-                 (snowgrave:make-layout ',(getf description :identity) ',class
-                                        ',(getf description :ancestors) ',(getf description :slots)
-                                        :slot-types ',(getf description :slot-types)
-                                        :error-mapping ',(getf description :error-mapping)))
-              (build-generated build))
         (push `(defun ,name (&rest ,arguments)
                  (let ((,defaults nil))
                    ,@(mapcar
@@ -2872,7 +3456,7 @@ not a second inheritance or initialization algorithm."
       (and (name= (cadr form) generic)
            (multiple-value-bind (qualifiers lambda-list body) (method-parts form)
              (declare (ignore body))
-             (and (equal qualifiers (sb-mop:method-qualifiers method))
+             (and (equal qualifiers (source-method-qualifiers build generic method))
                   (equal
                    (mapcar (lambda (item)
                              (let ((specializer (if (consp item) (cadr item) 't)))
@@ -2903,11 +3487,13 @@ not a second inheritance or initialization algorithm."
 
 (defun method-logical-key (build generic method)
   (list (build-identity build) :method generic
-        (sb-mop:method-qualifiers method)
+        (source-method-qualifiers build generic method)
         (mapcar (lambda (specializer) (source-class build specializer)) (sb-mop:method-specializers method))))
 
 (defun method-source-key (build generic method form)
-  (let ((definition (snowgrave::authored-form-definition (build-source build) form)))
+  (let ((definition (snowgrave::authored-form-definition
+                     (build-source build)
+                     (gethash form (build-normalized-originals build) form))))
     (cond (definition (authored-source-key build form))
           ((typep method 'sb-mop:standard-accessor-method)
            ;; The actual accessor specializer identifies its class declaration.
@@ -3161,11 +3747,7 @@ class whitelist replaces their actual applicability behavior."
           (t (builtin-type-test build source parameter)))))
 
 (defun record-layout-test (build class parameter)
-  (let ((description (find class (build-layouts build) :key (lambda (layout) (getf layout :class)) :test #'name=)))
-    `(snowgrave:sg-record-layout-p ,parameter ',(getf description :identity) ',class
-                                    ',(getf description :ancestors) ',(getf description :slots)
-                                    :slot-types ',(getf description :slot-types)
-                                    :error-mapping ',(getf description :error-mapping))))
+  `(snowgrave:sg-record-matches-layout-p ,parameter ,(ensure-layout build class)))
 
 (defun record-type-test (build class parameter)
   `(or ,@(loop for layout in (build-layouts build)
@@ -3254,7 +3836,10 @@ class whitelist replaces their actual applicability behavior."
     (unless (eq (class-of gf) (find-class 'standard-generic-function))
       (fail build 'snowgrave:unsupported-definition :generic-function-class
             "Custom generic-function classes need an exact argument/applicability/error contract." :materialization))
-    (unless (typep (sb-mop:generic-function-method-combination gf) 'sb-pcl::standard-method-combination)
+    (unless (or (typep (sb-mop:generic-function-method-combination gf) 'sb-pcl::standard-method-combination)
+                (let ((name (source-generic-combination build generic)))
+                  (or (authored-combination-name build name)
+                      (member name *host-method-combinations*))))
       (fail build 'snowgrave:unsupported-definition :custom-method-combination
             "Custom combinations need their own audited normalized source extension." :materialization))
     (dolist (cell cells)
@@ -3310,7 +3895,7 @@ class whitelist replaces their actual applicability behavior."
           (push (list :classes (mapcar (lambda (class) (source-class build class)) cell)
                       :argument-contract argument-contract
                       :methods (mapcar (lambda (method)
-                                         (list (sb-mop:method-qualifiers method)
+                                         (list (source-method-qualifiers build generic method)
                                                (mapcar (lambda (specializer) (source-class build specializer))
                                                        (sb-mop:method-specializers method)))) applicable))
                 descriptions)))))))
@@ -3729,7 +4314,8 @@ This is hosted compiled-root evidence, not target or whole-image admission."
                   (when (or (builder-name-p name) (member-name name (build-classes build)))
                     (bad :compiled-authored-layout "A compiled type/layout constant still depends on an authored CLOS class."))
                   (unless (or (typep classoid 'sb-kernel:built-in-classoid)
-                              (member name '(snowgrave::record-layout snowgrave::closed-record restart)))
+                              (member name '(snowgrave::record-layout snowgrave::closed-record
+                                             snowgrave::reference-domain snowgrave::reference-schema restart)))
                     (bad :unadmitted-layout
                          (format nil "A compiled layout for ~S lacks an ordinary representation contract." name)))
                   (boundary :ordinary-representation-layout name)))
@@ -3741,7 +4327,24 @@ This is hosted compiled-root evidence, not target or whole-image admission."
                 (walk (snowgrave::record-layout-class object))
                 (walk (snowgrave::record-layout-ancestors object))
                 (walk (snowgrave::record-layout-slots object))
+                (walk (snowgrave::record-layout-slot-types object))
+                (walk (snowgrave::record-layout-row-token object))
+                (walk (snowgrave::record-layout-reference-domain object))
+                (walk (snowgrave::record-layout-reference-token object))
+                (walk (snowgrave::record-layout-reference-class-index object))
+                (walk (snowgrave::record-layout-reference-guards object))
                 (walk (snowgrave::record-layout-error-mapping object)))
+               ((snowgrave::reference-domain-p object)
+                (walk (snowgrave::reference-domain-token object))
+                (walk (snowgrave::reference-domain-schemas object))
+                (walk (snowgrave::reference-domain-guards object)))
+               ((snowgrave::reference-schema-p object)
+                (walk (snowgrave::reference-schema-identity object))
+                (walk (snowgrave::reference-schema-class object))
+                (walk (snowgrave::reference-schema-ancestors object))
+                (walk (snowgrave::reference-schema-slots object))
+                (walk (snowgrave::reference-schema-slot-types object))
+                (walk (snowgrave::reference-schema-error-mapping object)))
                ((snowgrave:sg-record-p object)
                 (walk (snowgrave::closed-record-layout object))
                 (walk (snowgrave::closed-record-values object))
@@ -3921,15 +4524,18 @@ implemented here. A nominal native class is never an imported graph proof."
   ;; Ordinary dispatch definitions contain direct calls to static methods,
   ;; so installing them does not need the method functions yet. Methods can
   ;; contain LOAD-TIME-VALUE captures of those generics or authored helpers.
-  ;; Install dispatchers first and method bodies last to give each capture
-  ;; the fresh ordinary binding that already existed in the open CLOS pass.
+  ;; Install cold descriptor cells before their dispatchers, and method bodies
+  ;; last so captures see the fresh ordinary bindings from the open CLOS pass.
   (labels ((rank (form)
-             (cond ((and (eq (car form) 'defun)
+             (cond ((and (eq (car form) 'defparameter)
+                         (or (eq (second form) (build-reference-domain-name build))
+                             (member (second form) (build-layout-names build) :key #'cdr))) 0)
+                   ((and (eq (car form) 'defun)
                          (some (lambda (generic)
                                  (equal (cadr form) (mapped-name generic (build-output-package build))))
-                               (getf (build-declaration build) :closed-generics))) 0)
-                   ((and (eq (car form) 'defun) (member (cadr form) (build-method-names build))) 2)
-                   (t 1))))
+                               (getf (build-declaration build) :closed-generics))) 1)
+                   ((and (eq (car form) 'defun) (member (cadr form) (build-method-names build))) 3)
+                   (t 2))))
     (stable-sort (copy-list forms) #'< :key #'rank)))
 
 (defun publish-special-values (values)
@@ -3961,6 +4567,7 @@ implemented here. A nominal native class is never an imported graph proof."
                    "A published unit identity cannot be reopened or reused." :declaration))
            (setf (build-source build) (snowgrave:make-authored-source (read-source source) :identity identity))
            (index-source build)
+           (normalize-authored-source build)
            (validate-external-value-contracts build)
            (validate-external-return-domains build)
            (compile-forms build
@@ -3970,6 +4577,10 @@ implemented here. A nominal native class is never an imported graph proof."
                           :open-pass :stage-specials (source-specials build))
            (obtain-layouts build)
            (setf (build-output-package build) (make-package output-name :use '(:cl)))
+           ;; Shared type data is persistent generation state. Establish it
+           ;; before the return-domain fixed point takes/discards scratch
+           ;; emissions, so a cached name can never outlive its definition.
+           (ensure-admitted-layouts build)
            (infer-function-domains build)
            (let* ((dispatch (mapcar (lambda (name) (emit-generic build name))
                                     (getf declaration :closed-generics)))
@@ -3981,6 +4592,13 @@ implemented here. A nominal native class is never an imported graph proof."
                                           (nreverse (build-generated build))))
                            (build-output-package build)))
                   (metadata (list :abi-version 3 :identity identity :entries entries
+                                  :source-normalization
+                                  '(:method :sbcl-lexical-host-macroexpansion
+                                    :snapshot :once-per-authored-definition
+                                    :pass-input :owned-sharing-preserving-graph
+                                    :source-keys :authored-definition-position)
+                                  :reference-domain (when (build-reference-domain-name build)
+                                                      (list :identity identity :schema-source :record-layouts))
                                   :record-layouts (build-layouts build) :dispatch dispatch
                                   :definitions (loop for form in forms when (eq (car form) 'defun)
                                                      collect (list :definition-key (list identity :definition
