@@ -693,21 +693,26 @@ The stable key names its owner obligation, never a class or slot type."
          (cons 'or (mapcar (lambda (part) (external-result-native-type build part)) (cdr domain))))
         (t domain)))
 
+(defun native-data-type-p (build domain)
+  ;; Shared scalar/storage geometry test; provenance is checked by callers.
+  (or (native-value-type-p domain)
+      (and (not (member domain '(:unknown :pending :external-result)))
+           (or (subtype-domain-p build domain 'number) (subtype-domain-p build domain 'symbol)
+               (subtype-domain-p build domain 'string) (subtype-domain-p build domain 'character)))))
+
 (defun native-data-domain-p (build domain)
   (when (relational-value-domain-p domain)
     (return-from native-data-domain-p (native-data-domain-p build (third domain))))
   (and (not (external-result-domain-p domain)) (not (owned-record-domain-p domain))
        (not (initializing-record-domain-p domain))
+       (not (and (graph-state-profile-p build) (graph-private-container-domain-p build domain)))
        (or (and (graph-node-domain-p domain) (native-data-domain-p build (third domain)))
            (external-value-domain-p build domain)
            (and (consp domain) (eq (car domain) 'or)
                 (every (lambda (part) (native-data-domain-p build part)) (cdr domain)))
            (and (consp domain) (eq (car domain) 'eql)
                 (or (numberp (cadr domain)) (symbolp (cadr domain)) (characterp (cadr domain))))
-           (native-value-type-p domain)
-           (and (not (eq domain :unknown))
-                (or (subtype-domain-p build domain 'number) (subtype-domain-p build domain 'symbol)
-                    (subtype-domain-p build domain 'string) (subtype-domain-p build domain 'character))))))
+           (native-data-type-p build domain))))
 
 (defun native-data-form-p (build form)
   (cond ((and (consp form) (eq (car form) 'quote)) (serializable-tree-p (cadr form)))
@@ -780,11 +785,17 @@ The stable key names its owner obligation, never a class or slot type."
          (audit-graph-native-inputs build (list value) :graph-state-write)
          (loop for argument in (cdr place) for position from 0
               unless (and (= position 0) (member (car place) '(aref svref car cdr nth))
-                          (native-sequence-form-p build argument))
+                          (native-sequence-form-p build argument)
+                          (not (graph-private-container-domain-p build (value-domain build argument))))
               do (audit-graph-native-inputs build (list argument) :graph-state-place)))))
   (when (and (not *collect-function-flow*)
              (or (build-classes build) (getf (build-declaration build) :closed-generics))
-             (external-result-domain-p (value-domain build value)))
+             (external-result-domain-p (value-domain build value))
+             ;; An exact captured value already has this installation's
+             ;; identity/custody. Its logical field store was type/slot-audited
+             ;; above; this is not an ABI for an opaque external return.
+             (not (and (graph-state-profile-p build) (consp place) (eq (first place) 'slot-value)
+                       (graph-captured-identity-domain-p build (value-domain build value)))))
     (fail build 'snowgrave:unclosed-call :external-result-state
           "An unclassified external result cannot be retained in closed or shared state without its value ABI." :reachability))
   (cond ((symbolp place) (audit-external-shared-value build place value))
@@ -843,6 +854,8 @@ The stable key names its owner obligation, never a class or slot type."
                            (or (every (lambda (argument) (native-data-form-p build argument)) arguments)
                                (scalar-equality-tuple-p build domains)
                                (every (lambda (domain) (record-domain-p build domain)) domains)
+                               (and (member name '(eq eql))
+                                    (every (lambda (domain) (graph-captured-identity-domain-p build domain)) domains))
                                (every #'identity cohort-callables)))))
         (fail build 'snowgrave:unclosed-call :external-logical-identity
               "Identity across an opaque external return or alias needs a logical value ABI; an original callable/record must not compare against its rewritten representative."
@@ -3241,10 +3254,10 @@ reflection, lexical rebinding and class values still require their own ABI."
          `(go ,(cdr target))))
       ((eq (car form) 'the)
        (when (and (not open) (not *collect-function-flow*) (graph-state-profile-p build)
-                  (graph-private-record-domain-p build (value-domain build (third form)))
+                  (graph-private-payload-domain-p build (value-domain build (third form)))
                   (not (subtype-domain-p build (value-domain build (third form)) (second form))))
          (fail build 'snowgrave:unclosed-class-operation :private-type-assertion-error
-               "A checked assertion could publish a private record as its failing TYPE-ERROR datum." :reachability))
+               "A checked assertion could publish private record payload as its failing TYPE-ERROR datum." :reachability))
        (unless (or (native-value-type-p (second form)) (member (second form) '(t list cons)))
          (fail build 'snowgrave:unclosed-class-operation :type-assertion
                "THE needs an admitted native type or explicit closed representation mapping."))

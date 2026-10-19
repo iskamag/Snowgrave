@@ -4339,6 +4339,7 @@
     (entry-graph-tests)
     (native-binding-context-tests)
     (graph-state-inference-tests)
+    (private-container-tests)
     (constructor-state-tests)
     (initialization-phase-tests)
     (relational-state-tests)

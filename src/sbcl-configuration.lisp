@@ -357,19 +357,13 @@ The existing literal pool consumes these cold node recipes for shell/fill."
             (build-graph-root-names build) (nreverse root-facts)
             (build-graph-root-references build) (nreverse root-references))
       (dolist (row (build-graph-nodes build))
-        (if (getf row :class)
-            (setf (getf row :slots)
-                  (mapcar (lambda (field)
-                            (list (first field) (second field)
-                                  (if (second field) (graph-value-fact build (third field)) :unknown)))
-                          (getf row :values)))
-            (setf (getf row :record-edge-p)
-                  (some (lambda (value)
-                          (let ((child (graph-source-node build value)))
-                            (and child (getf child :class) t)))
-                        (if (and (getf row :import-reference) (arrayp (getf row :source)))
-                            (mapcar #'cdr (getf row :native-links))
-                            (getf row :values))))))
+        (when (getf row :class)
+          (setf (getf row :slots)
+                (mapcar (lambda (field)
+                          (list (first field) (second field)
+                                (if (second field) (graph-value-fact build (third field)) :unknown)))
+                        (getf row :values)))))
+      (derive-graph-record-edges build)
       (when (build-graph-imports build)
         (let ((resource-name (fresh-name build "NATIVE-RESOURCES")))
           (setf (build-graph-resource-name build) resource-name)
@@ -469,22 +463,73 @@ The existing literal pool consumes these cold node recipes for shell/fill."
 
 (defun graph-state-profile-p (build) (not (null (build-graph-nodes build))))
 
+(defun derive-graph-record-edges (build)
+  "Close private payload reachability over the existing cold node inventory."
+  (let ((parents (make-hash-table :test #'eq)) (pending nil))
+    (labels ((edge (parent value)
+               (let ((child (graph-source-node build value)))
+                 (when child (push parent (gethash child parents))))))
+      (dolist (row (build-graph-nodes build))
+        (setf (getf row :record-edge-p) (not (null (getf row :class))))
+        (if (getf row :class)
+            (push row pending)
+            (progn
+              (dolist (value (if (and (getf row :import-reference) (arrayp (getf row :source)))
+                                (mapcar #'cdr (getf row :native-links))
+                                (getf row :values)))
+                (edge row value))
+              (when (getf row :backing) (edge row (getf row :backing))))))
+      (loop while pending for child = (pop pending) do
+        (dolist (parent (gethash child parents))
+          (unless (getf parent :record-edge-p)
+            (setf (getf parent :record-edge-p) t)
+            (push parent pending))))))
+  build)
+
+(defun graph-private-containers-p (build)
+  (some (lambda (row) (and (not (getf row :class)) (getf row :record-edge-p)))
+        (build-graph-nodes build)))
+
+(defun graph-private-container-domain-p (build domain)
+  ;; Shape cannot establish payload custody. Exact captured identities carry
+  ;; the cold closure proof; a lost/opaque identity is conservative whenever
+  ;; this installation can contain a private native aggregate. Source stores
+  ;; and aggregate construction cannot introduce further private edges.
+  (some (lambda (part)
+          (cond ((relational-value-domain-p part)
+                 (graph-private-container-domain-p build (third part)))
+                ((graph-node-domain-p part)
+                 (let ((row (graph-node-row build part)))
+                   (or (null row)
+                       (and (not (getf row :class))
+                            (multiple-value-bind (key value) (get-properties row '(:record-edge-p))
+                              (or (null key) value))))))
+                ((record-domain-p build part) nil)
+                ((native-data-type-p build (value-domain-shape build part)) nil)
+                (t (graph-private-containers-p build))))
+        (domain-alternatives domain)))
+
+(defun graph-captured-identity-domain-p (build domain)
+  ;; Joint capture/materialization preserves identity and distinctness for
+  ;; these exact unit values. This does not license recursive native EQUALP.
+  (every (lambda (part)
+           (if (relational-value-domain-p part)
+               (graph-captured-identity-domain-p build (third part))
+               (and (graph-node-domain-p part) (graph-node-row build part))))
+         (domain-alternatives domain)))
+
+(defun graph-private-payload-domain-p (build domain)
+  (or (graph-private-record-domain-p build domain)
+      (graph-private-container-domain-p build domain)))
+
 (defun prepare-graph-state-proof (build)
   ;; Conservative complete-source preservation, independent of reachability
   ;; guesses. A write invalidates captured value facts; an unbind additionally
   ;; invalidates boundness. Mutable scalar fields are never snapshot constants.
   (audit-graph-state-entry-profile build)
-  ;; Native sequence conditions can retain their receiver. The first state
-  ;; profile therefore admits no container edge into the private record graph.
-  ;; This marker is derived by the existing cold edge inventory, never supplied
-  ;; as an assertion by the caller. Missing evidence is not a false marker.
-  (dolist (row (build-graph-nodes build))
-    (unless (getf row :class)
-      (multiple-value-bind (key record-edge-p) (get-properties row '(:record-edge-p))
-        (unless (and key (not record-edge-p))
-          (fail build 'snowgrave:unclosed-class-operation :graph-state-container-closure
-                "A native container can appear in an error payload; this state profile needs its captured closure to exclude private records."
-                :reachability)))))
+  ;; Captured native containers may retain private records. Their transitive
+  ;; payload proof is consumed at observable operations, not a global ban on
+  ;; retaining an otherwise unused container in the private installation.
   (let ((writes nil) (unbinds nil))
     (labels ((invalidate (slot-form &optional unbindp)
                (multiple-value-bind (slot literalp) (quoted-value slot-form)
@@ -667,10 +712,15 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                      (and (= count 1)
                           (member name '(identity not null atom consp symbolp numberp integerp rationalp
                                          floatp realp complexp stringp characterp vectorp arrayp keywordp)))
-                     (and (= count 2) (member name '(eq eql equal equalp))))
+                     (and (= count 2) (member name '(eq eql equal equalp))
+                          (not (and (eq name 'equalp)
+                                    (some (lambda (argument)
+                                            (graph-private-container-domain-p build (value-domain build argument)))
+                                          arguments)))))
            (let ((receiver (native-sequence-argument-position name)))
              (loop for argument in arguments for position from 0
-                   unless (and receiver (= position receiver) (native-sequence-form-p build argument))
+                   unless (and receiver (= position receiver) (native-sequence-form-p build argument)
+                               (not (graph-private-container-domain-p build (value-domain build argument))))
                    do (audit-graph-native-inputs build (list argument) :graph-state-operation-input)))))))))
 
 (defun audit-graph-entry-result (build name)
@@ -724,7 +774,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                  (snowgrave::class-reference-slot-type-p type (build-classes build)))
         (fail build 'snowgrave:unclosed-call :external-result-state
               "An opaque native initarg has no closed class-reference slot ABI." :reachability))
-      (when (and (graph-private-record-domain-p build domain)
+      (when (and (graph-private-payload-domain-p build domain)
                  (not (subtype-domain-p build domain type)))
         (fail build 'snowgrave:unclosed-class-operation feature
               "A potentially private initializer datum needs proved slot-type acceptance before an error could publish it."
@@ -749,7 +799,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   (when (and (graph-state-profile-p build) (not *collect-function-flow*))
     (let ((targets (loop for slot in (getf layout :slots) for names in (getf layout :slot-initargs)
                          when (member key names) collect slot)))
-      (when (and (graph-private-record-domain-p build domain) (null targets))
+      (when (and (graph-private-payload-domain-p build domain) (null targets))
         (fail build 'snowgrave:unclosed-class-operation :construction-private-initarg
               "A potentially private initarg needs an accepted slot owner; an ignored key or custom keyword cannot borrow one."
               :reachability))
@@ -786,7 +836,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
             (setf plist (append plist (list (first default) domain))))))
       (when (and (not *collect-function-flow*)
                  (loop for tail on plist by #'cddr
-                       thereis (graph-private-record-domain-p build (second tail)))
+                       thereis (graph-private-payload-domain-p build (second tail)))
                  (not (getf protocol :allow))
                  (not (let ((allow (getf plist :allow-other-keys '(eql nil))))
                         (subtype-domain-p build allow '(not null))))

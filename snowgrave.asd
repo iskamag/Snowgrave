@@ -58,6 +58,7 @@
                (:file "tests/entry-graphs")
                (:file "tests/native-binding-contexts")
                (:file "tests/graph-state-inference")
+               (:file "tests/private-containers")
                (:file "tests/constructor-state")
                (:file "tests/initialization-phase")
                (:file "tests/relational-state")

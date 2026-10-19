@@ -108,17 +108,18 @@
            (lambda () (graph-state-close body forms (list entry)
                         (list (list entry (list (list 'eql root))))))
            (when (search "(fill (vector" body) :graph-state-operation-input)))))
-    ;; Captured native containers could themselves become bounds-condition
-    ;; receivers. Their closure must not contain a copied private record.
+    ;; A private container can remain behind the fixed configuration boundary
+    ;; without being passed to an operation/error/result boundary.
     (dolist (kind '(:vector :list))
       (let ((forms (list base (first (graph-state-forms "((defun entry (root) (eq root root)))")))))
         (dolist (definition forms) (eval definition))
         (let* ((root (make-instance (intern "HOLDER") :data nil))
                (container (ecase kind (:vector (vector root)) (:list (list root)))))
           (setf (slot-value root (intern "DATA")) container)
-          (graph-state-refuses
-           (lambda () (graph-state-close kind forms (list entry)
-                        (list (list entry (list (list 'eql root)))))) :graph-state-container-closure))))
+          (let ((unit (graph-state-close kind forms (list entry)
+                         (list (list entry (list (list 'eql root)))))))
+            (check (funcall (graph-state-fixed unit entry)))
+            (signals error (snowgrave:unit-function unit entry))))))
     ;; Globals and native operations are both observable authority boundaries.
     (dolist (kind '(:global :external))
       (let* ((extra (graph-state-forms
