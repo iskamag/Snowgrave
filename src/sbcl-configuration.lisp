@@ -454,7 +454,8 @@ The existing literal pool consumes these cold node recipes for shell/fill."
        (symbolp (second domain))))
 
 (defun private-record-domain-base (domain)
-  (cond ((initializing-record-domain-p domain) (third domain))
+  (cond ((relational-value-domain-p domain) (private-record-domain-base (third domain)))
+        ((initializing-record-domain-p domain) (third domain))
         ((graph-node-domain-p domain) (third domain))
         ((owned-record-domain-p domain) (second domain)) (t domain)))
 
@@ -525,38 +526,41 @@ The existing literal pool consumes these cold node recipes for shell/fill."
     (setf (build-graph-state-invalidations build) (list :writes writes :unbinds unbinds))))
 
 (defun private-record-slot-row (build domain)
-  (cond ((initializing-record-domain-p domain) (initialization-record-row domain))
+  (when (relational-value-domain-p domain)
+    (return-from private-record-slot-row (private-record-slot-row build (third domain))))
+  (cond ((initializing-record-domain-p domain)
+         (or (initialization-record-row domain) (original-record-flow-row build domain)))
         ((graph-node-domain-p domain) (graph-node-row build domain))
         ((owned-record-domain-p domain)
          (let ((layout (owned-record-layout build domain)))
            (when (getf layout :construction-state)
              (list :class (getf layout :class) :slots (getf layout :construction-state)))))))
 
+(defun record-slot-entry-fact (build domain slot)
+  ;; The field fact owner serves direct reads, generated readers and helper
+  ;; entry projection. Origin invalidation is identical for all three.
+  (let* ((row (private-record-slot-row build domain))
+         (field (assoc slot (getf row :slots)))
+         (currentp (initialization-domain-current-p domain)))
+    (when (and (getf row :class) field)
+      (let* ((prior (third field))
+             (invalidations (build-graph-state-invalidations build))
+             (status (if (and (not currentp) (member slot (getf invalidations :unbinds))) nil (second field)))
+             (value (if (and (not currentp) (member slot (getf invalidations :writes)))
+                        (merge-value-domains build (if (external-value-observation-p build prior)
+                                                      :external-result prior) :unknown)
+                        prior)))
+        (values status value t)))))
+
 (defun graph-record-slot-facts (build receiver slot)
   "Use the same read owner for exact captures and joined fresh-family facts."
   (let ((alternatives (domain-alternatives receiver)) (value :pending))
     (when alternatives
       (dolist (domain alternatives (values t value))
-        (let* ((row (private-record-slot-row build domain))
-               (field (assoc slot (getf row :slots))))
-          (unless (and (getf row :class) field (second field)
-                       (or (initialization-domain-current-p domain)
-                           (not (member slot (getf (build-graph-state-invalidations build) :unbinds)))))
-            (return (values nil :unknown)))
-          (let* ((prior (third field))
-                 ;; A possible write invalidates value/shape facts, but cannot
-                 ;; erase native origin already retained by the field. Once
-                 ;; its exact owner relation is lost, a guarded native value
-                 ;; has the same conservative observation boundary as an
-                 ;; unclassified native result.
-                 (current (if (and (not (initialization-domain-current-p domain))
-                                   (member slot (getf (build-graph-state-invalidations build) :writes)))
-                              (merge-value-domains build
-                                                   (if (external-value-observation-p build prior)
-                                                       :external-result prior)
-                                                   :unknown)
-                              prior)))
-            (setf value (merge-value-domains build value current))))))))
+        (multiple-value-bind (status current presentp) (record-slot-entry-fact build domain slot)
+          (when (eq status :pending) (return (values nil :pending)))
+          (unless (and presentp (eq status t)) (return (values nil :unknown)))
+          (setf value (merge-value-domains build value current)))))))
 
 (defun record-slot-read-domain (build receiver-form slot-form)
   ;; Authored reads and MOP-generated readers use this one fact owner. A class
@@ -564,7 +568,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   (multiple-value-bind (slot literalp) (quoted-value slot-form)
     (if literalp
         (multiple-value-bind (boundp domain) (graph-record-slot-facts build (value-domain build receiver-form) slot)
-          (values (if boundp domain :unknown) boundp))
+          (values (if (or boundp (eq domain :pending)) domain :unknown) boundp))
         (values :unknown nil))))
 
 (defun audit-graph-state-entry-profile (build)
@@ -592,8 +596,19 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   (some (lambda (part)
           ;; The opaque envelope also covers clean alternatives joined with
           ;; native returns. One such alternative may be a private record.
-          (cond ((member part '(:pending :unknown :external-result)) t)
-                ((or (owned-record-domain-p part) (initializing-record-domain-p part)) t)
+          (cond ((relational-value-domain-p part)
+                 (graph-private-record-domain-p build (third part)))
+                ((member part '(:pending :unknown :external-result)) t)
+                ((owned-record-domain-p part) t)
+                ((initializing-record-domain-p part)
+                 ;; A relational formal adds identity to an ordinary caller
+                 ;; view; it does not turn a disjoint nominal selected cell
+                 ;; into a private allocation. Actual initializer shells have
+                 ;; no such origin and always retain private custody.
+                 (let ((origin (find (second part) *flow-record-origins* :key #'second :test #'eq)))
+                   (if origin
+                       (or (fifth origin) (graph-private-record-domain-p build (fourth origin)))
+                       t)))
                 ((graph-node-domain-p part)
                  (let ((row (graph-node-row build part)))
                    (or (null row) (not (null (getf row :class))))))
@@ -606,14 +621,12 @@ The existing literal pool consumes these cold node recipes for shell/fill."
         (domain-alternatives domain)))
 
 (defun private-record-slot-present-p (build domain slot)
-  ;; Presence alone is phase-independent. In initialization methods a nominal
-  ;; receiver must never borrow the normal-return family's boundness/value.
-  (let ((row (private-record-slot-row build domain)))
-    (if row (not (null (assoc slot (getf row :slots))))
-        (let ((layouts (remove-if-not
-                        (lambda (layout) (subtype-domain-p build (getf layout :class) domain))
-                        (build-layouts build))))
-          (and layouts (every (lambda (layout) (member slot (getf layout :slots))) layouts))))))
+  ;; Presence is a class/layout property even for a joined formal state row.
+  ;; The row's union of keys cannot invent a slot on another alternative.
+  (let* ((base (private-record-domain-base domain))
+         (layouts (remove-if-not (lambda (layout) (subtype-domain-p build (getf layout :class) base))
+                                 (build-layouts build))))
+    (and layouts (every (lambda (layout) (member slot (getf layout :slots))) layouts))))
 
 (defun audit-graph-record-slot (build receiver-form slot-form &key bound)
   (when (and (graph-state-profile-p build) (not *collect-function-flow*)
@@ -643,7 +656,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
        (audit-graph-record-slot build (first arguments) (second arguments) :bound t))
       ((eq name 'snowgrave::%record-write)
        (audit-graph-record-slot build (first arguments) (second arguments))
-       (audit-graph-native-inputs build (list (third arguments)) :graph-state-write))
+       (audit-stored-record-value build (first arguments) (second arguments) (value-domain build (third arguments))))
       ((member name *ordinary-operations*)
        (let ((count (length arguments)))
          (unless (or (eq name 'values)
@@ -692,6 +705,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
         (*mutable-invariant-bindings* nil) (*declared-specials* nil)
         (*current-method* nil) (*effective-return-proof* nil) (*fixed-effective-arguments* nil)
         (*initialization-phase* nil) (*initialization-next* nil) (*initialization-plan* nil)
+        (*flow-record-origins* nil) (*flow-value-receipts* nil)
         (*immediate-callee-value* nil) (*generated-class-operation* nil)
         (*tagbody-targets* nil) (*immediate-lambda-domains* nil))
     (with-build-source-key (build (getf initializer :source-key)) (funcall process))))
@@ -700,7 +714,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   (call-in-initializer-environment build initializer
     (lambda () (value-domain build (getf initializer :form)))))
 
-(defun audit-construction-slot-domain (build layout slot domain)
+(defun audit-record-slot-value-domain (build layout slot domain &optional (feature :construction-private-type-error))
   ;; SG-RECORD-WRITE's TYPE-ERROR retains VALUE, not just a nominal type.
   ;; An existing private object therefore needs actual acceptance proof.
   (when (and (graph-state-profile-p build) (not *collect-function-flow*))
@@ -712,9 +726,24 @@ The existing literal pool consumes these cold node recipes for shell/fill."
               "An opaque native initarg has no closed class-reference slot ABI." :reachability))
       (when (and (graph-private-record-domain-p build domain)
                  (not (subtype-domain-p build domain type)))
-        (fail build 'snowgrave:unclosed-class-operation :construction-private-type-error
+        (fail build 'snowgrave:unclosed-class-operation feature
               "A potentially private initializer datum needs proved slot-type acceptance before an error could publish it."
               :reachability)))))
+
+(defun audit-construction-slot-domain (build layout slot domain)
+  (audit-record-slot-value-domain build layout slot domain))
+
+(defun audit-stored-record-value (build receiver slot-form domain)
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*))
+    (multiple-value-bind (slot literalp) (quoted-value slot-form)
+      (unless literalp
+        (fail build 'snowgrave:unclosed-class-operation :dynamic-slot
+              "A stored record field needs its constant slot owner." :reachability))
+      (dolist (layout (validate-record-slot build receiver slot))
+        (unless (member slot (getf layout :slots))
+          (fail build 'snowgrave:unclosed-class-operation :graph-state-slot-read
+                "A stored field must exist on every possible private receiver." :reachability))
+        (audit-record-slot-value-domain build layout slot domain :graph-state-write)))))
 
 (defun audit-construction-initarg-domain (build layout key domain)
   (when (and (graph-state-profile-p build) (not *collect-function-flow*))
@@ -741,11 +770,11 @@ The existing literal pool consumes these cold node recipes for shell/fill."
         (return-from source-construction-domain :unknown))
       (loop for (key value) on arguments by #'cddr
             for domain = (value-domain build value)
-            do (when (some #'initializing-record-domain-p (domain-alternatives domain))
+            do (when (active-initialization-shell-p domain)
                  (fail build 'snowgrave:unclosed-class-operation :initialization-activation-escape
                        "A constructor cannot retain an enclosing symbolic initialization receiver without activation transport." :reachability))
                (audit-construction-initarg-domain build layout key domain)
-               (setf plist (append plist (list key domain))))
+               (setf plist (append plist (list key (persistent-record-flow-domain domain)))))
       ;; GET-PROPERTIES below mirrors the materializer's first-occurrence
       ;; selection across all accepted names. Every initializer is still
       ;; emitted/audited by its original owner, including omitted profiles.

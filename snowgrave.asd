@@ -20,7 +20,8 @@
   :serial t
   :components ((:file "src/sbcl-adapter")
                (:file "src/sbcl-configuration")
-               (:file "src/sbcl-initialization")))
+               (:file "src/sbcl-initialization")
+               (:file "src/sbcl-relational")))
 
 (asdf:defsystem "snowgrave/tests"
   :depends-on ("snowgrave/sbcl")
@@ -59,6 +60,7 @@
                (:file "tests/graph-state-inference")
                (:file "tests/constructor-state")
                (:file "tests/initialization-phase")
+               (:file "tests/relational-state")
                (:file "tests/native-materialization"))
   :perform (asdf:test-op (operation component)
              (declare (ignore operation component))

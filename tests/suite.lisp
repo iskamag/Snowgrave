@@ -4341,6 +4341,7 @@
     (graph-state-inference-tests)
     (constructor-state-tests)
     (initialization-phase-tests)
+    (relational-state-tests)
     (native-materialization-tests)
     (binding-owner-tests)
     (lambda-scope-tests)

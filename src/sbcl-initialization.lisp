@@ -3,18 +3,22 @@
 ;;;; Receiver-scoped initialization continuation proof. These cells are cold.
 
 (defstruct initialization-phase
-  key class slots
+  key class slots records aliases relationalp
   (selection :unknown))
 
 (defun initializing-record-domain-p (domain)
   (and (consp domain) (eq (first domain) :initializing-record)
        (snowgrave::source-finite-list-p domain) (= (length domain) 3)
-       (symbolp (second domain)) (symbolp (third domain))))
+       (symbolp (second domain))
+       (or (symbolp (third domain))
+           (and (consp (third domain)) (eq (first (third domain)) 'or)
+                (snowgrave::source-finite-list-p (third domain)) (every #'symbolp (rest (third domain)))))))
 
 (defun erase-initialization-domain (domain)
   ;; A scoped symbolic receiver is not a singleton, constructor result or
   ;; persistent helper input. Outside its carrier only its nominal class stays.
-  (cond ((initializing-record-domain-p domain) (third domain))
+  (cond ((relational-value-domain-p domain) (erase-initialization-domain (third domain)))
+        ((initializing-record-domain-p domain) (third domain))
         ((and (consp domain) (eq (first domain) 'or))
          (cons 'or (mapcar #'erase-initialization-domain (rest domain))))
         (t domain)))
@@ -38,21 +42,38 @@
     (list :initializing-record (initialization-phase-key *initialization-phase*)
           (initialization-phase-class *initialization-phase*))))
 
+(defun initialization-domain-record (domain)
+  (when (relational-value-domain-p domain)
+    (return-from initialization-domain-record (initialization-domain-record (third domain))))
+  (when (and *initialization-phase* (initializing-record-domain-p domain))
+    (or (when (eq (second domain) (initialization-phase-key *initialization-phase*))
+          (list nil (second domain) (third domain)))
+        (find (second domain) (initialization-phase-records *initialization-phase*)
+              :key #'second :test #'eq))))
+
 (defun initialization-domain-current-p (domain)
-  (and *initialization-phase* (initializing-record-domain-p domain)
-       (eq (second domain) (initialization-phase-key *initialization-phase*))))
+  (not (null (initialization-domain-record domain))))
+
+(defun initialization-field-key (record slot)
+  (if (first record) (list :formal (first record) slot) slot))
 
 (defun initialization-record-row (domain)
-  (when (and (initialization-domain-current-p domain)
-             (listp (initialization-phase-slots *initialization-phase*)))
-    (list :class (initialization-phase-class *initialization-phase*)
-          :slots (mapcar (lambda (field) (list (first field) (eq (second field) t) (third field)))
-                         (initialization-phase-slots *initialization-phase*)))))
+  (let ((record (initialization-domain-record domain)))
+    (when (and record (listp (initialization-phase-slots *initialization-phase*)))
+      (list :class (third record)
+            :slots (loop for field in (initialization-phase-slots *initialization-phase*)
+                         when (if (first record)
+                                  (and (consp (first field)) (= (second (first field)) (first record)))
+                                  (symbolp (first field)))
+                         collect (list (if (first record) (third (first field)) (first field))
+                                       (second field) (third field)))))))
 
 (defun copy-initialization-state ()
   (when *initialization-phase* (copy-tree (initialization-phase-slots *initialization-phase*))))
 
 (defun forget-initialization-state ()
+  (when (and *initialization-phase* (initialization-phase-relationalp *initialization-phase*))
+    (setf *flow-unknown-effect* t))
   (when (and *initialization-phase* (listp (initialization-phase-slots *initialization-phase*)))
     (setf (initialization-phase-slots *initialization-phase*)
           (mapcar (lambda (field) (list (first field) nil :external-result))
@@ -64,7 +85,9 @@
   (unless (and (listp left) (listp right))
     (return-from join-initialization-states :unknown-control))
   (mapcar (lambda (a b)
-            (list (first a) (if (eq (second a) (second b)) (second a) nil)
+            (list (first a) (cond ((eq (second a) :pending) (second b))
+                                  ((eq (second b) :pending) (second a))
+                                  ((eq (second a) (second b)) (second a)))
                   (merge-value-domains build (third a) (third b)))) left right))
 
 (defun call-with-initialization-state (state process)
@@ -73,24 +96,41 @@
     (let ((result (funcall process)))
       (values result (copy-initialization-state)))))
 
+(defun initialization-record-alias-relation (build domain target)
+  ;; One alias owner for local stores and instantiated callee effects. Distinct
+  ;; formal keys are not automatically distinct runtime objects: the joined
+  ;; caller relation is authoritative. Class overlap includes sealed MI rows.
+  (let ((record (initialization-domain-record domain)))
+    (cond ((and record (eq (second record) (second target))) :must)
+          ((and record (first record) (first target))
+           (let ((pair (find-if (lambda (pair)
+                                 (or (and (= (first pair) (first record)) (= (second pair) (first target)))
+                                     (and (= (second pair) (first record)) (= (first pair) (first target)))))
+                               (initialization-phase-aliases *initialization-phase*))))
+             (third pair)))
+          ((member (relational-base domain) '(:pending :unknown :external-result)) :may)
+          ((record-flow-domains-overlap-p build domain (third target)) :may))))
+
 (defun phase-slot-update (build receiver slot status value)
-  (let* ((domain (value-domain build receiver)) (alternatives (domain-alternatives domain)))
-    (when (and (some (lambda (part)
-                       (or (initialization-domain-current-p part)
-                           (member part '(:pending :unknown))
-                           (subtype-domain-p build (initialization-phase-class *initialization-phase*)
-                                             (private-record-domain-base part))
-                           (subtype-domain-p build (private-record-domain-base part)
-                                             (initialization-phase-class *initialization-phase*)))) alternatives)
-               (listp (initialization-phase-slots *initialization-phase*)))
-      (let ((field (assoc slot (initialization-phase-slots *initialization-phase*))))
-        (when field
-          (if (and (symbolp receiver) (not (special-variable-p build receiver))
-                   (every #'initialization-domain-current-p alternatives))
-              (setf (second field) status (third field) value)
-              ;; A possible alias does not prove which receiver was written.
-              (setf (second field) (if (eq (second field) status) status nil)
-                    (third field) (merge-value-domains build (third field) value))))))))
+  (let* ((domain (value-domain build receiver)) (alternatives (domain-alternatives domain))
+         (records (or (initialization-phase-records *initialization-phase*)
+                      (when (initialization-phase-key *initialization-phase*)
+                        (list (list nil (initialization-phase-key *initialization-phase*)
+                                    (initialization-phase-class *initialization-phase*)))))))
+    (when (and (initialization-phase-relationalp *initialization-phase*)
+               (not (every #'initialization-domain-current-p alternatives)))
+      (setf *flow-unknown-effect* t))
+    (when (listp (initialization-phase-slots *initialization-phase*))
+      (dolist (record records)
+        (let* ((relations (mapcar (lambda (part) (initialization-record-alias-relation build part record)) alternatives))
+               (strongp (and (symbolp receiver) (not (special-variable-p build receiver))
+                             (every (lambda (relation) (eq relation :must)) relations)))
+               (field (assoc (initialization-field-key record slot)
+                             (initialization-phase-slots *initialization-phase*) :test #'equal)))
+          (when (and (some #'identity relations) field)
+            (if strongp (setf (second field) status (third field) value)
+                (setf (second field) (if (eq (second field) status) status nil)
+                      (third field) (merge-value-domains build (third field) value)))))))))
 
 (defun initialization-effectful-form-p (build form)
   (and (consp form) (not (member (first form) '(quote function lambda)))
@@ -123,11 +163,18 @@
                                        (lambda-positional-variables contract))
                                 (lambda-key-variables contract))))
       (let ((before (copy-initialization-state)))
-        (multiple-value-bind (code omitted-state)
-            (call-with-initialization-state before process)
-          (setf (initialization-phase-slots *initialization-phase*)
-                (join-initialization-states build before omitted-state))
-          code))
+        (let ((receipt nil))
+         (multiple-value-bind (code omitted-state)
+            (call-with-initialization-state before
+              (lambda () (multiple-value-bind (code fact) (funcall process)
+                           (setf receipt fact) code)))
+          (let ((mode (when (and *flow-input-row* (initialization-phase-relationalp *initialization-phase*))
+                        (nth (position name (lambda-input-variables contract))
+                             (record-flow-input-modes *flow-input-row*)))))
+            (setf (initialization-phase-slots *initialization-phase*)
+                  (case mode (:omitted omitted-state) (:supplied before)
+                        (t (join-initialization-states build before omitted-state)))))
+          (values code receipt))))
       (funcall process)))
 
 (defun call-with-initialization-branches (build test then-process else-process &optional local)
@@ -212,11 +259,13 @@
                                         mapcar mapc mapcan maplist mapl mapcon reduce
                                         find find-if position position-if remove remove-if delete delete-if
                                         sort stable-sort merge)))))
-       (when unknown-call-p (forget-initialization-state))
+       (when (and unknown-call-p (not (record-flow-owned-call-p build form)))
+         (forget-initialization-state))
        (let ((code (funcall emit)))
          ;; Actual callees run after their arguments. An argument's write
          ;; therefore cannot survive an unproved callee effect on the record.
-         (when unknown-call-p (forget-initialization-state))
+         (when (and unknown-call-p (not (record-flow-owned-call-p build form)))
+         (forget-initialization-state))
          (when unbinding
            (phase-slot-update build (second form) (second (third form)) :unbound :unknown))
          (when (member (first form) '(incf decf push pushnew pop))
@@ -311,26 +360,36 @@
                                  (let ((*effective-return-proof* t)) (form-return-summary build summary))))
                        code))))
                (domains (method-binding-domains build generic lambda-list body)))
-          (setf (first domains) (initialization-receiver-domain))
+          (if (initialization-phase-relationalp *initialization-phase*)
+              (setf domains (record-flow-body-domains domains))
+              (setf (first domains) (initialization-receiver-domain)))
           ;; Return proof uses the input snapshot, never the later poststate.
           ;; Missing continuation facts remain conservative, not a value proof.
-          (setf proof (erase-initialization-summary
+          (unless (initialization-phase-relationalp *initialization-phase*)
+           (setf proof (erase-initialization-summary
                        (if (and *collect-function-flow* (member :pending domains)) :pending
-                           (lambda-return-summary build lambda-list domains body :method t))))
+                           (lambda-return-summary build lambda-list domains body :method t)))))
           (multiple-value-bind (scope ordinary)
               (analyze-lambda-scope build lambda-list domains :package (build-output-package build)
                                    :method t :specials (body-special-domains body) :original parameters)
             (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
               (push name (build-method-names build))
-              (push `(defun ,name ,parameters
-                       (apply (lambda ,ordinary
-                                ,@(when (source-specials build) (list `(declare (special ,@(source-specials build)))))
-                                ,@(loop while (and body (consp (first body)) (eq (caar body) 'declare))
-                                        collect (transform-form build (pop body) (build-output-package build)))
-                                (block ,generic
-                                  ,@(transform-body build body (build-output-package build)
-                                                    :original parameters))) ,(first parameters)))
-                    (build-generated build)))))))
+              (let ((declarations (loop while (and body (consp (first body)) (eq (caar body) 'declare))
+                                        collect (transform-form build (pop body) (build-output-package build)))))
+                (multiple-value-bind (code receipt)
+                    (transform-body build body (build-output-package build) :original parameters)
+                  (when (initialization-phase-relationalp *initialization-phase*)
+                    ;; Analyze every selected body and dependency now, but a
+                    ;; not-yet-known caller cannot publish its provisional
+                    ;; value/effect state into the monotone return join.
+                    (setf proof (if (and *collect-function-flow* (member :pending domains)) :pending receipt)))
+                  (push `(defun ,name ,parameters
+                           (,(if *fixed-effective-arguments* 'funcall 'apply)
+                            (lambda ,ordinary
+                              ,@(when (source-specials build) (list `(declare (special ,@(source-specials build)))))
+                              ,@declarations (block ,(if (consp generic) (second generic) generic) ,@code))
+                            ,@(if *fixed-effective-arguments* parameters (list (first parameters)))))
+                        (build-generated build)))))))))
     (when (and next-methods (not next-called-p))
       ;; Retain selected tail obligations even if the authored method skips
       ;; its continuation. Its effects do not reach the caller in that case.
