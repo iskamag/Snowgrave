@@ -62,6 +62,7 @@
                (:file "tests/cold-method-combinations")
                (:file "tests/open-host-operations")
                (:file "tests/cold-integer-initializers")
+               (:file "tests/slot-place-normalization")
                (:file "tests/entry-graphs")
                (:file "tests/native-binding-contexts")
                (:file "tests/graph-state-inference")

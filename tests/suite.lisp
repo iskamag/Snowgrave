@@ -4341,6 +4341,7 @@
   (cold-method-combination-tests)
   (open-host-operation-tests)
   (cold-integer-initializer-tests)
+  (slot-place-normalization-tests)
     (entry-graph-tests)
     (native-binding-context-tests)
     (graph-state-inference-tests)

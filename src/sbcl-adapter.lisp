@@ -55,6 +55,8 @@
 (defvar *cold-recipe-active* nil)
 (defvar *cold-recipe-functions* nil)
 
+(defparameter *standard-slot-setter-function* (fdefinition 'sb-pcl::set-slot-value))
+
 (defparameter *standard-miss-methods*
   (loop for (name specializers) in '((no-next-method (standard-generic-function standard-method))
                                     (no-applicable-method (t)))
@@ -270,6 +272,19 @@ all other expansions re-enter the same admission and residual audits."
                 (values (walk `(let ((,cell ,(second form)) (,value ,(third form)))
                                  (setf (,(if (eq (car form) 'rplaca) 'car 'cdr) ,cell) ,value)
                                  ,cell) env) t)))
+             ((and (eq (car form) 'sb-pcl::set-slot-value)
+                   (not (nth-value 1 (sb-cltl2:function-information (car form) env)))
+                   (standard-operation-meaning-p build (car form))
+                   (fboundp (car form))
+                   (eq (fdefinition (car form)) *standard-slot-setter-function*))
+              ;; The host's generalized-place expansion (ROTATEF, SHIFTF,
+              ;; etc.) uses object/name/value order for this exact setter.
+              ;; Return to the shared SLOT-VALUE place owner, preserving that
+              ;; order and every effect instead of admitting a native CLOS call.
+              (unless (= (length form) 4)
+                (fail build 'snowgrave:unsupported-definition :host-slot-setter-shape
+                      "The pinned host slot setter requires object, slot name and value."))
+              (values (walk `(setf (slot-value ,(second form) ,(third form)) ,(fourth form)) env) t))
              ((eq (car form) 'sb-kernel:the*)
               ;; SBCL supplies a walker macrofunction even though THE* is a
               ;; special operator. USE-ANNOTATIONS is PROGN, not a LIST cast.
