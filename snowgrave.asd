@@ -68,6 +68,7 @@
                (:file "tests/graph-state-inference")
                (:file "tests/private-containers")
                (:file "tests/constructor-state")
+               (:file "tests/callable-payloads")
                (:file "tests/initialization-phase")
                (:file "tests/relational-state")
                (:file "tests/native-materialization"))

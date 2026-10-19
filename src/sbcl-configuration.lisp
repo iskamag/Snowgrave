@@ -505,6 +505,9 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                             (multiple-value-bind (key value) (get-properties row '(:record-edge-p))
                               (or (null key) value))))))
                 ((record-domain-p build part) nil)
+                ;; A qualified function target cannot be a cons/array, even
+                ;; when this installation also owns a private container.
+                ((domain-function-target part) nil)
                 ((native-data-type-p build (value-domain-shape build part)) nil)
                 (t (graph-private-containers-p build))))
         (domain-alternatives domain)))
@@ -518,9 +521,29 @@ The existing literal pool consumes these cold node recipes for shell/fill."
                (and (graph-node-domain-p part) (graph-node-row build part))))
          (domain-alternatives domain)))
 
+(defun graph-private-callable-domain-p (build domain)
+  ;; A condition can publish a relocated callable just as it can publish a
+  ;; private record. Exact non-cohort targets keep their unchanged native
+  ;; binding; a nominal FUNCTION fact alone establishes no such identity.
+  (some (lambda (part)
+          (cond ((relational-value-domain-p part)
+                 (graph-private-callable-domain-p build (third part)))
+                ((graph-node-domain-p part)
+                 (graph-private-callable-domain-p build (third part)))
+                ((external-value-domain-p build part) nil)
+                ((domain-function-target part)
+                 (let ((name (domain-function-target part)))
+                   (or (member-name name (build-functions build))
+                       (member-name name (getf (build-declaration build) :closed-generics)))))
+                ((member part '(:unknown :pending :external-result)) t)
+                (t (or (subtype-domain-p build part 'function)
+                       (subtype-domain-p build 'function part)))))
+        (domain-alternatives domain)))
+
 (defun graph-private-payload-domain-p (build domain)
   (or (graph-private-record-domain-p build domain)
-      (graph-private-container-domain-p build domain)))
+      (graph-private-container-domain-p build domain)
+      (graph-private-callable-domain-p build domain)))
 
 (defun prepare-graph-state-proof (build)
   ;; Conservative complete-source preservation, independent of reachability
@@ -766,7 +789,8 @@ The existing literal pool consumes these cold node recipes for shell/fill."
 
 (defun audit-record-slot-value-domain (build layout slot domain &optional (feature :construction-private-type-error))
   ;; SG-RECORD-WRITE's TYPE-ERROR retains VALUE, not just a nominal type.
-  ;; An existing private object therefore needs actual acceptance proof.
+  ;; A private record/container or relocated callable therefore needs actual
+  ;; acceptance proof; a source callable's native fcell is not its emitted one.
   (when (and (graph-state-profile-p build) (not *collect-function-flow*))
     (let* ((index (position slot (getf layout :slots)))
            (type (nth index (getf layout :slot-types))))
@@ -777,7 +801,7 @@ The existing literal pool consumes these cold node recipes for shell/fill."
       (when (and (graph-private-payload-domain-p build domain)
                  (not (subtype-domain-p build domain type)))
         (fail build 'snowgrave:unclosed-class-operation feature
-              "A potentially private initializer datum needs proved slot-type acceptance before an error could publish it."
+              "A private or relocated datum needs proved slot-type acceptance before an error could publish it."
               :reachability)))))
 
 (defun audit-construction-slot-domain (build layout slot domain)
