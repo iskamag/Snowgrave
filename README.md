@@ -12,4 +12,4 @@ With this directory registered with ASDF:
 (asdf:test-system "snowgrave")
 ```
 
-The original paper snapshot remains in `paper/`.
+The [specification](paper/README.md) is in `paper/`.
