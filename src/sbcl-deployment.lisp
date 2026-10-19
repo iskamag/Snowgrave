@@ -103,3 +103,83 @@
                                 :reason :unreachable-from-deployment-roots))
           :proof :shared-call-capture-and-construction-fixed-point
           :cell-coverage :whole-sealed-partition-of-each-retained-generic)))
+
+;;;; Implicit callable authority in native generic errors.
+
+(defun generic-error-private-classes (build domain)
+  ;; A captured node or freshly constructed record has one exact layout.
+  ;; An initializing receiver carries identity/state, but its class fact can
+  ;; still be nominal (a base-specialized method also accepts subclasses).
+  (cond ((relational-value-domain-p domain)
+         (generic-error-private-classes build (third domain)))
+        ((graph-node-domain-p domain) (list (third domain)))
+        ((owned-record-domain-p domain) (list (second domain)))
+        ((or (initializing-record-domain-p domain)
+             (member-name domain (build-classes build)))
+         (let ((base (if (initializing-record-domain-p domain) (third domain) domain)))
+           (remove-if-not (lambda (class) (subtype-domain-p build class base))
+                          (build-classes build))))))
+
+(defun generic-error-axis-possible-p (build domain cell axis)
+  ;; Reflect the ordered emitted CELL-TEST guards, not only method
+  ;; specialization overlap. Private guards test an exact layout; native
+  ;; guards test TYPEP. UNKNOWN remains conservative.
+  (some
+   (lambda (part)
+     (let ((classes (generic-error-private-classes build part)))
+       (if classes
+           (some (lambda (class)
+                   (name= cell
+                          (find-if
+                           (lambda (guard)
+                             (if (member-name guard (build-classes build))
+                                 (name= class guard)
+                                 (subtype-domain-p build class guard))) axis)))
+                 classes)
+           (and (nth-value 1 (intersect-method-cell-domain build part cell))
+                (not (loop for earlier in axis until (name= earlier cell)
+                           thereis (and (not (member-name earlier (build-classes build)))
+                                        (subtype-domain-p build part earlier))))))))
+   (domain-alternatives domain)))
+
+(defun generic-miss-has-program-caller-p (build generic)
+  ;; Capture rows are retained arbitrary-body obligations, not evidence that
+  ;; this error executes. Keep raw actual tuples: projected method bindings
+  ;; have already forgotten arity and dispatch alternatives.
+  (let ((shapes (gethash generic (build-generic-call-shapes build))))
+    (when shapes
+      (loop for key being the hash-keys of shapes using (hash-value input)
+            thereis
+            (destructuring-bind (capture variable-tail count literal-names) key
+              (declare (ignore literal-names))
+              (and (not capture)
+                   (or variable-tail (>= count (length *cell-domains*)))
+                   (or (null *cell-axis-domains*)
+                       (let ((domains (if (record-flow-input-p input)
+                                          (record-flow-positional-inputs input) input)))
+                         (loop for cell in *cell-domains* for axis in *cell-axis-domains*
+                               for position from 0
+                               always (generic-error-axis-possible-p
+                                       build (if (< position count) (nth position domains) :unknown)
+                                       cell axis))))))))))
+
+(defun audit-generic-minimum-arity (build generic required count capture)
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*)
+             (not capture) (< count required))
+    ;; An unknown APPLY tail may be empty. A statically expanded complete
+    ;; tuple has already passed through the shared call/lambda binder.
+    (fail build 'snowgrave:unclosed-call :graph-state-generic-authority
+          (format nil "A possible short call to ~S exposes its relocated generic in the native arity condition."
+                  generic) :reachability)))
+
+(defun audit-standard-generic-authority (build generic)
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*)
+             (or (initialization-generic-p generic)
+                 (generic-miss-has-program-caller-p build generic)))
+    ;; Native miss conditions and their retry restart retain the generic.
+    ;; Unknown-input body auditing does not establish an external result or
+    ;; effect ABI for that callable. Initialization root phases include
+    ;; retention placeholders, so they cannot discharge this obligation.
+    (fail build 'snowgrave:unclosed-call :graph-state-generic-authority
+          (format nil "A possible standard miss of ~S exposes relocated callable authority without a public calling contract."
+                  generic) :reachability)))

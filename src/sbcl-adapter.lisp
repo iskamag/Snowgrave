@@ -11,6 +11,7 @@
 (defvar *builder-counter* 0)
 (defvar *argument-domains* nil)
 (defvar *cell-domains* nil)
+(defvar *cell-axis-domains* nil)
 (defvar *function-bindings* nil)
 (defvar *generated-class-operation* nil)
 (defvar *current-method* nil)
@@ -2858,6 +2859,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                                 (when (and (consp domain) (eq (car domain) 'eql) (symbolp (second domain))) domain))
                               (nthcdr required actual))))
            (shapes (gethash name (build-generic-call-shapes build))))
+      (audit-generic-minimum-arity build name required (length actual) capture)
       ;; Presence is also the deployment reachability fact. A call below
       ;; required arity still needs this generic's exact error implementation.
       (when (and (entry-rooted-deployment-p build) *collect-function-flow* (null shapes))
@@ -4915,6 +4917,7 @@ not a second inheritance or initialization algorithm."
 
 (defun emit-standard-miss (build operation generic method arguments)
   (verify-standard-miss build operation generic method)
+  (audit-standard-generic-authority build generic)
   (let* ((nextp (eq operation 'no-next-method))
          ;; A computed list belongs to this one miss invocation. Bind it once
          ;; before condition/restart creation, preserving its identity and
@@ -5250,7 +5253,9 @@ class whitelist replaces their actual applicability behavior."
     ;; or caches a method, combination or class at runtime.
     (validate-generic-protocol build generic gf)
     (dolist (cell cells)
-      (let ((*cell-domains* (mapcar (lambda (class) (source-class build class)) cell)))
+      (let ((*cell-domains* (mapcar (lambda (class) (source-class build class)) cell))
+            (*cell-axis-domains* (mapcar (lambda (axis)
+                                           (mapcar (lambda (class) (source-class build class)) axis)) axes)))
        (multiple-value-bind (applicable certainp)
           (sb-mop:compute-applicable-methods-using-classes gf cell)
         (unless certainp
@@ -5262,6 +5267,9 @@ class whitelist replaces their actual applicability behavior."
           (setf (gethash applicable verified-lists) t))
         (if (null applicable)
             (progn
+              ;; A shared fixed miss function can serve several cells; each
+              ;; call site still needs its own actual-row feasibility proof.
+              (audit-standard-generic-authority build generic)
               (when (and fixed-arity (null fixed-miss))
                 (setf fixed-miss (fresh-name build "STANDARD-MISS"))
                 (push fixed-miss (build-method-names build))
@@ -5605,6 +5613,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
           :native-custody :installation-owner-maintains-geometry-and-aliases
           :record-custody :private-installed-copy
           :entry-binding :explicit-zero-argument-fixed-roots
+          :implicit-generic-authority :possible-native-error-exposure-refused
           :installation :one-incarnation-per-identity)))
 
 (defun residual-source-audit (build forms)
