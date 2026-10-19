@@ -5,7 +5,7 @@
 
 (defun deployed-generics (build)
   ;; The declaration seals the complete authored world. In entry-rooted mode,
-  ;; table presence records an actual call/capture dependency, even when its
+  ;; table presence records a call, capture or named identity dependency, even when its
   ;; normal argument-shape set is empty (for example, a short-arity call).
   (remove-if-not
    (lambda (name)
@@ -144,6 +144,16 @@
                                         (subtype-domain-p build part earlier))))))))
    (domain-alternatives domain)))
 
+(defun generic-call-row-possible-p (build domains variable-tail count)
+  "Whether a raw caller tuple can reach the current ordered dispatch cell."
+  (and (or variable-tail (>= count (length *cell-domains*)))
+       (or (null *cell-axis-domains*)
+           (loop for cell in *cell-domains* for axis in *cell-axis-domains*
+                 for position from 0
+                 always (generic-error-axis-possible-p
+                         build (if (< position count) (nth position domains) :unknown)
+                         cell axis)))))
+
 (defun map-generic-program-call-inputs (build generic process)
   ;; Capture rows are retained arbitrary-body obligations, not evidence that
   ;; this error executes. Keep raw actual tuples: projected method bindings
@@ -155,14 +165,7 @@
             (destructuring-bind (capture variable-tail count literal-names &optional native-payloads) key
               (declare (ignore literal-names))
               (let ((domains (if (record-flow-input-p input) (record-flow-positional-inputs input) input)))
-                (when (and (not capture)
-                           (or variable-tail (>= count (length *cell-domains*)))
-                           (or (null *cell-axis-domains*)
-                               (loop for cell in *cell-domains* for axis in *cell-axis-domains*
-                                     for position from 0
-                                     always (generic-error-axis-possible-p
-                                             build (if (< position count) (nth position domains) :unknown)
-                                             cell axis))))
+                (when (and (not capture) (generic-call-row-possible-p build domains variable-tail count))
                   (funcall process domains variable-tail native-payloads))))))))
 
 (defun generic-miss-has-program-caller-p (build generic)

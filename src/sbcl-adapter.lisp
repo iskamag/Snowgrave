@@ -122,7 +122,7 @@
   (sequence 0) (dependencies nil) (source-key nil) (integer-constants nil)
   (literal-pools nil)
   (literal-states (make-hash-table :test #'eq))
-  function-domains function-returns generic-call-shapes function-flow-evidence
+  function-domains function-returns generic-call-shapes function-flow-evidence function-values
   (graph-index (make-hash-table :test #'eq))
   graph-nodes graph-imports graph-root-names graph-root-references graph-resource-name
   graph-state-invalidations
@@ -3050,7 +3050,10 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
          (let ((domains (if (record-flow-input-p input) (record-flow-positional-inputs input) input)))
           (destructuring-bind (capture variable-tail count literal-names &optional native-payloads) key
            (declare (ignore literal-names native-payloads))
-           (let ((supplied nil) (compatiblep t))
+           (let ((supplied nil)
+                 (compatiblep (or capture (initialization-generic-p generic)
+                                  (not (configured-callable-retention-p build))
+                                  (generic-call-row-possible-p build domains variable-tail count))))
              (loop for cell in *cell-domains* for position from 0
                    do (multiple-value-bind (fact possiblep)
                           (if (or capture (initialization-generic-p generic)
@@ -3380,7 +3383,7 @@ reflection, lexical rebinding and class values still require their own ABI."
              (let ((binding (find-local-function-binding (second form))))
                (unless (or open (eq form *immediate-callee-value*))
                  (if binding (audit-local-function-capture build binding)
-                     (audit-function-capture build (second form)))))
+                     (retain-named-callable build (second form)))))
              `(function ,(target (cadr form))))))
       ((eq (car form) 'declare)
        ;; Closed class type declarations must not enter the host compiler as
@@ -5653,6 +5656,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
     (when (graph-state-profile-p build) (prepare-graph-state-proof build))
     (setf (build-function-domains build) (make-hash-table :test #'equal)
           (build-function-returns build) (make-hash-table :test #'equal)
+          (build-function-values build) (make-hash-table :test #'equal)
           (build-generic-call-shapes build) (make-hash-table :test #'equal))
     (unwind-protect
          (progn
@@ -5696,6 +5700,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
              ;; An unsolved recursive component is not a usable type fact.
              ;; Widen it to unknown and propagate that fact before final audit.
              (unless *function-flow-changed*
+               (settle-retained-callables build)
                (maphash (lambda (name domains)
                           (when (member :pending (flow-input-domains domains))
                             (if (record-flow-input-p domains)
@@ -5741,6 +5746,10 @@ and class audits with the fixed point. Unknown captures poison the proof."
                        :generic-return-method :same-emitted-effective-method-proof-tree
                        :generic-binding-method :raw-call-shapes-through-shared-lambda-owner
                        :callable-identity-facts :finite-named-source-target-unions
+                       :retained-named-values
+                       (sort (loop for name being the hash-keys of (build-function-values build)
+                                   collect (snowgrave::function-name-key name))
+                             #'string< :key #'prin1-to-string)
                        :unresolved-return-domain :unknown
                        :escaping-capture-domain :arbitrary-callers
                        :generic-call-bindings

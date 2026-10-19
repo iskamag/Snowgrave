@@ -4351,6 +4351,8 @@
     (private-container-tests)
     (constructor-state-tests)
     (callable-payload-tests)
+    (callable-retention-tests)
+    (callable-retention-dormant-tests)
     (physical-type-input-tests)
     (generic-error-authority-tests)
     (place-update-input-tests)

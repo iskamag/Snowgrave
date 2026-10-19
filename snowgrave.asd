@@ -25,7 +25,8 @@
                (:file "src/sbcl-edge-envelopes")
                (:file "src/sbcl-deployment")
                (:file "src/sbcl-parser-inputs")
-               (:file "src/sbcl-cold-source")))
+               (:file "src/sbcl-cold-source")
+               (:file "src/sbcl-callable-retention")))
 
 (asdf:defsystem "snowgrave/tests"
   :depends-on ("snowgrave/sbcl")
@@ -72,6 +73,7 @@
                (:file "tests/private-containers")
                (:file "tests/constructor-state")
                (:file "tests/callable-payloads")
+               (:file "tests/callable-retention")
                (:file "tests/physical-type-inputs")
                (:file "tests/generic-error-authority")
                (:file "tests/place-update-inputs")
