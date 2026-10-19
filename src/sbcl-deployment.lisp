@@ -112,7 +112,9 @@
   ;; still be nominal (a base-specialized method also accepts subclasses).
   (cond ((relational-value-domain-p domain)
          (generic-error-private-classes build (third domain)))
-        ((graph-node-domain-p domain) (list (third domain)))
+        ((graph-node-domain-p domain)
+         (let ((class (getf (graph-node-row build domain) :class)))
+           (when class (list class))))
         ((owned-record-domain-p domain) (list (second domain)))
         ((or (initializing-record-domain-p domain)
              (member-name domain (build-classes build)))
