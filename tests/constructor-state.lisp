@@ -133,6 +133,12 @@
     "(declare (ignore root)) (length (the list (make-instance 'node)))" nil :refusal :private-type-assertion-error)
   (constructor-state-case :captured-the "((defclass node () ()))"
     "(length (the list root))" nil :refusal :private-type-assertion-error)
+  (constructor-state-case :mixed-private-native-the "((defclass node () ()))"
+    "(null (the list (if (zerop (length (slot-value root 'data)))
+                         (snowgrave.tests::constructor-state-opaque 'node)
+                         (make-instance 'node))))"
+    nil :refusal :private-type-assertion-error
+    :external-operations '(constructor-state-opaque))
   (constructor-state-case :secondary "((defclass node () ()))"
     "(declare (ignore root)) (values 17 (make-instance 'node))" nil :refusal :graph-state-result)
   (constructor-state-case :callback-escape "((defclass node () ()))"

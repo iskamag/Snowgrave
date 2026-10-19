@@ -586,7 +586,9 @@ The existing literal pool consumes these cold node recipes for shell/fill."
   ;; ordinary slot/error semantics. A broad base class can still hold a
   ;; captured subclass and therefore cannot borrow this disjointness proof.
   (some (lambda (part)
-          (cond ((member part '(:pending :unknown)) t)
+          ;; The opaque envelope also covers clean alternatives joined with
+          ;; native returns. One such alternative may be a private record.
+          (cond ((member part '(:pending :unknown :external-result)) t)
                 ((owned-record-domain-p part) t)
                 ((graph-node-domain-p part)
                  (let ((row (graph-node-row build part)))
