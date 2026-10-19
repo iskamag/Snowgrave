@@ -30,6 +30,7 @@
                (:file "tests/authored-combinations")
                (:file "tests/vector-constants")
                (:file "tests/literal-identity")
+               (:file "tests/native-literal-graphs")
                (:file "tests/predicate-refinement")
                (:file "tests/partition-factorization")
                (:file "tests/external-results")

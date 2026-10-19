@@ -54,11 +54,16 @@
                               (when (and common (not (eq common x)))
                                 (pushnew (cons (package-name package) (symbol-name x)) shadows
                                          :test #'equal))))))
-                       ((or (consp x) (simple-vector-p x))
+                       ((or (consp x) (arrayp x))
                         (unless (gethash x seen)
                           (setf (gethash x seen) t)
                           (if (consp x) (progn (collect (car x)) (collect (cdr x)))
-                              (loop for part across x do (collect part))))))))
+                              (multiple-value-bind (parent offset) (array-displacement x)
+                                (declare (ignore offset))
+                                (if parent (collect parent)
+                                    (unless (null (array-element-type x))
+                                      (dotimes (index (array-total-size x))
+                                        (collect (row-major-aref x index))))))))))))
         (collect (closed-unit-source unit))
         ;; Metadata can mention exported source names absent from emitted code,
         ;; such as an entry whose zero-argument body is a scalar constant.

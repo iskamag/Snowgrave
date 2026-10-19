@@ -2238,7 +2238,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
   (cond ((and *effective-return-proof* (return-summary-p form)) (return-summary-primary form))
         ((numberp form) (type-of form))
         ((stringp form) 'string)
-        ((simple-vector-p form) 'simple-vector)
+        ((arrayp form) (type-of form))
         ((characterp form) 'character)
         ((or (keywordp form) (eq form t) (null form)) (list 'eql form))
         ((symbolp form) (if (special-variable-p build form) :unknown
@@ -2788,13 +2788,13 @@ reflection, lexical rebinding and class values still require their own ABI."
       ((symbolp form)
        (if (member form (build-globals build)) (global-binding-name build form package open) form))
       ((atom form)
-       (if (or (stringp form) (simple-vector-p form))
+       (if (arrayp form)
            (literal-reference build form package) form))
       ((eq (car form) 'quote)
-       (unless (serializable-tree-p (cadr form))
+       (unless (serializable-literal-graph-p (cadr form) (build-literal-states build))
          (fail build 'snowgrave:residual-metaobject :quoted-object
-               "Only ordinary readable scalar/list constants are admitted."))
-       (if (or (consp (cadr form)) (stringp (cadr form)) (simple-vector-p (cadr form)))
+               "Literal graphs need readable native scalar, cons and array nodes."))
+       (if (or (consp (cadr form)) (arrayp (cadr form)))
            (literal-reference build (cadr form) package) form))
       ((eq (car form) 'function)
        (if (and (consp (cadr form)) (eq (caadr form) 'lambda))
@@ -3334,6 +3334,42 @@ class, function, displaced backing or arbitrary array is hidden by this test."
                      (t nil))))
     (walk value)))
 
+(defun serializable-literal-graph-p (value &optional (states (make-hash-table :test #'eq)))
+  "Validate a finite readable native graph, including shared and cyclic edges.
+Only a complete successful traversal publishes memoized facts. Stable names,
+declarations and compiler receipts keep their separate acyclic tree grammar."
+  (let ((seen (make-hash-table :test #'eq)) (displacements (make-hash-table :test #'eq))
+        (nodes nil) (pending (list value)))
+    (loop while pending for part = (pop pending) do
+      (cond ((symbolp part)
+             (unless (symbol-package part) (return-from serializable-literal-graph-p nil)))
+            ((or (numberp part) (characterp part)))
+            ((or (consp part) (arrayp part))
+             (unless (or (eq (gethash part states) :complete) (gethash part seen))
+               (when (and (arrayp part)
+                          (not (snowgrave::acyclic-array-displacement-p part displacements)))
+                 (return-from serializable-literal-graph-p nil))
+               (when (and (arrayp part)
+                          (not (let ((type (array-element-type part)))
+                                 (or (member type '(t nil bit)) (native-value-type-p type)
+                                     (and (consp type) (eq (car type) 'complex)
+                                          (= (length type) 2)
+                                          (member (second type) '(single-float double-float short-float long-float)))))))
+                 (return-from serializable-literal-graph-p nil))
+               (setf (gethash part seen) t)
+               (push part nodes)
+               (if (consp part)
+                   (progn (push (cdr part) pending) (push (car part) pending))
+                   (multiple-value-bind (parent offset) (array-displacement part)
+                     (declare (ignore offset))
+                     (if parent (push parent pending)
+                         (unless (null (array-element-type part))
+                           (dotimes (index (array-total-size part))
+                             (push (row-major-aref part index) pending))))))))
+            (t (return-from serializable-literal-graph-p nil))))
+    (dolist (node nodes) (setf (gethash node states) :complete))
+    t))
+
 (defun fresh-name (build role)
   (loop for name = (format nil "%~A/~D" role (incf (build-sequence build)))
         unless (some (lambda (source) (string= name (source-name source)))
@@ -3620,7 +3656,7 @@ An unknown name makes that name and the remainder uncertain, never absent."
 (defun reproducible-global-p (build form)
   (cond ((atom form) (or (numberp form) (stringp form) (characterp form)
                         (keywordp form) (eq form t) (null form)))
-        ((eq (car form) 'quote) (serializable-tree-p (cadr form)))
+        ((eq (car form) 'quote) (serializable-literal-graph-p (cadr form) (build-literal-states build)))
         ((eq (car form) 'function) (function-target-p build (cadr form) nil))
         ((eq (car form) 'load-time-value) (reproducible-global-p build (cadr form)))
         ((member (car form) *reproducible-global-operations*)
@@ -3639,9 +3675,9 @@ An unknown name makes that name and the remainder uncertain, never absent."
 (defun literal-reference (build value package)
   ;; EQ is the source graph's authority, not structural equality. Separate
   ;; pools keep the disposable CLOS pass and the installed unit independent.
-  (unless (serializable-tree-p value (build-literal-states build))
+  (unless (serializable-literal-graph-p value (build-literal-states build))
     (fail build 'snowgrave:residual-metaobject :literal-object
-          "Literal graphs must contain only acyclic readable native data."))
+          "Literal graphs must contain only readable native data."))
   (let* ((pool (or (cdr (assoc package (build-literal-pools build)))
                    (let ((pool (make-literal-pool)))
                      ;; Use an interned, private binding for fresh-file replay.
@@ -3658,24 +3694,49 @@ An unknown name makes that name and the remainder uncertain, never absent."
 (defun literal-pool-definition (build package)
   (let ((pool (cdr (assoc package (build-literal-pools build)))))
     (when pool
-      (let ((seen (make-hash-table :test #'eq)) (bindings nil))
-        (labels ((construct (value)
-                   (if (or (consp value) (stringp value) (simple-vector-p value))
+      (let ((seen (make-hash-table :test #'eq)) (defaults (make-hash-table :test #'eq))
+            (bindings nil) (edges nil) (pending nil))
+        (labels ((reference (value)
+                   (if (or (consp value) (arrayp value))
                        (or (gethash value seen)
-                           (let* ((name (gensym "LITERAL"))
+                           (let* ((backing (when (arrayp value)
+                                             (let ((parent (array-displacement value)))
+                                               (when parent (reference parent)))))
+                                  (name (gensym "LITERAL"))
+                                  (default (when (and (arrayp value) (not backing)
+                                                      (array-element-type value) (plusp (array-total-size value)))
+                                             (let ((first (row-major-aref value 0)))
+                                               (list (if (or (numberp first) (characterp first) (symbolp first))
+                                                         first nil)))))
                                   (initializer
-                                    (cond ((consp value) `(cons ,(construct (car value)) ,(construct (cdr value))))
-                                          ((stringp value) `(copy-seq ,value))
-                                          (t `(vector ,@(map 'list #'construct value))))))
+                                    (cond ((consp value) '(cons nil nil))
+                                          (t `(make-array ',(array-dimensions value)
+                                                ,@(loop for (key argument) on
+                                                        (snowgrave::array-allocation-options value backing) by #'cddr
+                                                        append (list key (if (eq key :displaced-to) argument `',argument)))
+                                                ,@(when default `(:initial-element ',(car default))))))))
                              (setf (gethash value seen) name)
+                             (when default (setf (gethash value defaults) default))
                              (push (list name initializer) bindings)
+                             (unless (and (arrayp value)
+                                          (or (array-displacement value) (null (array-element-type value))))
+                               (push (cons name value) pending))
                              name))
                        `',value)))
-          (let ((roots (map 'list #'construct (literal-pool-values pool))))
-            ;; Allocate once at load time. Only scalar leaves reach the FASL
-            ;; constant dumper, so it cannot merge distinct mutable nodes.
+          (let ((roots (map 'list #'reference (literal-pool-values pool))))
+            (loop while pending for (name . value) = (pop pending) do
+              (if (consp value)
+                  (push `(setf (car ,name) ,(reference (car value))
+                               (cdr ,name) ,(reference (cdr value))) edges)
+                  (dotimes (index (array-total-size value))
+                    (let ((element (row-major-aref value index)) (default (gethash value defaults)))
+                      (unless (and default (eql element (car default)))
+                        (push `(setf (row-major-aref ,name ,index) ,(reference element)) edges))))))
+            ;; Allocate every shell before installing edges. Back edges and
+            ;; cycles need no source object or initialization callback. Only
+            ;; scalar leaves reach the compiler's constant dumper.
             `(defparameter ,(literal-pool-name pool)
-               (let* ,(nreverse bindings) (vector ,@roots)))))))))
+               (let* ,(nreverse bindings) ,@(nreverse edges) (vector ,@roots)))))))))
 
 (defun with-literal-pool (build forms package)
   (let ((definition (literal-pool-definition build package)))
@@ -4004,7 +4065,8 @@ not a second inheritance or initialization algorithm."
                           (getf layout :slot-types))) (build-layouts build))
         (let ((name (fresh-name build "REFERENCE-DOMAIN")))
           (push `(defparameter ,name
-                   (snowgrave:make-reference-domain ',(build-identity build) ',(build-layouts build)))
+                   (snowgrave:make-reference-domain ',(build-identity build)
+                                                    ',(mapcar #'layout-metadata (build-layouts build))))
                 (build-generated build))
           (setf (build-reference-domain-name build) name)))))
 
@@ -5046,7 +5108,9 @@ This is hosted compiled-root evidence, not target or whole-image admission."
                 (walk (snowgrave::closed-record-bound object)))
                ((arrayp object)
                 (let ((parent (array-displacement object))) (when parent (walk parent)))
-                (dotimes (i (array-total-size object)) (walk (row-major-aref object i))))
+                ;; NIL storage has geometry but no element values to inspect.
+                (unless (null (array-element-type object))
+                  (dotimes (i (array-total-size object)) (walk (row-major-aref object i)))))
                ((packagep object)
                 (when (eq object (build-open-package build))
                   (bad :compiled-builder-package "A compiled constant retains the builder package.")))
@@ -5242,6 +5306,21 @@ implemented here. A nominal native class is never an imported graph proof."
     (if (second entry) (setf (symbol-value (first entry)) (third entry))
         (makunbound (first entry)))))
 
+(defun layout-metadata (description)
+  ;; Initializer expressions are compiler inputs; their executable behavior
+  ;; is already in the emitted constructors. Keep provenance keys in the ABI,
+  ;; rather than duplicating mutable/non-readable literal graphs as metadata.
+  (let ((result (copy-list description)))
+    (setf (getf result :slot-initializer-keys)
+          (mapcar (lambda (initializer) (getf initializer :source-key))
+                  (getf description :slot-initforms))
+          (getf result :default-initializer-keys)
+          (mapcar (lambda (initializer) (list (car initializer) (getf (cddr initializer) :source-key)))
+                  (getf description :default-initargs)))
+    (remf result :slot-initforms)
+    (remf result :default-initargs)
+    result))
+
 (defun close-source (source declaration)
   (unless (serializable-tree-p (getf declaration :unit-name))
     (snowgrave::reject 'snowgrave:nonreproducible-source :declaration :unit-identity
@@ -5305,7 +5384,7 @@ implemented here. A nominal native class is never an imported graph proof."
                                     :source-keys :authored-definition-position)
                                   :reference-domain (when (build-reference-domain-name build)
                                                       (list :identity identity :schema-source :record-layouts))
-                                  :record-layouts (build-layouts build) :dispatch dispatch
+                                  :record-layouts (mapcar #'layout-metadata (build-layouts build)) :dispatch dispatch
                                   :definitions (loop for form in forms when (eq (car form) 'defun)
                                                      collect (list :definition-key (list identity :definition
                                                                                          (snowgrave::function-name-key

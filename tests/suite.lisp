@@ -4315,6 +4315,7 @@
     (annotation-form-tests)
     (vector-constant-tests)
     (literal-identity-tests)
+    (native-literal-graph-tests)
     (predicate-refinement-tests)
     (partition-factorization-tests)
     (external-result-tests)
