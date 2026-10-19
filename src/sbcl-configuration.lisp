@@ -757,11 +757,11 @@ The existing literal pool consumes these cold node recipes for shell/fill."
 
 (defun graph-native-payload-form-p (build form)
   ;; Reuse the mutable-binding fixed point, not a fresh value/shape assertion.
-  ;; CONS preserves its operands; a successful CDR only selects old payload.
+  ;; CONS preserves its operands; successful CAR/CDR only select old payload.
   (cond ((and (symbolp form) (assoc form *function-bindings*))
          (or (binding-native-payload-p form)
              (not (graph-private-payload-domain-p build (value-domain build form)))))
-        ((and (consp form) (member (first form) '(cons cdr)))
+        ((and (consp form) (member (first form) '(cons car cdr)))
          (every (lambda (argument) (graph-native-payload-form-p build argument)) (rest form)))
         (t (not (graph-private-payload-domain-p build (value-domain build form))))))
 

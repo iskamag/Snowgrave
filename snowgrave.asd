@@ -43,6 +43,7 @@
                (:file "tests/external-results")
                (:file "tests/external-value-guards")
                (:file "tests/fixed-generic-calls")
+               (:file "tests/optional-generic-calls")
                (:file "tests/generic-required-domains")
                (:file "tests/typed-slots")
                (:file "tests/closed-reference-slots")

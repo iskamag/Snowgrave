@@ -42,10 +42,23 @@
                            (mapcar #'keyword-name (getf contract :keys))))))
          (domain-alternatives domain)))
 
-(defun audit-lambda-parser-inputs (build contract supplied variable-tail owner)
+(defun audit-lambda-parser-inputs (build contract supplied variable-tail owner &key native-payloads)
   "Admit only native/private-safe payloads on feasible actual KEY parser paths.
 SUPPLIED is the raw ordered tuple, not projected parameter domains. Capture
 envelopes are excluded by callers. This adds no runtime parser or checker."
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*)
+             (getf contract :positional-surplus-p))
+    (when variable-tail
+      (fail build 'snowgrave:unclosed-call :graph-state-parser-tail
+            (format nil "The unknown optional surplus of ~S lacks its native payload proof." owner)
+            :reachability))
+    (loop for domain in (nthcdr (min (length supplied) (length (lambda-positional-variables contract))) supplied)
+          for position from (length (lambda-positional-variables contract))
+          when (and (not (nth position native-payloads)) (graph-private-payload-domain-p build domain))
+          do
+        (fail build 'snowgrave:unclosed-call :graph-state-parser-payload
+              (format nil "The optional parser of ~S can publish a private surplus operand in its native condition." owner)
+              :reachability)))
   (when (and (graph-state-profile-p build) (not *collect-function-flow*) (getf contract :keyp))
     (let ((tail (nthcdr (min (length supplied) (length (lambda-positional-variables contract))) supplied)))
       (unless (parser-allows-other-keys-p build contract tail)
@@ -68,8 +81,19 @@ envelopes are excluded by callers. This adds no runtime parser or checker."
   (when (and (graph-state-profile-p build) (not *collect-function-flow*))
     (map-generic-program-call-inputs
      build generic
-     (lambda (domains variable-tail)
-       (audit-lambda-parser-inputs build contract domains variable-tail generic)))))
+     (lambda (domains variable-tail native-payloads)
+       (audit-lambda-parser-inputs build contract domains variable-tail generic :native-payloads native-payloads)))))
+
+(defun audit-method-positional-parser-inputs (build generic method)
+  ;; This method's native binder, not the population of the generic, owns the
+  ;; tail condition. The shared row iterator preserves actual cell guards;
+  ;; capture placeholders do not fabricate execution of an error path.
+  (let ((contract (lambda-contract build (sb-mop:method-lambda-list method) :method t)))
+    (setf (getf contract :positional-surplus-p) t)
+    (when (and (graph-state-profile-p build) (not *collect-function-flow*))
+      (map-generic-program-call-inputs
+       build generic (lambda (domains variable-tail native-payloads)
+                       (audit-lambda-parser-inputs build contract domains variable-tail generic :native-payloads native-payloads))))))
 
 (defun audit-apply-parser-tail (build form)
   ;; APPLY parses its own final operand before the callee's lambda parser.

@@ -384,11 +384,11 @@
                     ;; value/effect state into the monotone return join.
                     (setf proof (if (and *collect-function-flow* (member :pending domains)) :pending receipt)))
                   (push `(defun ,name ,parameters
-                           (,(if *fixed-effective-arguments* 'funcall 'apply)
-                            (lambda ,ordinary
-                              ,@(when (source-specials build) (list `(declare (special ,@(source-specials build)))))
-                              ,@declarations (block ,(if (consp generic) (second generic) generic) ,@code))
-                            ,@(if *fixed-effective-arguments* parameters (list (first parameters)))))
+                           ,(fixed-effective-method-body
+                             build generic method ordinary
+                             (append (when (source-specials build) (list `(declare (special ,@(source-specials build)))))
+                                     declarations (list `(block ,(if (consp generic) (second generic) generic) ,@code)))
+                             parameters))
                         (build-generated build)))))))))
     (when (and next-methods (not next-called-p))
       ;; Retain selected tail obligations even if the authored method skips

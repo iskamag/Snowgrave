@@ -411,20 +411,21 @@ all other expansions re-enter the same admission and residual audits."
                   (mapped-name name (build-open-package build)))))
 
 (defun fixed-generic-arity (build name)
-  "Only required-only generic and method contracts can omit a raw argument list.
-The actual MOP still selects and combines all methods. Optional, rest and key
-contracts retain their complete ordinary argument path. AUX stays method-local."
+  "Return the minimum and maximum finite positional arities, or NIL.
+The actual MOP still selects and combines every method. Rest/key contracts
+retain the ordinary parser path; AUX and optional defaults stay method-local."
   (when (and (member-name name (getf (build-declaration build) :closed-generics))
              (not (initialization-generic-p name)))
     (let ((gf (open-generic build name)))
-      (labels ((fixedp (lambda-list &optional method)
+      (labels ((finitep (lambda-list &optional method)
                  (let ((contract (lambda-contract build lambda-list :method method)))
-                   (not (or (getf contract :optional) (getf contract :rest)
-                            (getf contract :keyp))))))
-        (when (and (fixedp (sb-mop:generic-function-lambda-list gf))
-                   (every (lambda (method) (fixedp (sb-mop:method-lambda-list method)))
+                   (not (or (getf contract :rest) (getf contract :keyp))))))
+        (when (and (finitep (sb-mop:generic-function-lambda-list gf))
+                   (every (lambda (method) (finitep (sb-mop:method-lambda-list method) t))
                           (sb-mop:generic-function-methods gf)))
-          (length (ordinary-lambda-list build (sb-mop:generic-function-lambda-list gf))))))))
+          (let* ((contract (lambda-contract build (sb-mop:generic-function-lambda-list gf)))
+                 (required (length (getf contract :required))))
+            (values required (+ required (length (getf contract :optional))))))))))
 
 (defun fixed-generic-name (build name)
   (if (consp name) (list 'setf (fixed-generic-name build (cadr name)))
@@ -436,10 +437,79 @@ contracts retain their complete ordinary argument path. AUX stays method-local."
 (defun direct-call-name (build name package open local argument-count)
   ;; Resolve/audit the public binding before choosing its internal convention.
   ;; FUNCTION captures still use TRANSFORMED-FUNCTION-NAME and keep identity.
-  (let ((public (transformed-function-name build name package open local))
-        (arity (unless (or open (member-name name local)) (fixed-generic-arity build name))))
-    (if (and arity (= arity argument-count))
-        (values (fixed-generic-name build name) t) (values public nil))))
+  (let ((public (transformed-function-name build name package open local)))
+    (multiple-value-bind (minimum maximum)
+        (unless (or open (member-name name local)) (fixed-generic-arity build name))
+      (if (and minimum (<= minimum argument-count maximum))
+          (values (fixed-generic-name build name) t
+                  (if (= minimum maximum) '(nil)
+                      (append (make-list (- maximum argument-count))
+                              (list argument-count nil))))
+          (values public nil nil)))))
+
+(defun fixed-invocation-argument-plan (build form)
+  ;; Literal VALUES has source expressions at every ordered position. Other
+  ;; MVC producers retain the ordinary emitted MULTIPLE-VALUE-BIND plan.
+  (if (and (eq (first form) 'multiple-value-call)
+           (every (lambda (producer) (and (consp producer) (eq (first producer) 'values))) (cddr form)))
+      (multiple-value-bind (arguments bindings domains completep)
+          (multiple-value-call-plan build (cddr form))
+        (declare (ignore bindings domains)) (values arguments nil completep))
+      (ordinary-call-argument-plan build form)))
+
+(defun emit-fixed-generic-invocation (build callee arguments targets globals)
+  "Realize a proved finite invocation without changing its public identities.
+The source callee and every primary argument are evaluated exactly once, in
+order, before an identity choice. Unknown/nonkernel targets keep FUNCALL."
+  (let ((plans nil) (count (length arguments)))
+    (dolist (target targets)
+      (when (and (not (local-function-binding-p target)) (member-name target globals))
+        (multiple-value-bind (minimum maximum) (fixed-generic-arity build target)
+          (when (and minimum (<= minimum count maximum))
+            (push (list target (if (= minimum maximum) '(nil)
+                                  (append (make-list (- maximum count)) (list count nil)))) plans)))))
+    (when plans
+      (let ((function (fresh-name build "FIXED-CALLEE"))
+            (parameters (loop repeat count collect (fresh-name build "FIXED-ARG"))))
+        `(let* ((,function ,callee)
+                ,@(mapcar #'list parameters arguments))
+           (cond ,@(loop for (target suffix) in (nreverse plans)
+                         collect `((eq ,function #',(mapped-name target (build-output-package build)))
+                                   (funcall #',(fixed-generic-name build target) ,@parameters ,@suffix)))
+                 (t (funcall ,function ,@parameters))))))))
+
+(defun fixed-effective-error-arguments (parameters)
+  ;; Only an error path materializes the original positional tuple. Padding
+  ;; slots never become arguments, and supplied NIL remains a real argument.
+  (if (consp *fixed-effective-arguments*)
+      (destructuring-bind (arguments count minimum maximum) *fixed-effective-arguments*
+        `(or ,arguments
+             (case ,count
+               ,@(loop for arity from minimum to maximum
+                       collect `(,arity (list ,@(subseq parameters 0 arity)))))))
+      `(list ,@parameters)))
+
+(defun fixed-effective-method-body (build generic method ordinary body parameters)
+  ;; One ordinary method body/default binder is shared by every positional
+  ;; shape. The lexical function does not escape; CALL-NEXT retains the outer
+  ;; transport tuple, including its actual count, rather than defaulted values.
+  (if (consp *fixed-effective-arguments*)
+      (destructuring-bind (arguments count minimum maximum) *fixed-effective-arguments*
+        (let ((name (fresh-name build "POSITIONAL-METHOD"))
+              (surplusp (method-positional-surplus-p build method)))
+          (when surplusp (audit-method-positional-parser-inputs build generic method))
+          `(flet ((,name ,ordinary ,@body))
+             (case ,count
+               ,@(loop for arity from minimum to maximum
+                       collect `(,arity (,name ,@(subseq parameters 0 arity))))
+               (t ,(if surplusp
+                       (destructuring-bind (class control) (positional-surplus-schema build)
+                         `(error ',class :format-control ,control
+                                        :format-arguments (list (nthcdr ,maximum ,arguments))))
+                       `(apply #',name ,arguments)))))))
+      `(,(if *fixed-effective-arguments* 'funcall 'apply)
+        (lambda ,ordinary ,@body)
+        ,@(if *fixed-effective-arguments* parameters (list (car parameters))))))
 
 (defun source-specials (build)
   (snowgrave:authored-source-specials (build-source build)))
@@ -2899,7 +2969,19 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
                       (length actual)
                       (mapcar (lambda (domain)
                                 (when (and (consp domain) (eq (car domain) 'eql) (symbolp (second domain))) domain))
-                              (nthcdr required actual))))
+                              (nthcdr required actual))
+                      ;; Native payload is distinct from sequence geometry.
+                      ;; Keep each proof with its actual raw caller row; an
+                      ;; unsafe same-arity caller must never inherit this bit.
+                      (let ((positional (length (lambda-positional-variables contract))))
+                        (when (and (not capture) (getf contract :optional)
+                                   (not (getf contract :rest)) (not (getf contract :keyp))
+                                   (> (length actual) positional))
+                          (append (make-list positional)
+                                  (mapcar (lambda (argument)
+                                            (not (null (or (native-data-form-p build argument)
+                                                           (graph-native-payload-form-p build argument)))))
+                                          (nthcdr positional arguments)))))))
            (shapes (gethash name (build-generic-call-shapes build))))
       (audit-generic-minimum-arity build name required (length actual) capture)
       ;; Presence is also the deployment reachability fact. A call below
@@ -2964,8 +3046,8 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
       (maphash
        (lambda (key input)
          (let ((domains (if (record-flow-input-p input) (record-flow-positional-inputs input) input)))
-          (destructuring-bind (capture variable-tail count literal-names) key
-           (declare (ignore literal-names))
+          (destructuring-bind (capture variable-tail count literal-names &optional native-payloads) key
+           (declare (ignore literal-names native-payloads))
            (let ((supplied nil) (compatiblep t))
              (loop for cell in *cell-domains* for position from 0
                    do (multiple-value-bind (fact possiblep)
@@ -3321,7 +3403,7 @@ reflection, lexical rebinding and class values still require their own ABI."
              (*current-method*
               (emit-standard-miss build 'no-next-method
                                   (first *current-method*) (second *current-method*)
-                                  (if *fixed-effective-arguments* `(list ,@original) (car original))))
+                                  (if *fixed-effective-arguments* (fixed-effective-error-arguments original) (car original))))
              (t (fail build 'snowgrave:mop-failure :no-next-method-context
                       "CALL-NEXT-METHOD has no reproducible authored method context." :materialization))))
       ((eq (car form) 'next-method-p)
@@ -3635,15 +3717,17 @@ reflection, lexical rebinding and class values still require their own ABI."
                   (let* ((binding (gensym "VALUE-CALLEE"))
                          (arguments (mapcan (lambda (producer) (copy-list (first producer))) value-bindings))
                          (invocation
-                           `(funcall ,(if (eq equality-realization :identity)
-                                          `(if (eq ,binding #'equalp) #'eq ,binding) binding)
-                                     ,@(cond (native-sequence-position
-                                              (asserted-sequence-arguments
-                                               build value-arguments
-                                               (if mapping-plans (equality-arguments arguments mapping-plans binding) arguments)
-                                               native-sequence-position))
-                                             (mapping-plans (equality-arguments arguments mapping-plans binding))
-                                             (t arguments)))))
+                           (or (and (not open) (not equality-realization) (not mapping-plans)
+                                    (emit-fixed-generic-invocation build binding arguments targets global-targets))
+                               `(funcall ,(if (eq equality-realization :identity)
+                                              `(if (eq ,binding #'equalp) #'eq ,binding) binding)
+                                         ,@(cond (native-sequence-position
+                                                  (asserted-sequence-arguments
+                                                   build value-arguments
+                                                   (if mapping-plans (equality-arguments arguments mapping-plans binding) arguments)
+                                                   native-sequence-position))
+                                                 (mapping-plans (equality-arguments arguments mapping-plans binding))
+                                                 (t arguments))))))
                     `(let ((,binding ,callee))
                        ,(reduce (lambda (body producer)
                                   `(multiple-value-bind ,(first producer) ,(walk (second producer)) ,body))
@@ -3661,13 +3745,27 @@ reflection, lexical rebinding and class values still require their own ABI."
                          (if native-sequence-position
                              (native-sequence-indirect-arguments build form arguments native-sequence-position)
                              arguments))))))
-                 (t (let ((expression `(,(car form) ,callee
-                                           ,@(let ((arguments (body (cddr form))))
-                                               (if native-sequence-position
-                                                   (native-sequence-indirect-arguments build form arguments native-sequence-position)
-                                                   arguments)))))
+                 (t (multiple-value-bind (tuple tuple-bindings completep variable-tail)
+                        (fixed-invocation-argument-plan build form)
+                      (let* (;; The ordinary tuple owner is also used by the
+                             ;; audits. Generated MVC bindings are handled by
+                             ;; the branch above; unknown tails stay ordinary.
+                            (fixedp (and (not open) completep (null tuple-bindings) (null variable-tail)
+                                         (some (lambda (target)
+                                                 (and (not (local-function-binding-p target))
+                                                      (member-name target global-targets)
+                                                      (multiple-value-bind (minimum maximum) (fixed-generic-arity build target)
+                                                        (and minimum (<= minimum (length tuple) maximum))))) targets)))
+                            (expression
+                              (or (when fixedp
+                                    (emit-fixed-generic-invocation build callee (body tuple) targets global-targets))
+                                  `(,(car form) ,callee
+                                    ,@(let ((arguments (body (cddr form))))
+                                        (if native-sequence-position
+                                            (native-sequence-indirect-arguments build form arguments native-sequence-position)
+                                            arguments))))))
                       (if (and (not open) (= (length targets) 1))
-                          (declared-external-result-expression build (first targets) expression) expression)))))))))
+                          (declared-external-result-expression build (first targets) expression) expression))))))))))
       ((member (car form) '(setq setf incf decf push pushnew pop))
        (when (eq (car form) 'pushnew) (validate-keyword-callbacks build (cdddr form) local open nil
                                                                             :data (list (second form) (third form))))
@@ -3850,9 +3948,10 @@ reflection, lexical rebinding and class values still require their own ABI."
              `(,(target (car form))
                 ,@(equality-arguments (cdr form)
                                      (mapcar (lambda (position) (list position (car form))) mapping-realization))))
-           (t (multiple-value-bind (callee fixedp)
+           (t (multiple-value-bind (callee fixedp suffix)
                  (direct-call-name build (car form) package open local (length (cdr form)))
-               (let ((expression `(,callee ,@(body (cdr form)) ,@(when fixedp '(nil)))))
+               (declare (ignore fixedp))
+               (let ((expression `(,callee ,@(body (cdr form)) ,@suffix)))
                  ;; A composer leaf produces its typed value while walking
                  ;; the argument. Feed the same ordinary/local caller owner
                  ;; after those receipts exist, rather than permanently join
@@ -3902,19 +4001,23 @@ reflection, lexical rebinding and class values still require their own ABI."
            (validate-hash-access build (cadr place) (caddr place)))
          (cons (car place) (transform-body build (cdr place) package :open open :local local)))
         ((and (consp place) (function-target-p build (list 'setf (car place)) local))
-         (multiple-value-bind (callee fixedp)
+         (multiple-value-bind (callee fixedp suffix)
              (direct-call-name build (list 'setf (car place)) package open local (length place))
            ;; Read/modify/write needs BOTH conventions to agree. An unrelated
            ;; rest/key writer must never be redirected merely because its
            ;; reader has a fixed contract (or the converse).
            (when (and fixedp readp
-                      (let ((arity (fixed-generic-arity build (car place))))
-                        (not (and arity (= arity (length (cdr place)))))))
-             (setf fixedp nil
+                      (multiple-value-bind (minimum maximum) (fixed-generic-arity build (car place))
+                        ;; Read/modify/write shares place subforms between the
+                        ;; two functions. Optional transport counts differ by
+                        ;; the inserted new value, so keep its ordinary path.
+                        (not (and minimum (= minimum maximum (length (cdr place)))
+                                  (= (length suffix) 1)))))
+             (setf fixedp nil suffix nil
                    callee (transformed-function-name build (list 'setf (car place)) package open local)))
            (cons (second callee)
                  (append (transform-body build (cdr place) package :open open :local local)
-                         (when fixedp '(nil))))))
+                         suffix))))
         (t (fail build 'snowgrave:unclosed-call :setf-place
                  (format nil "No declared finite SETF operation for ~S." place)))))
 
@@ -5058,14 +5161,15 @@ not a second inheritance or initialization algorithm."
                                    :method t :specials (body-special-domains body) :next next-name :original parameters)
             (let ((*argument-domains* (car scope)) (*function-bindings* (cdr scope)))
               (push `(defun ,name ,parameters
-                       (,(if *fixed-effective-arguments* 'funcall 'apply) (lambda ,ordinary
-                                ,@(when (source-specials build) (list `(declare (special ,@(source-specials build)))))
-                                ,@(loop while (and body (consp (car body)) (eq (caar body) 'declare))
-                                        collect (transform-form build (pop body) (build-output-package build)))
-                                (block ,block-name
-                                  ,@(transform-body build body (build-output-package build)
-                                                    :next next-name :original parameters)))
-                              ,@(if *fixed-effective-arguments* parameters (list (car parameters)))))
+                       ,(fixed-effective-method-body
+                         build generic method ordinary
+                         (append (when (source-specials build) (list `(declare (special ,@(source-specials build)))))
+                                 (loop while (and body (consp (car body)) (eq (caar body) 'declare))
+                                       collect (transform-form build (pop body) (build-output-package build)))
+                                 (list `(block ,block-name
+                                          ,@(transform-body build body (build-output-package build)
+                                                            :next next-name :original parameters))))
+                         parameters))
                     (build-generated build))))))))
     (values `(,name ,@parameters) (if (eq summary :pending) '(error) summary))))))
 
@@ -5251,11 +5355,50 @@ class whitelist replaces their actual applicability behavior."
   (let ((head (if (consp spec) (car spec) spec)))
     (if (consp head) (car head) (intern (symbol-name head) :keyword))))
 
+(defparameter *method-fast-function-reader* (fdefinition 'sb-pcl::safe-method-fast-function))
+
+(defun method-positional-surplus-p (build method)
+  "The native method binder determines optional error payload and timing."
+  (unless (eq *method-fast-function-reader* (fdefinition 'sb-pcl::safe-method-fast-function))
+    (fail build 'snowgrave:mop-failure :optional-method-parser-realization
+          "The pinned native method realization reader has changed." :materialization))
+  (let* ((function (funcall *method-fast-function-reader* method))
+         (lambda-list (and function (sb-introspect:function-lambda-list function))))
+    (unless (and function (snowgrave::source-finite-list-p lambda-list))
+      (fail build 'snowgrave:mop-failure :optional-method-parser-realization
+            "The optional method needs its native finite binding convention." :materialization))
+    (not (null (member '&rest lambda-list)))))
+
+(defvar *positional-surplus-schema* nil)
+
+(defun positional-surplus-schema (build)
+  "Verify the stock host's bounded optional parser without authored execution."
+  (or *positional-surplus-schema*
+      (let* ((gf (make-instance 'standard-generic-function :lambda-list '(object &optional value)))
+             (prototype (sb-mop:class-prototype (find-class 'standard-method)))
+             (marker :snowgrave-surplus-probe))
+        (multiple-value-bind (source initargs)
+            (sb-mop:make-method-lambda
+             gf prototype '(lambda (object &optional value) (declare (ignore object value)) nil) nil)
+          (add-method gf (apply #'make-instance 'standard-method :qualifiers nil
+                                :lambda-list '(object &optional value)
+                                :specializers (list (find-class t)) :function (compile nil source) initargs)))
+        (let ((condition (handler-case (progn (funcall gf nil nil marker) nil)
+                           (error (condition) condition))))
+          (unless (and (eq (type-of condition) 'sb-int:simple-program-error)
+                       (equal (simple-condition-format-arguments condition) (list (list marker)))
+                       (equal (simple-condition-format-control condition) "surplus arguments: ~S"))
+            (fail build 'snowgrave:mop-failure :optional-surplus-error-schema
+                  "The stock optional parser needs its exact surplus-tail condition schema." :materialization))
+          (setf *positional-surplus-schema*
+                (list (type-of condition) (simple-condition-format-control condition)))))))
+
 (defun emit-argument-validator (build generic gf applicable)
   (let* ((contract (generic-parser-contract build gf applicable))
          (name (fresh-name build "CONTRACT"))
          (required (mapcar (lambda (x) (declare (ignore x)) (fresh-name build "CHECK-ARG")) (getf contract :required)))
          (optional (mapcar (lambda (x) (declare (ignore x)) (fresh-name build "CHECK-OPT")) (getf contract :optional)))
+         (finite-optional-p (and (getf contract :optional) (not (getf contract :rest)) (not (getf contract :keyp))))
          (rest (when (or (getf contract :rest) (getf contract :keyp)) (fresh-name build "CHECK-REST")))
          (keywords (getf contract :accepted-keywords))
          (allow (getf contract :allow)))
@@ -5267,10 +5410,11 @@ class whitelist replaces their actual applicability behavior."
                                 (when rest (list '&rest rest))
                                 (when (getf contract :keyp) (cons '&key key-specs))
                                 (when (and (getf contract :keyp) allow) '(&allow-other-keys)))))
-      (push `(defun ,name ,lambda-list
-               ,@(when all-variables (list `(declare (ignore ,@all-variables))))
-               (values)) (build-generated build))
-      (values name (list :generic generic :keywords keywords :allow-other-keys allow
+      (unless finite-optional-p
+        (push `(defun ,name ,lambda-list
+                 ,@(when all-variables (list `(declare (ignore ,@all-variables))))
+                 (values)) (build-generated build)))
+      (values (unless finite-optional-p name) (list :generic generic :keywords keywords :allow-other-keys allow
                          :lambda-list lambda-list) contract))))
 
 (defun emit-minimum-arity-check (build generic gf required established arguments)
@@ -5302,13 +5446,28 @@ class whitelist replaces their actual applicability behavior."
          (variables (ordinary-lambda-list build lambda-list))
          (parameters (mapcar (lambda (x) (declare (ignore x)) (fresh-name build "ARG")) variables))
          (arguments (fresh-name build "ARGUMENTS"))
-         (fixed-arity (fixed-generic-arity build generic))
-         (error-arguments (if fixed-arity `(or ,arguments (list ,@parameters)) arguments))
+         (fixed-arities (multiple-value-list (fixed-generic-arity build generic)))
+         (fixed-arity (first fixed-arities))
+         (maximum-arity (second fixed-arities))
+         (optionalp (and fixed-arity (> maximum-arity fixed-arity)))
+         (positional-parameters
+           (append parameters (when optionalp
+                                (loop repeat (- maximum-arity fixed-arity)
+                                      collect (fresh-name build "OPTIONAL-ARG")))))
+         (argument-count (when optionalp (fresh-name build "ARGUMENT-COUNT")))
+         (effective-parameters (if optionalp (append positional-parameters (list argument-count arguments)) parameters))
+         (fixed-convention (if optionalp (list arguments argument-count fixed-arity maximum-arity)
+                               (not (null fixed-arity))))
+         (error-arguments (if fixed-arity
+                              (let ((*fixed-effective-arguments* fixed-convention))
+                                (if optionalp (fixed-effective-error-arguments positional-parameters)
+                                    `(or ,arguments (list ,@parameters))))
+                              arguments))
          (established (fresh-name build "DISPATCH-ESTABLISHED"))
          (methods (sb-mop:generic-function-methods gf))
          ;; Required-only validators are identical for every method set. Keep
          ;; one ordinary lambda contract, rather than a copy in every cell.
-         (fixed-validator (when fixed-arity
+         (fixed-validator (when (and fixed-arity (not optionalp))
                             (multiple-value-list (emit-argument-validator build generic gf nil))))
          (plan (multiple-value-list (generic-partition-plan build gf methods (length parameters))))
          (axes (first plan)) (axis-evidence (second plan)) (concrete-axes (third plan))
@@ -5347,7 +5506,7 @@ class whitelist replaces their actual applicability behavior."
                          ,(emit-standard-miss build 'no-applicable-method generic nil arguments))
                       (build-generated build)))
               (let* ((contract (lambda-contract build lambda-list))
-                     (validator (if fixed-arity (first fixed-validator)
+                     (validator (if fixed-arity (unless optionalp (first fixed-validator))
                                     (unless (or (getf contract :rest) (getf contract :keyp))
                                       (emit-argument-validator build generic gf nil)))))
                 (push `(,(cons 'and (mapcar (lambda (class parameter) (cell-test build class parameter)) cell parameters))
@@ -5364,11 +5523,11 @@ class whitelist replaces their actual applicability behavior."
             (fail build 'snowgrave:unsupported-definition :effective-method-options
                   "The normalized source emitter does not ignore MOP options." :materialization))
           (multiple-value-bind (validator argument-contract parser-contract)
-              (if fixed-arity (values-list fixed-validator)
+              (if (and fixed-arity (not optionalp)) (values-list fixed-validator)
                   (emit-argument-validator build generic gf applicable))
           (audit-generic-parser-inputs build generic parser-contract)
           (multiple-value-bind (code proof)
-              (let* ((*fixed-effective-arguments* (not (null fixed-arity)))
+              (let* ((*fixed-effective-arguments* fixed-convention)
                      (input (nth-value 1 (method-binding-domains build generic lambda-list nil))))
                 (call-with-record-flow-input
                  build input
@@ -5376,8 +5535,8 @@ class whitelist replaces their actual applicability behavior."
                    (declare (ignore domains))
                    (multiple-value-bind (code proof)
                        (if *initialization-phase*
-                           (emit-initialization-plan build generic effective (if fixed-arity parameters (list arguments)))
-                           (emit-effective build generic effective (if fixed-arity parameters (list arguments))))
+                           (emit-initialization-plan build generic effective (if fixed-arity effective-parameters (list arguments)))
+                           (emit-effective build generic effective (if fixed-arity effective-parameters (list arguments))))
                      (let* ((*effective-return-proof* t)
                             (result (form-return-summary build proof)))
                        (values code (if *initialization-phase* (publish-record-flow-summary result) result)))))))
@@ -5388,8 +5547,9 @@ class whitelist replaces their actual applicability behavior."
             (push `(,(cons 'and (mapcar (lambda (class parameter) (cell-test build class parameter))
                                        cell parameters))
                      (progn (setf ,established t)
-                            ,(if fixed-arity `(when ,arguments (apply #',validator ,arguments))
-                                 `(apply #',validator ,arguments))
+                            ,@(when validator
+                                (list (if fixed-arity `(when ,arguments (apply #',validator ,arguments))
+                                          `(apply #',validator ,arguments))))
                             ,code)) clauses))
           (push (list :classes (mapcar (lambda (class) (source-class build class)) cell)
                       :argument-contract argument-contract
@@ -5406,7 +5566,7 @@ class whitelist replaces their actual applicability behavior."
                 *function-flow-changed* t))))
     (when fixed-arity
       (push `(defun ,(fixed-generic-name build generic)
-                 (,@parameters ,arguments)
+                 (,@effective-parameters ,@(unless optionalp (list arguments)))
                (declare (special ,established))
                (cond ,@(reverse clauses)
                      (t (snowgrave:sg-domain-violation ',(build-identity build) ',generic ,error-arguments))))
@@ -5414,14 +5574,17 @@ class whitelist replaces their actual applicability behavior."
     (push `(defun ,(mapped-name generic (build-output-package build)) (&rest ,arguments)
              (declare (special ,established))
              ,@(when parameters (list (emit-minimum-arity-check build generic gf (length parameters) established arguments)))
-             (let ,(loop for parameter in parameters for position from 0
-                         collect `(,parameter (nth ,position ,arguments)))
-               ,(if fixed-arity `(funcall #',(fixed-generic-name build generic) ,@parameters ,arguments)
+             (let (,@(loop for parameter in positional-parameters for position from 0
+                           collect `(,parameter (nth ,position ,arguments)))
+                   ,@(when optionalp `((,argument-count (length ,arguments)))))
+               ,(if fixed-arity `(funcall #',(fixed-generic-name build generic)
+                                        ,@positional-parameters ,@(when optionalp (list argument-count)) ,arguments)
                     `(cond ,@(reverse clauses)
                            (t (snowgrave:sg-domain-violation ',(build-identity build) ',generic ,arguments))))))
           (build-generated build))
     (list :generic generic :lambda-list lambda-list
           :fixed-call-kernel (when fixed-arity (snowgrave::function-name-key (fixed-generic-name build generic)))
+          :fixed-call-arities (when fixed-arity (list fixed-arity maximum-arity))
           :argument-precedence-order (sb-mop:generic-function-argument-precedence-order gf)
           :axis-uniformity axis-evidence
           :uniformity-replays uniformity-replays

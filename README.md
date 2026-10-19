@@ -14,9 +14,10 @@ With this directory registered with ASDF:
 
 The [specification](paper/README.md) is in `paper/`.
 
-Hosted cold import and resource-indexing measurements:
+Hosted import, resource-indexing and generic-call measurements:
 
 ```sh
 sbcl --script scripts/bench-configuration-imports.lisp
 sbcl --script scripts/bench-native-resources.lisp
+sbcl --script scripts/bench-generic-call-conventions.lisp
 ```

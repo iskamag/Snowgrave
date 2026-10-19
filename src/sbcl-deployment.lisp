@@ -152,7 +152,7 @@
     (when shapes
       (loop for key being the hash-keys of shapes using (hash-value input)
             do
-            (destructuring-bind (capture variable-tail count literal-names) key
+            (destructuring-bind (capture variable-tail count literal-names &optional native-payloads) key
               (declare (ignore literal-names))
               (let ((domains (if (record-flow-input-p input) (record-flow-positional-inputs input) input)))
                 (when (and (not capture)
@@ -163,13 +163,13 @@
                                      always (generic-error-axis-possible-p
                                              build (if (< position count) (nth position domains) :unknown)
                                              cell axis))))
-                  (funcall process domains variable-tail))))))))
+                  (funcall process domains variable-tail native-payloads))))))))
 
 (defun generic-miss-has-program-caller-p (build generic)
   (block found
     (map-generic-program-call-inputs build generic
-                                    (lambda (domains variable-tail)
-                                      (declare (ignore domains variable-tail))
+                                    (lambda (domains variable-tail native-payloads)
+                                      (declare (ignore domains variable-tail native-payloads))
                                       (return-from found t)))))
 
 (defun audit-generic-minimum-arity (build generic required count capture)
