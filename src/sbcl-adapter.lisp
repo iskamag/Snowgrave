@@ -1556,13 +1556,18 @@ A literal lexical FUNCTION may name a target without proving a global owner."
            (*declared-specials* (append (when sequential-p active-specials) *declared-specials*)))
        (unless open (audit-external-shared-value build name initializer specials))
        (multiple-value-bind (code receipt) (funcall process initializer)
-         (values (cons (if receipt (return-summary-primary receipt) (value-domain build initializer))
-                       (function-expression-target initializer)) code))))
+         (values (list (if receipt (return-summary-primary receipt) (value-domain build initializer))
+                       (function-expression-target initializer)
+                       (or (native-data-form-p build initializer)
+                           (graph-native-payload-form-p build initializer))) code))))
    (lambda (name fact scope)
      (let ((specialp (or (assoc name specials) (special-variable-p build name))))
        (when specialp (pushnew name active-specials))
-       (cons (acons name (if specialp :unknown (car fact)) (car scope))
-             (acons name (if specialp :unknown (cdr fact)) (cdr scope)))))
+       (let ((functions (acons name (if specialp :unknown (second fact)) (cdr scope))))
+         (unless specialp
+           (push (list name (assoc name functions) (first fact) (third fact) :initial)
+                 *mutable-invariant-bindings*))
+         (cons (acons name (if specialp :unknown (first fact)) (car scope)) functions))))
    :source-key (build-source-key build) :path (list (build-identity build)))))
 
 (defun source-mutations (forms)
@@ -1579,9 +1584,13 @@ can never hide a captured write or a write reached by a backedge."
                    ((setq setf)
                     (loop for (place value) on (cdr form) by #'cddr do
                       (write-to place value) (unless (symbolp place) (walk place)) (walk value)))
-                   ((incf decf) (write-to (second form) '(+ 0)) (mapc #'walk (cddr form)))
-                   ((push pushnew) (write-to (third form) '(cons nil nil)) (mapc #'walk (cdr form)))
-                   (pop (write-to (second form) '(cdr nil)))
+                   ((incf decf)
+                    (write-to (second form) (list (if (eq (car form) 'incf) '+ '-)
+                                                 (second form) (if (cddr form) (third form) 1)))
+                    (mapc #'walk (cddr form)))
+                   ((push pushnew) (write-to (third form) (list 'cons (second form) (third form)))
+                    (mapc #'walk (cdr form)))
+                   (pop (write-to (second form) (list 'cdr (second form))))
                    (multiple-value-setq
                     (dolist (variable (second form)) (write-to variable :unknown))
                     (walk (third form)))
@@ -1610,8 +1619,14 @@ can never hide a captured write or a write reached by a backedge."
 
 (defun mutable-binding-fact (name)
   (let ((binding (assoc name *function-bindings*)))
-    (find-if (lambda (fact) (and (eq name (first fact)) (eq binding (second fact))))
+    (find-if (lambda (fact) (and (eq name (first fact)) (eq binding (second fact))
+                                 (not (eq (fifth fact) :initial))))
              *mutable-invariant-bindings*)))
+
+(defun binding-native-payload-p (name)
+  (let ((binding (assoc name *function-bindings*)))
+    (fourth (find-if (lambda (fact) (and (eq name (first fact)) (eq binding (second fact))))
+                     *mutable-invariant-bindings*))))
 
 (defun binding-value-domain (name)
   ;; Predicate refinement cannot restore an initial or path-local fact across
@@ -1647,7 +1662,11 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
               (setf functions (acons name :unknown (remove name functions :key #'car)))
               (setf binding (assoc name functions)))
             (setf (cdr fact) domain)
-            (let ((candidate (list name binding domain)))
+            ;; Custody is independent of shape: POP can lose LIST geometry
+            ;; while retaining the initial native payload guarantee.
+            (let ((candidate (list name binding domain
+                                   (or (binding-native-payload-p name)
+                                       (not (graph-private-payload-domain-p build previous))))))
               (push candidate candidates) (push candidate invariants))))))
     (let ((*argument-domains* domains) (*function-bindings* functions)
           (*mutable-invariant-bindings* invariants))
@@ -1660,14 +1679,19 @@ origin always survives; this analysis never rejects SETQ by itself. Existing con
           (let* ((old (third candidate))
                  (inputs (loop for write in writes when (eq (car write) (first candidate))
                                collect (value-domain build (cdr write))))
+                 (nativep (and (fourth candidate)
+                               (loop for write in writes
+                                     always (or (not (eq (car write) (first candidate)))
+                                                (graph-native-payload-form-p build (cdr write))))))
                  (domain (cond ((or (external-result-domain-p old) (some #'external-result-domain-p inputs))
                                 :external-result)
                                ((or (eq old :unknown)
                                     (not (every (lambda (input) (subtype-domain-p build input old)) inputs)))
                                 :unknown)
                                (t old))))
-            (unless (equal old domain)
+            (unless (and (equal old domain) (eql (fourth candidate) nativep))
               (setf (third candidate) domain
+                    (fourth candidate) nativep
                     (cdr (assoc (first candidate) domains)) domain
                     changed t))))
         (unless changed (return))))
@@ -3632,17 +3656,6 @@ reflection, lexical rebinding and class values still require their own ABI."
                   (not (and *initialization-phase* (eq (car form) 'setf))))
          (loop for (place value) on (cdr form) by #'cddr
                do (audit-external-place-value build place value)))
-       (when (and (not open) (member (car form) '(push pushnew)))
-         (audit-external-place-value build (caddr form) (cadr form)))
-       (when (and (not open) (member (car form) '(incf decf push pushnew pop)))
-         ;; These forms still execute as the ordinary host macros. Successful
-         ;; arithmetic updates supply a number; PUSH supplies a cons. POP's
-         ;; new CDR can be any object, so it contributes an unknown value.
-         (audit-place-writer build (if (member (car form) '(push pushnew)) (caddr form) (cadr form))
-                             (case (car form)
-                               ((incf decf) '(+ 0))
-                               ((push pushnew) '(cons nil nil))
-                               (pop '(cdr nil))) local))
        (case (car form)
          (setf
           `(setf ,@(loop for (place value) on (cdr form) by #'cddr
@@ -3660,12 +3673,37 @@ reflection, lexical rebinding and class values still require their own ABI."
                                    (note-initialization-place-write build place domain)
                                    (list location value-code))))))
          ((incf decf pop)
-          `(,(car form) ,(transform-place build (cadr form) package open local :readp t)
-                        ,@(body (cddr form))))
+          (let* ((place (second form))
+                 (location (transform-place build place package open local :readp t))
+                 ;; SBCL evaluates the numeric delta before the old getter.
+                 ;; Child receipts preserve the delta's actual returned value.
+                 (operands (body (cddr form))))
+            (unless open
+              (let ((old-domain (audit-place-reader build place local)))
+                (audit-graph-update-payload
+                 build old-domain (and (symbolp place) (binding-native-payload-p place))))
+              (dolist (operand (cddr form))
+                (audit-graph-update-payload build (value-domain build operand)
+                                            (graph-native-payload-form-p build operand)))
+              (audit-place-writer build place (if (eq (car form) 'pop) '(cdr nil) '(+ 0)) local))
+            `(,(car form) ,location ,@operands)))
          ((push pushnew)
-          `(,(car form) ,(walk (cadr form))
-                        ,(transform-place build (caddr form) package open local :readp t)
-                        ,@(body (cdddr form))))
+          (let* ((item (walk (second form)))
+                 (item-domain (value-domain build (second form)))
+                 (native-item-p (and (symbolp (second form)) (binding-native-payload-p (second form))))
+                 (place (third form))
+                 (location (transform-place build place package open local :readp t))
+                 ;; The old getter precedes PUSHNEW's keyword operands. Do
+                 ;; not reconstruct it after a keyword form has changed state.
+                 (old-domain (if open (value-domain build place) (audit-place-reader build place local)))
+                 (native-old-p (and (symbolp place) (binding-native-payload-p place)))
+                 (keywords (body (cdddr form))))
+            (unless open
+              (audit-graph-update-payload build item-domain native-item-p)
+              (audit-graph-update-payload build old-domain native-old-p)
+              (audit-external-place-value build place (second form))
+              (audit-place-writer build place '(cons nil nil) local))
+            `(,(car form) ,item ,location ,@keywords)))
          (otherwise `(,(car form) ,@(body (cdr form))))))
       ((member (car form) '(slot-value slot-boundp slot-makunbound))
        (when (and open (entry-rooted-deployment-p build))
@@ -3801,6 +3839,23 @@ reflection, lexical rebinding and class values still require their own ABI."
       (t (fail build 'snowgrave:unsupported-definition :computed-operator
                "Computed operator forms are not in the audited source fragment.")))))
 
+(defun audit-place-reader (build place local)
+  "Audit one getter at its actual macro read point; emit no extra read."
+  (when (consp place)
+    (cond ((eq (car place) 'slot-value)
+           (audit-graph-record-slot build (second place) (third place) :bound t))
+          ((member (car place) '(getf gethash aref svref sbit bit car cdr))
+           (audit-ordinary-operation build (car place) (cdr place) local nil))
+          ((not (member-name (car place) local))
+           (audit-generic-call build (car place) (cdr place))
+           (audit-function-call build (car place) (cdr place))
+           (audit-external-call build (car place) (cdr place)))))
+  (if (and *initialization-phase* (record-flow-owned-call-p build place))
+      ;; Getter effects occur before the writer. Use the same call receipt
+      ;; owner as ordinary calls; do not borrow the pre-getter state row.
+      (return-summary-primary (record-flow-call-receipt build place))
+      (value-domain build place)))
+
 (defun transform-place (build place package open local &key readp)
   (cond ((symbolp place)
          (if (member place (build-globals build)) (global-binding-name build place package open) place))
@@ -3823,10 +3878,6 @@ reflection, lexical rebinding and class values still require their own ABI."
            (validate-hash-access build (cadr place) (caddr place)))
          (cons (car place) (transform-body build (cdr place) package :open open :local local)))
         ((and (consp place) (function-target-p build (list 'setf (car place)) local))
-         (when (and readp (not open) (not (member-name (car place) local)))
-           (audit-generic-call build (car place) (cdr place))
-           (audit-function-call build (car place) (cdr place))
-           (audit-external-call build (car place) (cdr place)))
          (multiple-value-bind (callee fixedp)
              (direct-call-name build (list 'setf (car place)) package open local (length place))
            ;; Read/modify/write needs BOTH conventions to agree. An unrelated

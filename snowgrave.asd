@@ -70,6 +70,7 @@
                (:file "tests/constructor-state")
                (:file "tests/callable-payloads")
                (:file "tests/generic-error-authority")
+               (:file "tests/place-update-inputs")
                (:file "tests/initialization-phase")
                (:file "tests/relational-state")
                (:file "tests/native-materialization"))

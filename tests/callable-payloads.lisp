@@ -58,6 +58,7 @@
            (check (typep error 'type-error))
            (check (eq (type-error-datum error) (fdefinition native-datum)))))
         (t
+         (when condition (error "~S unexpectedly refused: ~A" tag condition))
          (check (null condition))
          (check (equal expected (multiple-value-list (funcall entry native-root))))
          (check (equal expected (multiple-value-list

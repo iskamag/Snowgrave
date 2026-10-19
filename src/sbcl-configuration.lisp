@@ -755,6 +755,27 @@ The existing literal pool consumes these cold node recipes for shell/fill."
               "Every public state entry must keep private records and dependent aggregates/callables behind its native result boundary."
               :reachability)))))
 
+(defun graph-native-payload-form-p (build form)
+  ;; Reuse the mutable-binding fixed point, not a fresh value/shape assertion.
+  ;; CONS preserves its operands; a successful CDR only selects old payload.
+  (cond ((and (symbolp form) (assoc form *function-bindings*))
+         (or (binding-native-payload-p form)
+             (not (graph-private-payload-domain-p build (value-domain build form)))))
+        ((and (consp form) (member (first form) '(cons cdr)))
+         (every (lambda (argument) (graph-native-payload-form-p build argument)) (rest form)))
+        (t (not (graph-private-payload-domain-p build (value-domain build form))))))
+
+(defun audit-graph-update-payload (build domain &optional nativep)
+  ;; Host read/modify/write macros can fail before their writer runs. Their
+  ;; old value, numeric delta, new item or list tail can become a condition
+  ;; datum or an aggregate edge. The successful writer's value is no proof
+  ;; about these distinct inputs. Unchanged native callable bindings retain
+  ;; their actual identity; relocated/opaque payloads need an explicit ABI.
+  (when (and (graph-state-profile-p build) (not *collect-function-flow*)
+             (not nativep) (graph-private-payload-domain-p build domain))
+    (fail build 'snowgrave:unclosed-call :graph-state-update-input
+          "A native place update needs a data/error proof for its old value and operands." :reachability)))
+
 
 ;;;; Construction shares finalized layout, source, lambda and return owners.
 
