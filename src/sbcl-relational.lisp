@@ -379,10 +379,13 @@
     (when (eq (relational-base callee-domain) :pending)
       (pending-record-flow-state)
       (return-from record-flow-call-receipt :pending))
-    (multiple-value-bind (arguments bindings completep variable-tail)
+    (multiple-value-bind (arguments bindings completep variable-tail pendingp)
         (if (member (first form) '(funcall apply multiple-value-call))
             (ordinary-call-argument-plan build form) (values (rest form) nil t nil))
       (unless completep
+        (when pendingp
+          (pending-record-flow-state)
+          (return-from record-flow-call-receipt :pending))
         (forget-initialization-state)
         (return-from record-flow-call-receipt (make-return-summary (list :external-result) nil)))
       (let* ((*argument-domains* (append bindings *argument-domains*)) (*flow-deferred-call-p* t)

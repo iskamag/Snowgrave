@@ -1250,10 +1250,10 @@ The stable key names its owner obligation, never a class or slot type."
               (values (butlast (cddr form)) nil t
                       (if (external-result-domain-p (value-domain build tail)) :external-result t))))))
     (multiple-value-call
-     (multiple-value-bind (arguments bindings domains completep)
+     (multiple-value-bind (arguments bindings domains completep pendingp)
          (multiple-value-call-plan build (cddr form) :literal-proofs nil)
        (declare (ignore bindings))
-       (values arguments domains completep)))))
+       (values arguments domains completep nil pendingp)))))
 
 (defun native-sequence-argument-position (name)
   (case name ((coerce length fill reverse) 0) ((remove delete) 1)))
@@ -2465,10 +2465,13 @@ Unknown/native operations retain only their existing primary fact."
 (defun multiple-value-call-plan (build producers &key (literal-proofs t))
   "Describe a finite complete producer tuple without executing its proof forms.
 Runtime bindings preserve each original producer; opaque domain facts feed the
-existing call audits. Literal VALUES keeps its stronger source-tree proofs."
+existing call audits. Literal VALUES keeps its stronger source-tree proofs.
+The fifth value distinguishes pending producers from genuine incomplete counts."
   (let (arguments bindings domains)
     (dolist (producer producers)
       (let ((summary (form-return-summary build producer)))
+        (when (eq summary :pending)
+          (return-from multiple-value-call-plan (values nil nil nil nil t)))
         (unless (and (return-summary-p summary) (return-summary-completep summary))
           (return-from multiple-value-call-plan (values nil nil nil nil)))
         (let* ((positions (return-summary-domains summary))

@@ -189,6 +189,40 @@
     (defun run (object &optional (callback (target)))
       (funcall callback 23 object) (slot-value object 'data))"
    "(run object)" :expected '(23))
+  (callable-retention-case :helper-default-mvc-secondary
+   "(defun target () #'operation)
+    (defun pair (first second) (values first second))
+    (defun run (object &optional (callback (target)))
+      (multiple-value-call #'pair (funcall callback object)))"
+   "(run object)" :operation-body "(values (slot-value object 'data) :ok)" :expected '(17 :ok))
+  (callable-retention-case :helper-default-mvc-order
+   "(defun target () #'operation)
+    (defun triple (first second third) (values first second third))
+    (defun run (object &optional (callback (target)))
+      (multiple-value-call #'triple (values :head) (funcall callback object)))"
+   "(run object)" :operation-body "(values (slot-value object 'data) :ok)" :expected '(:head 17 :ok))
+  (callable-retention-case :helper-default-mvc-zero
+   "(defun target () #'operation)
+    (defun zero () 17)
+    (defun run (object &optional (callback (target)))
+      (multiple-value-call #'zero (funcall callback object)))"
+   "(run object)" :operation-body "(values)" :expected '(17))
+  (callable-retention-case :helper-default-mvc-prefix-effect
+   "(defun target () #'operation)
+    (defun triple (first second third) (values first second third))
+    (defun run (object &optional (callback (target)))
+      (multiple-value-call #'triple
+        (progn (setf (slot-value object 'data) 19) (values :head))
+        (funcall callback object)))"
+   "(run object)" :operation-body "(values (slot-value object 'data) :ok)" :expected '(:head 19 :ok))
+  (callable-retention-case :helper-default-mvc-variable-count
+   "(defun other (object) (declare (ignore object)) (values 17 :ok :extra))
+    (defun target (flag) (if flag #'operation #'other))
+    (defun pair (first second) (values first second))
+    (defun run (object flag &optional (callback (target flag)))
+      (multiple-value-call #'pair (funcall callback object)))"
+   "(run object t) (run object nil)"
+   :operation-body "(values 17 :ok)" :refusal :multiple-value-arguments)
   ;; Independent identity never means native data or publication authority.
   (dolist (spec '((:result "callback" :graph-state-result)
                   (:aggregate "(list callback) 17" :graph-state-operation-input)
