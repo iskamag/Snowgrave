@@ -13,6 +13,23 @@
        (defmethod backing ((x anchor)) (slot-value x 'data))
        (defun store (x) (setf (svref (backing x) 1) 23) (length (backing x))))"
     "(eql (store root) 2)" :expected '(t))
+  (relational-state-case :native-aref-state "()"
+    "(let ((saved (slot-value root 'data)))
+       (setf (aref (slot-value root 'data)
+                   (progn (snowgrave.tests::constructor-state-event :index) 1))
+             (progn (snowgrave.tests::constructor-state-event :value) 23))
+       (values (eq saved (slot-value root 'data)) (length (slot-value root 'data))))"
+    :expected '(t 2))
+  (relational-state-case :native-aref-helper-state
+    "((defgeneric backing (x))
+       (defmethod backing ((x anchor)) (slot-value x 'data))
+       (defun store (x) (setf (aref (backing x) 1) 23) (length (backing x))))"
+    "(eql (store root) 2)" :expected '(t))
+  (relational-state-case :native-aref-private-edge "()"
+    "(setf (aref (slot-value root 'data) 1) root) 17" :unsafe :graph-state-write)
+  (relational-state-case :native-setter-authored-call "()"
+    "(sb-kernel:vector-hairy-data-vector-set/check-bounds (slot-value root 'data) 1 23)"
+    :unsafe :call-target)
   (relational-state-case :native-cons-state "()"
     "(let ((pair (cons 17 nil)))
        (setf (car pair) 23 (cdr pair) (list 31))
@@ -46,7 +63,8 @@
     "(setf (slot-value root 'data) nil)
      (setf (getf (slot-value root 'data) :key) 17)
      (null (slot-value root 'data))" :unsafe :graph-state-slot-read)
-  (native-store-shared-effect-tests))
+  (native-store-shared-effect-tests)
+  (native-array-setter-condition-tests))
 
 (defun native-store-shared-effect-tests ()
   ;; STORE has one joined ordinary body over ROOT/DATA and WORDS/WORDS.
@@ -80,3 +98,29 @@
         (initialization-phase-source-check unit)
         (check (not (search ":RECORD-VIEW-CLASSES"
                             (with-output-to-string (stream) (snowgrave:write-unit-source unit stream)))))))))
+
+(defun native-array-setter-condition-tests ()
+  ;; The native condition retains the receiver array. Import that exact array
+  ;; so the comparison checks its identity as well as the index/type payload
+  ;; and cleanup ordering, rather than comparing unrelated private copies.
+  (let* ((package (make-package (format nil "SNOWGRAVE.NATIVE.SETTER.~D"
+                                      (incf *constructor-state-sequence*)) :use '("CL")))
+         (forms (constructor-state-read package
+                  "((defclass root () ((data :initarg :data)))
+                     (defun entry (root)
+                       (unwind-protect (setf (aref (slot-value root 'data) 99) 23)
+                         (snowgrave.tests::constructor-state-event :cleanup))))"))
+         (root (intern "ROOT" package)) (entry (intern "ENTRY" package)))
+    (mapc #'eval forms)
+    (let* ((array (vector 1 2)) (native (make-instance root :data array))
+           (installed (make-instance root :data array))
+           (unit (graph-state-close
+                  :native-array-setter-condition forms (list entry)
+                  (list (list entry (list (list 'eql installed))))
+                  :resources (list (list :backing array)) :external '(constructor-state-event)))
+           (observation (constructor-state-observation (lambda () (funcall entry native)) nil))
+           (closed (constructor-state-observation (graph-state-fixed unit entry) nil)))
+      (check (eq :error (first observation)))
+      (check (equal observation closed))
+      (check (equal '(:cleanup) (getf closed :events)))
+      (check (equalp #(1 2) array)))))

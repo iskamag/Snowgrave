@@ -691,9 +691,12 @@ order, before an identity choice. Unknown/nonkernel targets keep FUNCALL."
                              sb-kernel:two-arg-string-equal
                              ;; SEQTRAN's FILL specializations for ordinary data.
                              sb-kernel:list-fill sb-kernel:vector-fill
-                             ;; Compiler-selected, bounds-checked AREF for a
-                             ;; general vector (including adjustable/string).
+                             ;; Compiler-selected, bounds-checked AREF and
+                             ;; its setter for a general native vector. The
+                             ;; ARRAY.LISP widetag tables own element checks;
+                             ;; source/place payload admission remains separate.
                              sb-kernel:vector-hairy-data-vector-ref/check-bounds
+                             sb-kernel:vector-hairy-data-vector-set/check-bounds
                              ;; SEQTRAN's REVERSE rewrite-full-call selects
                              ;; these ordinary LIST/VECTOR implementations.
                              ;; LIST-REVERSE is the ENDP/POP/PUSH cons loop.
