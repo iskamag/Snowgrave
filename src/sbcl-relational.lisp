@@ -401,14 +401,20 @@
                         (target-domain (or (sixth target) (third target))))
                    (when possiblep
                      (dolist (field (second record))
-                       (let* ((key (initialization-field-key target (first field)))
+                       (let* (;; The callee joined every reached layout. An
+                              ;; effect on this target concerns only its saved
+                              ;; CURRENT class coverage, just as method input
+                              ;; projection does. Peer selectors still retain
+                              ;; their own source-class qualifiers below.
+                              (effect (select-record-field-view build field target-domain))
+                              (key (initialization-field-key target (first field)))
                               (prior (assoc key (initialization-phase-slots *initialization-phase*) :test #'equal))
-                              (status (second field))
-                              (value (substitute-record-flow-domain (third field) arguments before))
+                              (status (second effect))
+                              (value (substitute-record-flow-domain (third effect) arguments before))
                               (cases (mapcar (lambda (entry)
                                                (list (first entry) (second entry)
                                                      (substitute-record-flow-domain (third entry) arguments before)))
-                                             (fourth field)))
+                                             (fourth effect)))
                               (old (assoc key updates :test #'equal)))
                          (when (and prior (not strongp))
                            (setf cases (merge-record-field-cases build (first field) prior

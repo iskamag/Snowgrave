@@ -45,4 +45,38 @@
   (relational-state-case :native-getf-nested-place "()"
     "(setf (slot-value root 'data) nil)
      (setf (getf (slot-value root 'data) :key) 17)
-     (null (slot-value root 'data))" :unsafe :graph-state-slot-read))
+     (null (slot-value root 'data))" :unsafe :graph-state-slot-read)
+  (native-store-shared-effect-tests))
+
+(defun native-store-shared-effect-tests ()
+  ;; STORE has one joined ordinary body over ROOT/DATA and WORDS/WORDS.
+  ;; Its effect keeps per-class views, including ROOT's bound PEER field and
+  ;; WORDS's absent PEER. Replaying it on exact ROOT must project that view;
+  ;; copying the unconditional unknown PEER poisons the next actual call.
+  (let* ((package (make-package (format nil "SNOWGRAVE.NATIVE.STORE.~D"
+                                      (incf *constructor-state-sequence*)) :use '("CL")))
+         (forms (constructor-state-read package
+                  "((defclass root () ((data :initarg :data) (peer :initarg :peer)))
+                     (defclass words () ((words :initarg :words)))
+                     (defgeneric backing (x))
+                     (defmethod backing ((x root)) (slot-value x 'data))
+                     (defmethod backing ((x words)) (slot-value x 'words))
+                     (defun store (x) (setf (svref (backing x) 0) 23))
+                     (defun entry (root)
+                       (store root) (store (slot-value root 'peer))
+                       (values (length (backing root))
+                               (length (backing (slot-value root 'peer))))))"))
+         (root (intern "ROOT" package)) (words (intern "WORDS" package))
+         (entry (intern "ENTRY" package)) (backing (intern "BACKING" package)))
+    (mapc #'eval forms)
+    (flet ((make-root () (make-instance root :data (vector 1 2 3)
+                                      :peer (make-instance words :words (vector 5 7)))))
+      (let* ((native (make-root)) (installed (make-root))
+             (unit (graph-state-close
+                    :native-store-shared-effect forms (list entry)
+                    (list (list entry (list (list 'eql installed)))) :generics (list backing))))
+        (check (equal '(3 2) (multiple-value-list (funcall entry native))))
+        (check (equal '(3 2) (multiple-value-list (funcall (graph-state-fixed unit entry)))))
+        (initialization-phase-source-check unit)
+        (check (not (search ":RECORD-VIEW-CLASSES"
+                            (with-output-to-string (stream) (snowgrave:write-unit-source unit stream)))))))))
