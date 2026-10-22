@@ -164,11 +164,13 @@
 
 (defun record-independent-native-place-p (build place local)
   ;; These admitted native setters change one container cell, not a record
-  ;; field. Their operands have already run through the ordinary place and
+  ;; field and cannot invoke user callbacks. Their operands have already run
+  ;; through the ordinary place and
   ;; payload audits. No element-value fact is retained here. GETF is different:
   ;; its expansion can replace the enclosing generalized place when it adds a
-  ;; property, so a nested record field still needs the conservative fallback.
-  (and (consp place) (member (first place) '(aref svref bit sbit car cdr gethash))
+  ;; property. GETHASH can invoke a table's hash/test functions. Both retain
+  ;; the conservative fallback rather than acquiring a purity premise here.
+  (and (consp place) (member (first place) '(aref svref bit sbit car cdr))
        (standard-operation-meaning-p build (first place) local)
        (standard-operation-meaning-p build (list 'setf (first place)) local)))
 

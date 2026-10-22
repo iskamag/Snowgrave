@@ -64,7 +64,27 @@
      (setf (getf (slot-value root 'data) :key) 17)
      (null (slot-value root 'data))" :unsafe :graph-state-slot-read)
   (native-store-shared-effect-tests)
-  (native-array-setter-condition-tests))
+  (native-array-setter-condition-tests)
+  (native-store-effect-coverage-tests))
+
+(defun native-store-effect-coverage-tests ()
+  ;; Test the transfer boundary directly: an incomplete finite case list is
+  ;; not exhaustive when the target's CURRENT coverage is unknown or absent.
+  ;; In admitted calls, the existing input-coverage owner separately checks
+  ;; all actual rows; this transfer must not invent that premise on its own.
+  (dolist (coverage '((:record-view-classes native-store-owner) :unknown :pending nil))
+    (let* ((key (gensym "CURRENT-TARGET"))
+           (snowgrave.sbcl::*initialization-phase*
+             (snowgrave.sbcl::make-initialization-phase
+              :relationalp t :records `((0 ,key native-store-owner nil t ,coverage))
+              :slots '(((:formal 0 data) nil :external-result))))
+           (effects '((0 ((data nil :external-result ((native-store-owner t vector)))))))
+           (arguments `((:initializing-record ,key native-store-owner))))
+      (snowgrave.sbcl::apply-record-flow-effects (snowgrave.sbcl::make-build) effects arguments nil)
+      (let ((field (first (snowgrave.sbcl::initialization-phase-slots snowgrave.sbcl::*initialization-phase*))))
+        (if (consp coverage)
+            (progn (check (eq t (second field))) (check (eq 'vector (third field))))
+            (progn (check (null (second field))) (check (eq :external-result (third field)))))))))
 
 (defun native-store-shared-effect-tests ()
   ;; STORE has one joined ordinary body over ROOT/DATA and WORDS/WORDS.

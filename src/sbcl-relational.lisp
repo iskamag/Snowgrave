@@ -406,7 +406,11 @@
                               ;; CURRENT class coverage, just as method input
                               ;; projection does. Peer selectors still retain
                               ;; their own source-class qualifiers below.
-                              (effect (select-record-field-view build field target-domain))
+                              ;; A nominal/unknown carrier is not an exhaustive
+                              ;; CURRENT view. Retain the unconditional effect
+                              ;; there even if it has some finite class cases.
+                              (effect (if (record-view-domain-p (sixth target))
+                                          (select-record-field-view build field (sixth target)) field))
                               (key (initialization-field-key target (first field)))
                               (prior (assoc key (initialization-phase-slots *initialization-phase*) :test #'equal))
                               (status (second effect))
