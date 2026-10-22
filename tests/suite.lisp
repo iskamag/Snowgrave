@@ -4361,6 +4361,7 @@
     (initialization-phase-tests)
     (relational-state-tests)
     (current-record-view-tests)
+    (native-store-state-tests)
     (configured-edge-envelope-tests)
     (native-materialization-tests)
     (binding-owner-tests)

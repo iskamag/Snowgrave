@@ -82,6 +82,7 @@
                (:file "tests/initialization-phase")
                (:file "tests/relational-state")
                (:file "tests/current-record-views")
+               (:file "tests/native-store-state")
                (:file "tests/configured-edge-envelopes")
                (:file "tests/native-materialization"))
   :perform (asdf:test-op (operation component)

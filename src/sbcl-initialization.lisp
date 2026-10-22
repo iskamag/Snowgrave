@@ -162,7 +162,17 @@
            (member-name (first form) (getf (build-declaration build) :closed-generics))
            (some (lambda (part) (initialization-effectful-form-p build part)) (rest form)))))
 
-(defun note-initialization-place-write (build place domain &optional (saved-receiver nil savedp))
+(defun record-independent-native-place-p (build place local)
+  ;; These admitted native setters change one container cell, not a record
+  ;; field. Their operands have already run through the ordinary place and
+  ;; payload audits. No element-value fact is retained here. GETF is different:
+  ;; its expansion can replace the enclosing generalized place when it adds a
+  ;; property, so a nested record field still needs the conservative fallback.
+  (and (consp place) (member (first place) '(aref svref bit sbit car cdr gethash))
+       (standard-operation-meaning-p build (first place) local)
+       (standard-operation-meaning-p build (list 'setf (first place)) local)))
+
+(defun note-initialization-place-write (build place domain &optional (saved-receiver nil savedp) local)
   ;; Called by the existing SETF owner after one storing form has completed,
   ;; before evaluation of the next pair. The value domain is captured at its
   ;; actual RHS evaluation point, after place subforms and before RHS effects.
@@ -174,7 +184,8 @@
                 (note-graph-field-write build place receiver slot t domain)
                 (phase-slot-update build (second place) slot t domain receiver))
               (forget-initialization-state)))
-        (unless (symbolp place) (forget-initialization-state)))))
+        (unless (or (symbolp place) (record-independent-native-place-p build place local))
+          (forget-initialization-state)))))
 
 (defun call-with-initialization-default-effects (build name contract process)
   ;; OPTIONAL/KEY initializer syntax is emitted even when a supplied value
