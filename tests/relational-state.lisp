@@ -294,6 +294,18 @@
    "((defgeneric value (x))
       (defmethod value ((x anchor)) (declare(ignore x)) :pending))"
    "(eq(value root):pending)" :generics '("value"))
+  (relational-state-case :class-qualified-disjoint-fields
+    "((defclass left () ((data :initform (vector 17 23))))
+       (defclass right () ((words :initform (vector 31))))
+       (defgeneric measure (x))
+       (defmethod measure ((x left)) (length (slot-value x 'data)))
+       (defmethod measure ((x right)) (length (slot-value x 'words)))
+       (defun read-owner (x) (measure x)))"
+    "(declare (ignore root))
+     (snowgrave.tests::constructor-state-event
+       (and (= 2 (read-owner (make-instance 'left)))
+            (= 1 (read-owner (make-instance 'right))))) t"
+    :fresh t)
   ;; Two layouts enumerate their shared slot in different positions. A
   ;; keyed input join must stabilize without a semantic iteration cutoff.
   (relational-state-case :different-layout-slot-order

@@ -3037,7 +3037,10 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
 (defun intersect-method-cell-domain (build actual cell)
   ;; Return a binding fact and whether this caller can occupy the already
   ;; selected cell. UNKNOWN/captures cannot establish a private node identity.
-  (cond ((eq actual :pending) (values :pending t))
+  (cond ((relational-value-domain-p actual)
+         (multiple-value-bind (selected possiblep) (intersect-method-cell-domain build (third actual) cell)
+           (values (if possiblep (list :relational-value (second actual) selected) selected) possiblep)))
+        ((eq actual :pending) (values :pending t))
         ((eq cell t) (values actual t))
         ((member actual '(:unknown :external-result)) (values cell t))
         (t (let ((selected :pending) (compatiblep nil))
@@ -3065,7 +3068,7 @@ summary, but cannot hide a return out of the ordinary function or its cleanup."
            (let ((supplied nil)
                  (compatiblep (or capture (initialization-generic-p generic)
                                   (not (configured-callable-retention-p build))
-                                  (generic-call-row-possible-p build domains variable-tail count))))
+                                  (generic-call-row-possible-p build domains variable-tail count input))))
              (loop for cell in *cell-domains* for position from 0
                    do (multiple-value-bind (fact possiblep)
                           (if (or capture (initialization-generic-p generic)
@@ -5722,6 +5725,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
              (unless *function-flow-changed*
                (settle-retained-callables build)
                (maphash (lambda (name domains)
+                          (settle-record-field-cases build domains)
                           (when (member :pending (flow-input-domains domains))
                             (if (record-flow-input-p domains)
                                 (setf (record-flow-input-domains domains)
@@ -5732,6 +5736,7 @@ and class audits with the fixed point. Unknown captures poison the proof."
                (maphash (lambda (name shapes)
                           (declare (ignore name))
                           (maphash (lambda (key domains)
+                                     (settle-record-field-cases build domains)
                                      (when (member :pending (flow-input-domains domains))
                                        (if (record-flow-input-p domains)
                                            (setf (record-flow-input-domains domains)

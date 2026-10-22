@@ -4360,6 +4360,7 @@
     (parser-input-tests)
     (initialization-phase-tests)
     (relational-state-tests)
+    (current-record-view-tests)
     (configured-edge-envelope-tests)
     (native-materialization-tests)
     (binding-owner-tests)

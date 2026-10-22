@@ -114,6 +114,11 @@
   ;; still be nominal (a base-specialized method also accepts subclasses).
   (cond ((relational-value-domain-p domain)
          (generic-error-private-classes build (third domain)))
+        ((and (consp domain) (eq (first domain) 'or))
+         (when (every (lambda (part) (generic-error-private-classes build part)) (rest domain))
+           (remove-duplicates
+            (loop for part in (rest domain) append (generic-error-private-classes build part))
+            :test #'name= :from-end t)))
         ((graph-node-domain-p domain)
          (let ((class (getf (graph-node-row build domain) :class)))
            (when class (list class))))
@@ -124,6 +129,12 @@
            (remove-if-not (lambda (class) (subtype-domain-p build class base))
                           (build-classes build))))))
 
+(defun ordered-private-class-cell-p (build class cell axis)
+  ;; One ordered-guard owner for error feasibility and conditional state views.
+  (name= cell (find-if (lambda (guard)
+                        (if (member-name guard (build-classes build))
+                            (name= class guard) (subtype-domain-p build class guard))) axis)))
+
 (defun generic-error-axis-possible-p (build domain cell axis)
   ;; Reflect the ordered emitted CELL-TEST guards, not only method
   ;; specialization overlap. Private guards test an exact layout; native
@@ -133,12 +144,7 @@
      (let ((classes (generic-error-private-classes build part)))
        (if classes
            (some (lambda (class)
-                   (name= cell
-                          (find-if
-                           (lambda (guard)
-                             (if (member-name guard (build-classes build))
-                                 (name= class guard)
-                                 (subtype-domain-p build class guard))) axis)))
+                   (ordered-private-class-cell-p build class cell axis))
                  classes)
            (and (nth-value 1 (intersect-method-cell-domain build part cell))
                 (not (loop for earlier in axis until (name= earlier cell)
@@ -146,15 +152,19 @@
                                         (subtype-domain-p build part earlier))))))))
    (domain-alternatives domain)))
 
-(defun generic-call-row-possible-p (build domains variable-tail count)
+(defun generic-call-row-possible-p (build domains variable-tail count &optional input)
   "Whether a raw caller tuple can reach the current ordered dispatch cell."
   (and (or variable-tail (>= count (length *cell-domains*)))
        (or (null *cell-axis-domains*)
            (loop for cell in *cell-domains* for axis in *cell-axis-domains*
                  for position from 0
-                 always (generic-error-axis-possible-p
-                         build (if (< position count) (nth position domains) :unknown)
-                         cell axis)))))
+                 for row = (when (record-flow-input-p input) (assoc position (record-flow-input-records input)))
+                 for coverage = (fifth row)
+                 always (if (and (consp coverage) (eq (first coverage) :record-view-classes))
+                            (some (lambda (class) (ordered-private-class-cell-p build class cell axis))
+                                  (rest coverage))
+                            (generic-error-axis-possible-p
+                             build (if (< position count) (nth position domains) :unknown) cell axis))))))
 
 (defun map-generic-program-call-inputs (build generic process)
   ;; Capture rows are retained arbitrary-body obligations, not evidence that
@@ -167,7 +177,7 @@
             (destructuring-bind (capture variable-tail count literal-names &optional native-payloads) key
               (declare (ignore literal-names))
               (let ((domains (if (record-flow-input-p input) (record-flow-positional-inputs input) input)))
-                (when (and (not capture) (generic-call-row-possible-p build domains variable-tail count))
+                (when (and (not capture) (generic-call-row-possible-p build domains variable-tail count input))
                   (funcall process domains variable-tail native-payloads))))))))
 
 (defun generic-miss-has-program-caller-p (build generic)

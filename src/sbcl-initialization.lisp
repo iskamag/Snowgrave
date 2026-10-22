@@ -3,6 +3,9 @@
 ;;;; Receiver-scoped initialization continuation proof. These cells are cold.
 
 (defstruct initialization-phase
+  ;; Relational RECORDS are (position key nominal-class origin privacy
+  ;; current-class-coverage). Effects and field writes change CURRENT slots;
+  ;; they do not restore an origin snapshot or erase exact layout coverage.
   key class slots records aliases relationalp
   (selection :unknown))
 
@@ -57,6 +60,17 @@
 (defun initialization-field-key (record slot)
   (if (first record) (list :formal (first record) slot) slot))
 
+(defun initialization-field-slot (key)
+  (if (and (consp key) (eq (first key) :formal)) (third key) key))
+
+(defun initialization-field-owner-domain (key)
+  ;; A field's saved CURRENT owner supplies class coverage, including states
+  ;; whose value proof is pending, forgotten, or replaced by a direct store.
+  (if (and (consp key) (eq (first key) :formal))
+      (let ((record (assoc (second key) (initialization-phase-records *initialization-phase*))))
+        (or (sixth record) (third record)))
+      (initialization-phase-class *initialization-phase*)))
+
 (defun initialization-record-row (domain)
   (let ((record (initialization-domain-record domain)))
     (when (and record (listp (initialization-phase-slots *initialization-phase*)))
@@ -66,7 +80,7 @@
                                   (and (consp (first field)) (= (second (first field)) (first record)))
                                   (symbolp (first field)))
                          collect (list (if (first record) (third (first field)) (first field))
-                                       (second field) (third field)))))))
+                                       (second field) (third field) (fourth field)))))))
 
 (defun copy-initialization-state ()
   (when *initialization-phase* (copy-tree (initialization-phase-slots *initialization-phase*))))
@@ -88,7 +102,10 @@
             (list (first a) (cond ((eq (second a) :pending) (second b))
                                   ((eq (second b) :pending) (second a))
                                   ((eq (second a) (second b)) (second a)))
-                  (merge-value-domains build (third a) (third b)))) left right))
+                  (merge-value-domains build (third a) (third b))
+                  (merge-record-field-cases build (initialization-field-slot (first a)) a b
+                                            (initialization-field-owner-domain (first a))
+                                            (initialization-field-owner-domain (first b))))) left right))
 
 (defun call-with-initialization-state (state process)
   (let ((*initialization-phase* (copy-initialization-phase *initialization-phase*)))
@@ -128,6 +145,7 @@
                (field (assoc (initialization-field-key record slot)
                              (initialization-phase-slots *initialization-phase*) :test #'equal)))
           (when (and (some #'identity relations) field)
+            (set-record-field-cases field nil)
             (if strongp (setf (second field) status (third field) value)
                 (setf (second field) (if (eq (second field) status) status nil)
                       (third field) (merge-value-domains build (third field) value)))))))))

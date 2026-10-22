@@ -4,8 +4,11 @@
 ;;;; Formal positions are source roles. No activation key leaves a carrier.
 
 ;; DOMAINS are the ordinary nominal input tuple. Each RECORD is
-;; (position fields original-provenance may-private-p), where FIELDS contain
-;; the same (slot boundness value-domain) facts used by actual slot reads.
+;; (position fields original-provenance may-private-p current-class-coverage).
+;; FIELDS begin with the same (slot boundness value-domain) unconditional
+;; facts used by actual slot reads; an optional fourth item holds class views.
+;; Coverage is (:record-view-classes exact-layout ...), :PENDING bottom, or
+;; :UNKNOWN. In particular the empty finite set is not an unknown owner.
 ;; The privacy envelope distinguishes a real fresh shell from an ordinary
 ;; disjoint nominal cell even after its activation identity is erased.
 (defstruct (record-flow-input (:constructor make-record-flow-input (domains records aliases &optional modes)))
@@ -30,7 +33,7 @@
         ((or (eq left :havoc) (eq right :havoc)) :havoc)
         (t (merge-record-flow-rows build left right))))
 
-(defun merge-record-flow-fields (build left right)
+(defun merge-record-flow-fields (build left right left-domain right-domain)
   ;; Preserve the existing key order and append only new keys. Retaining the
   ;; last occurrence would reorder an unchanged union on each caller join.
   (loop for slot in (remove-duplicates (append (mapcar #'first left) (mapcar #'first right)) :from-end t)
@@ -38,13 +41,17 @@
         collect (list slot (and a b (cond ((eq (second a) :pending) (second b))
                                            ((eq (second b) :pending) (second a))
                                            ((eq (second a) (second b)) (second a))))
-                      (if (and a b) (merge-value-domains build (third a) (third b)) :external-result))))
+                      (if (and a b) (merge-value-domains build (third a) (third b)) :external-result)
+                      (merge-record-field-cases build slot a b left-domain right-domain))))
 
 (defun merge-record-flow-rows (build left right &optional left-domains right-domains)
   (loop for index in (remove-duplicates (append (mapcar #'first left) (mapcar #'first right)) :from-end t)
         for a = (assoc index left) for b = (assoc index right)
         collect (list index
-                      (cond ((and a b) (merge-record-flow-fields build (second a) (second b)))
+                      (cond ((and a b) (merge-record-flow-fields
+                                       build (second a) (second b)
+                                       (record-flow-row-view-domain build a (nth index left-domains))
+                                       (record-flow-row-view-domain build b (nth index right-domains))))
                             ;; A wholly pending argument has contributed no
                             ;; possible record state yet. Its missing row is
                             ;; bottom, unlike a known argument without proof.
@@ -56,7 +63,10 @@
                             ((and (null a) (eq (nth index left-domains) :pending)) (third b))
                             ((and (null b) (eq (nth index right-domains) :pending)) (third a))
                             ((or (third a) (third b)) (relational-base (third (or a b)))))
-                      (or (fourth a) (fourth b)))))
+                      (or (fourth a) (fourth b))
+                      (merge-record-view-domains
+                       build (record-flow-row-view-domain build a (nth index left-domains))
+                       (record-flow-row-view-domain build b (nth index right-domains))))))
 
 (defun record-flow-identity (domain)
   (cond ((initializing-record-domain-p domain) (list :activation (second domain)))
@@ -83,19 +93,25 @@
   (let* ((parts (domain-alternatives (relational-base domain)))
          (rows (mapcar (lambda (part) (private-record-slot-row build part)) parts)))
     (when (every #'identity rows)
-      (reduce (lambda (left right) (merge-record-flow-fields build left right))
-              (mapcar (lambda (part row)
-                        (loop for field in (getf row :slots)
-                              collect (multiple-value-bind (status value presentp)
-                                          (record-slot-entry-fact build part (first field))
-                                        (declare (ignore presentp))
-                                        (list (first field) status value)))) parts rows)))))
+      (loop with fields = nil with owner-domain = :pending
+            for part in parts for row in rows
+            for current = (loop for field in (getf row :slots)
+                                collect (multiple-value-bind (status value presentp cases)
+                                            (record-slot-entry-fact build part (first field))
+                                          (declare (ignore presentp))
+                                          (let ((fact (list (first field) status value cases)))
+                                            (set-record-field-cases fact (record-field-cases build (first field) fact part)))))
+            do (setf fields (if fields (merge-record-flow-fields build fields current owner-domain part) current)
+                     owner-domain (merge-value-domains build owner-domain part))
+            finally (return fields)))))
 
 (defun record-flow-entry-fields (build domain arguments)
   (when (flow-record-domain-p build domain)
     (mapcar (lambda (field)
               (list (first field) (second field)
-                    (normalize-record-flow-domain (third field) arguments)))
+                    (normalize-record-flow-domain (third field) arguments)
+                    (map-record-field-cases (fourth field)
+                                            (lambda (value) (normalize-record-flow-domain value arguments)))))
             (record-flow-field-facts build domain))))
 
 (defun record-flow-domains-overlap-p (build left right)
@@ -127,11 +143,17 @@
               ;; A nominal caller contributes an unknown entry view, including
               ;; unbound fields. It can never borrow another caller's row.
               (unless fields
-                (let ((layout (find (private-record-domain-base domain) (build-layouts build)
-                                    :key (lambda (row) (getf row :class)) :test #'name=)))
-                  (setf fields (mapcar (lambda (slot) (list slot nil :external-result)) (getf layout :slots)))))
+                (let ((slots (remove-duplicates
+                              (loop for class in (record-view-classes build domain)
+                                    for layout = (find class (build-layouts build)
+                                                       :key (lambda (row) (getf row :class)) :test #'name=)
+                                    append (getf layout :slots)))))
+                  (setf fields (mapcar (lambda (slot) (list slot nil :external-result)) slots))))
+              (setf fields (mapcar (lambda (field)
+                                    (append (subseq field 0 3)
+                                            (list (record-field-cases build (first field) field domain)))) fields))
               (push (list i fields (persistent-record-flow-domain domain)
-                          (graph-private-record-domain-p build domain)) records))
+                          (graph-private-record-domain-p build domain) (record-view-domain build domain)) records))
           do (loop for other in domains for j from 0 when (< i j) do
                (when (and (flow-record-domain-p build domain) (flow-record-domain-p build other))
                  (let ((relation (record-flow-domain-alias-relation build domain other)))
@@ -206,6 +228,11 @@
                 (let* ((actual-row (assoc (first record) (record-flow-input-records actual)))
                        (actual-fields (second actual-row)))
                   (and (or (not (fourth actual-row)) (fourth record))
+                       (or (null (fifth record))
+                           (record-view-domain-covered-p build
+                                                         (record-flow-row-view-domain build actual-row
+                                                                                      (nth (first record) (flow-input-domains actual)))
+                                                         (fifth record)))
                        (or (null (third record))
                            (flow-domain-covered-p build (third actual-row) (third record)))
                    (every (lambda (field)
@@ -215,7 +242,10 @@
                              ;; no presence or value. Presence checks still
                              ;; use every actual layout, not this envelope.
                              (and (or (null (second field)) (eq (second a) (second field)))
-                                  (record-flow-domain-covered-p build (third a) (third field)))))
+                                  (record-flow-domain-covered-p build (third a) (third field))
+                                  (record-field-cases-covered-p build a field
+                                                               (record-flow-row-view-domain
+                                                                build actual-row (nth (first record) (flow-input-domains actual)))))))
                          (second record)))))
               (record-flow-input-records expected))))
 
@@ -223,11 +253,21 @@
   (let ((records nil) (slots nil))
     (dolist (row (record-flow-input-records input))
       (let* ((position (first row)) (domain (nth position (record-flow-input-domains input)))
-             (class (value-domain-shape build domain)) (key (gensym "FORMAL-RECEIVER")))
-        (push (list position key class (third row) (fourth row)) records)
+             (class (value-domain-shape build domain)) (key (gensym "FORMAL-RECEIVER"))
+             (view-domain (record-flow-row-view-domain build row domain))
+             (classes (record-view-classes build view-domain))
+             (exact-class (when (and classes (null (rest classes))) (first classes))))
+        (push (list position key class (third row) (fourth row) view-domain) records)
         (dolist (field (second row))
           (push (list (list :formal position (first field)) (second field)
-                      (list :relational-value (list :field position (first field)) (third field))) slots))))
+                      (list :relational-value
+                            (append (list :field position (first field)) (when exact-class (list exact-class)))
+                            (third field))
+                      (mapcar (lambda (entry)
+                                (list (first entry) (second entry)
+                                      (list :relational-value
+                                            (list :field position (first field) (first entry)) (third entry))))
+                              (fourth field))) slots))))
     (make-initialization-phase :key nil :class nil :slots (nreverse slots)
                                :records (nreverse records) :aliases (record-flow-input-aliases input)
                                :relationalp t)))
@@ -257,7 +297,8 @@
           (setf (nth (first record) domains) (list :initializing-record (second record) (third record))))
         ;; Resolve finite peer/self edges only after every formal is present.
         (dolist (field (initialization-phase-slots *initialization-phase*))
-          (setf (third field) (instantiate-formal-entry-domain (third field))))
+          (setf (third field) (instantiate-formal-entry-domain (third field))
+                (fourth field) (map-record-field-cases (fourth field) #'instantiate-formal-entry-domain)))
         (funcall process domains))))
 
 (defun publish-record-flow-domain (domain)
@@ -277,7 +318,9 @@
                               (loop for field in (initialization-phase-slots *initialization-phase*)
                                     when (and (consp (first field)) (= (second (first field)) (first record)))
                                     collect (list (third (first field)) (second field)
-                                                  (publish-record-flow-domain (third field))))))
+                                                  (publish-record-flow-domain (third field))
+                                                  (map-record-field-cases (fourth field) #'publish-record-flow-domain)))
+                                (third record) nil (sixth record)))
           :havoc)))
 
 (defun publish-record-flow-summary (summary)
@@ -321,7 +364,10 @@
            (case (first selector)
              (:argument (or (nth position arguments) :unknown))
              (:field (let ((field (assoc (third selector) (second (assoc position entry-fields)))))
-                       (if field (third field) :external-result)))
+                       (if field
+                           (let ((entry (and (fourth selector)
+                                             (assoc (fourth selector) (fourth field) :test #'name=))))
+                             (if entry (third entry) (third field))) :external-result)))
              (t (third domain)))))
         ((and (consp domain) (eq (first domain) 'or))
          (cons 'or (mapcar (lambda (part) (substitute-record-flow-domain part arguments entry-fields)) (rest domain))))
@@ -351,25 +397,38 @@
                (dolist (target targets)
                  (let* ((relations (mapcar (lambda (part) (initialization-record-alias-relation build part target)) alternatives))
                         (strongp (every (lambda (relation) (eq relation :must)) relations))
-                        (possiblep (some #'identity relations)))
+                        (possiblep (some #'identity relations))
+                        (target-domain (or (sixth target) (third target))))
                    (when possiblep
                      (dolist (field (second record))
                        (let* ((key (initialization-field-key target (first field)))
                               (prior (assoc key (initialization-phase-slots *initialization-phase*) :test #'equal))
                               (status (second field))
                               (value (substitute-record-flow-domain (third field) arguments before))
+                              (cases (mapcar (lambda (entry)
+                                               (list (first entry) (second entry)
+                                                     (substitute-record-flow-domain (third entry) arguments before)))
+                                             (fourth field)))
                               (old (assoc key updates :test #'equal)))
                          (when (and prior (not strongp))
+                           (setf cases (merge-record-field-cases build (first field) prior
+                                                                (list (first field) status value cases)
+                                                                target-domain target-domain))
                            (setf status (if (eq status (second prior)) status nil)
                                  value (merge-value-domains build value (third prior))))
                          (when prior
                            (if old
                                (setf (second old) (if (eq (second old) status) status nil)
-                                     (third old) (merge-value-domains build (third old) value))
-                               (push (list key status value) updates))))))))))
+                                     (third old) (merge-value-domains build (third old) value)
+                                     (fourth old) (merge-record-field-cases build (first field) old
+                                                                           (list (first field) status value cases)
+                                                                           target-domain target-domain))
+                               (push (list key status value cases) updates))))))))))
            (dolist (update updates)
              (let ((field (assoc (first update) (initialization-phase-slots *initialization-phase*) :test #'equal)))
-               (when field (setf (second field) (second update) (third field) (third update)))))))))
+               (when field
+                 (setf (second field) (second update) (third field) (third update))
+                 (set-record-field-cases field (fourth update)))))))))
 
 (defun record-flow-call-receipt (build form)
   "Apply the settled contract after actual arguments, branching finite callees."
@@ -474,7 +533,6 @@
                     (list :relational-value (list :argument position) domain) domain)))
 
 (defun project-record-flow-input (build input projected)
-  (declare (ignore build))
   (let ((positions (mapcar (lambda (domain)
                              (when (and (relational-value-domain-p domain)
                                         (eq (first (second domain)) :argument))
@@ -493,8 +551,17 @@
        (loop for source in positions for position from 0
              for row = (when source (assoc source (record-flow-input-records input)))
              when row collect (list position (mapcar (lambda (field)
-                                                       (list (first field) (second field) (rename (third field))))
-                                                     (second row)) (third row) (fourth row)))
+                                                       (let ((narrowed (select-record-field-view
+                                                                         build field (nth position projected)
+                                                                         (nth position *cell-domains*)
+                                                                         (nth position *cell-axis-domains*))))
+                                                         (list (first narrowed) (second narrowed) (rename (third narrowed))
+                                                               (map-record-field-cases (fourth narrowed) #'rename))))
+                                                     (second row)) (third row) (fourth row)
+                                    (select-record-view-domain
+                                     build (record-flow-row-view-domain build row (nth source (flow-input-domains input)))
+                                     (nth position projected) (nth position *cell-domains*)
+                                     (nth position *cell-axis-domains*))))
        (loop for a in positions for i from 0 append
              (loop for b in positions for j from 0
                    for pair = (when (and a b (< i j)) (if (= a b) (list a b :must)
@@ -516,7 +583,10 @@
   (and (listp effects)
        (some (lambda (record)
                (some (lambda (field) (or (eq (second field) :pending)
-                                         (eq (third field) :pending))) (second record))) effects)))
+                                         (eq (third field) :pending)
+                                         (some (lambda (entry) (or (eq (second entry) :pending)
+                                                                   (eq (third entry) :pending))) (fourth field))))
+                     (second record))) effects)))
 
 (defun persistent-record-flow-domain (domain)
   (cond ((initializing-record-domain-p domain)

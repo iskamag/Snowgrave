@@ -5,6 +5,7 @@
         (metadata (prin1-to-string (snowgrave:unit-metadata unit))))
     (dolist (text (list source metadata))
       (check (not (search ":INITIALIZING-RECORD" text)))
+      (check (not (search ":RECORD-VIEW-CLASSES" text)))
       (check (not (search "INITIALIZING-RECEIVER" text))))))
 
 (defun initialization-phase-case (tag definitions body &key refusal fresh)

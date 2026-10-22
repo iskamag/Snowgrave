@@ -740,7 +740,7 @@ classification remains the separate logical subtype owner's responsibility."
                         (merge-value-domains build (if (external-value-observation-p build prior)
                                                       :external-result prior) :unknown)
                         prior))))
-        (values status value t)))))
+        (values status value t (when currentp (fourth field)))))))
 
 (defun graph-record-slot-facts (build receiver slot)
   "Use the same read owner for exact captures and joined fresh-family facts."
