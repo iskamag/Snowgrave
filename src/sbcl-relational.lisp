@@ -272,15 +272,17 @@
                                :records (nreverse records) :aliases (record-flow-input-aliases input)
                                :relationalp t)))
 
-(defun instantiate-formal-entry-domain (domain)
+(defun instantiate-formal-entry-domain (domain &optional
+                                               (records (when *initialization-phase*
+                                                          (initialization-phase-records *initialization-phase*))))
   (cond ((relational-value-domain-p domain)
          (let ((selector (second domain)))
            (if (eq (first selector) :argument)
-               (let ((record (assoc (second selector) (initialization-phase-records *initialization-phase*))))
+               (let ((record (assoc (second selector) records)))
                  (if record (list :initializing-record (second record) (third record)) (third domain)))
-               (list :relational-value selector (instantiate-formal-entry-domain (third domain))))))
+               (list :relational-value selector (instantiate-formal-entry-domain (third domain) records)))))
         ((and (consp domain) (eq (first domain) 'or))
-         (cons 'or (mapcar #'instantiate-formal-entry-domain (rest domain))))
+         (cons 'or (mapcar (lambda (part) (instantiate-formal-entry-domain part records)) (rest domain))))
         (t domain)))
 
 (defun call-with-record-flow-input (build input process)
@@ -588,6 +590,29 @@
                      (find (second domain) *flow-record-origins* :key #'second :test #'eq))))
     (when (and record (fourth record))
       (private-record-slot-row build (fourth record)))))
+
+(defun unchanged-record-flow-row (build domain)
+  ;; Unsupported control may discard its mutable transfer. It cannot change
+  ;; a field which has no writer in the complete normalized source inventory.
+  ;; Retain only that actual input premise, keyed by the receiver's role; an
+  ;; origin snapshot or a same-class object's fields supply no such premise.
+  ;; Keep mutable keys as unknown cells: dropping a key could omit its later
+  ;; callee write from a published effect instead of forgetting that field.
+  (let* ((record (and (initializing-record-domain-p domain)
+                      (find (second domain) *flow-record-origins* :key #'second :test #'eq)))
+         (input (and record (record-flow-input-p *flow-input-row*)
+                     (assoc (first record) (record-flow-input-records *flow-input-row*)))))
+    (when input
+      (list :class (third record)
+            :slots (loop for field in (second input)
+                         collect (if (member (first field) (getf (build-graph-state-invalidations build) :writes))
+                                     (list (first field) nil :external-result)
+                                     (list (first field) (second field)
+                                           (instantiate-formal-entry-domain (third field) *flow-record-origins*)
+                                           (map-record-field-cases
+                                            (fourth field)
+                                            (lambda (value)
+                                              (instantiate-formal-entry-domain value *flow-record-origins*))))))))))
 
 (defun pending-record-flow-effects-p (effects)
   (and (listp effects)

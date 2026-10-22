@@ -674,8 +674,16 @@ classification remains the separate logical subtype owner's responsibility."
                        (dolist (name (getf layout :slots))
                          (pushnew name writes) (pushnew name forced-writes)
                          (when unbindp (pushnew name unbinds) (pushnew name forced-unbinds)))))))
-             (place (form)
-               (when (and (consp form) (eq (car form) 'slot-value)) (invalidate (third form) nil form)))
+             (place (form &optional enclosingp)
+               (when (consp form)
+                 (case (first form)
+                   (slot-value
+                    ;; GETF can replace its containing generalized place.
+                    ;; There is no direct slot-store receipt for that write.
+                    (invalidate (third form) nil (unless enclosingp form)))
+                   (getf (place (second form) t))
+                   (the (place (third form) t))
+                   (values (dolist (part (rest form)) (place part t))))))
              (walk (form)
                (when (and (consp form) (not (eq (car form) 'quote)))
                  ;; Source reinitialization, including a saved/indirect
@@ -715,7 +723,8 @@ classification remains the separate logical subtype owner's responsibility."
   (when (relational-value-domain-p domain)
     (return-from private-record-slot-row (private-record-slot-row build (third domain))))
   (cond ((initializing-record-domain-p domain)
-         (or (initialization-record-row domain) (original-record-flow-row build domain)))
+         (or (initialization-record-row domain) (original-record-flow-row build domain)
+             (unchanged-record-flow-row build domain)))
         ((graph-node-domain-p domain) (graph-node-row build domain))
         ((owned-record-domain-p domain)
          (let ((layout (owned-record-layout build domain)))
@@ -727,8 +736,13 @@ classification remains the separate logical subtype owner's responsibility."
   ;; entry projection. Origin invalidation is identical for all three.
   (let* ((row (private-record-slot-row build domain))
          (field (assoc slot (getf row :slots)))
+         (unchanged (unless (or (and field (eq (second field) :pending))
+                               (member slot (getf (build-graph-state-invalidations build) :writes)))
+                      (assoc slot (getf (unchanged-record-flow-row build domain) :slots))))
          (currentp (and (initialization-domain-current-p domain)
                         (initialization-record-row domain))))
+    (when unchanged
+      (return-from record-slot-entry-fact (values (second unchanged) (third unchanged) t (fourth unchanged))))
     (when (and (getf row :class) field)
       (let* ((prior (third field))
              (invalidations (build-graph-state-invalidations build))

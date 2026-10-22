@@ -4362,6 +4362,7 @@
     (relational-state-tests)
     (current-record-view-tests)
     (native-store-state-tests)
+    (unchanged-input-field-tests)
     (configured-edge-envelope-tests)
     (native-materialization-tests)
     (binding-owner-tests)
