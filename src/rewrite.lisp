@@ -19,6 +19,63 @@
   '(equalp sxhash describe inspect print-object print prin1 princ write
     write-to-string prin1-to-string princ-to-string format))
 
+;; These are argument positions, not inferred values. A literal symbol in a
+;; standard callback position denotes a global function, even inside FLET.
+(defparameter *callback-arguments*
+  '((funcall 0) (apply 0) (multiple-value-call 0)
+    (mapcar 0) (mapc 0) (mapcan 0) (maplist 0) (mapl 0) (mapcon 0)
+    (map 1) (map-into 1) (maphash 0)
+    (every 0) (some 0) (notevery 0) (notany 0) (complement 0)
+    (reduce 0) (sort 1) (stable-sort 1) (merge 3)
+    (find-if 0) (find-if-not 0) (position-if 0) (position-if-not 0)
+    (count-if 0) (count-if-not 0) (remove-if 0) (remove-if-not 0)
+    (delete-if 0) (delete-if-not 0)
+    (substitute-if 1) (substitute-if-not 1)
+    (nsubstitute-if 1) (nsubstitute-if-not 1)
+    (member-if 0) (member-if-not 0) (assoc-if 0) (assoc-if-not 0)
+    (rassoc-if 0) (rassoc-if-not 0)
+    (subst-if 1) (subst-if-not 1) (nsubst-if 1) (nsubst-if-not 1)))
+
+;; The value is the first keyword argument position for the standard operator.
+(defparameter *callback-keywords*
+  '((find . 2) (find-if . 2) (find-if-not . 2)
+    (position . 2) (position-if . 2) (position-if-not . 2)
+    (count . 2) (count-if . 2) (count-if-not . 2)
+    (remove . 2) (remove-if . 2) (remove-if-not . 2)
+    (delete . 2) (delete-if . 2) (delete-if-not . 2)
+    (substitute . 3) (substitute-if . 3) (substitute-if-not . 3)
+    (nsubstitute . 3) (nsubstitute-if . 3) (nsubstitute-if-not . 3)
+    (remove-duplicates . 1) (delete-duplicates . 1)
+    (reduce . 2) (sort . 2) (stable-sort . 2) (merge . 4)
+    (search . 2) (mismatch . 2)
+    (member . 2) (member-if . 2) (member-if-not . 2)
+    (assoc . 2) (assoc-if . 2) (assoc-if-not . 2)
+    (rassoc . 2) (rassoc-if . 2) (rassoc-if-not . 2)
+    (adjoin . 2) (union . 2) (nunion . 2)
+    (intersection . 2) (nintersection . 2) (subsetp . 2)
+    (set-difference . 2) (nset-difference . 2)
+    (set-exclusive-or . 2) (nset-exclusive-or . 2)
+    (tree-equal . 2) (subst . 3) (nsubst . 3)
+    (subst-if . 3) (subst-if-not . 3) (nsubst-if . 3) (nsubst-if-not . 3)))
+
+(defun rewrite-callback-designators (form resolve)
+  (let ((arguments (copy-list (rest form))) (changed nil))
+    (labels ((replace-at (position)
+               (let ((argument (nth position arguments)))
+                 (when (and (quoted argument) (second argument)
+                            (symbolp (second argument)))
+                   (setf (nth position arguments)
+                         (list 'function (funcall resolve (second argument) nil))
+                         changed t)))))
+      (dolist (position (rest (assoc (first form) *callback-arguments*)))
+        (replace-at position))
+      (let ((start (cdr (assoc (first form) *callback-keywords*))))
+        (when start
+          (loop for position from start below (1- (length arguments)) by 2
+                when (member (nth position arguments) '(:key :test :test-not))
+                  do (replace-at (1+ position))))))
+    (if changed (cons (first form) arguments) form)))
+
 (defun local-function-p (name environment)
   (nth-value 1 (sb-cltl2:function-information name environment)))
 
@@ -106,7 +163,9 @@
            (cond ((local-function-p name env) name)
                  ((and (eq phase :closed)
                        (or (member name *indirect-record-operations* :test #'equal)
-                           (member name *unsupported-operations*)))
+                           (member name *unsupported-operations*)
+                           (and (build-classes build)
+                                (member name *representation-observers*))))
                   (unsupported build :indirect-open-operation
                                "Function reference ~S needs an explicit closed operation." name))
                  ((source-function-p build name) (mapped-name build name phase))
@@ -161,11 +220,11 @@
                             (cons 'locally (rewrite-body-declarations build (rest node) phase))))))
                    (if (equal replacement node) node replacement)))
                 ((and (symbolp (first node)) (local-function-p (first node) lexical)) node)
-                ((and (member (first node) '(funcall apply multiple-value-call)) (quoted (second node))
-                      (function-name-p (second (second node))))
-                 (values (walk (list* (first node)
-                                      (list 'function (function-reference (second (second node)) lexical))
-                                      (cddr node)) lexical) t))
+                ((or (assoc (first node) *callback-arguments*)
+                     (assoc (first node) *callback-keywords*))
+                 (let ((replacement (rewrite-callback-designators node #'function-reference)))
+                   (if (eq replacement node) node
+                       (values (walk replacement lexical) t))))
                 ((and (eq phase :closed) (member (first node) *unsupported-operations*))
                  (unsupported build :open-operation "Operation ~S has no closed source realization." (first node)))
                 ((and (eq phase :closed) (build-classes build)

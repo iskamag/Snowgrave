@@ -7,6 +7,10 @@
 (defvar *checks* 0)
 (defvar *fixture-sequence* 0)
 (defvar *events* nil)
+(defvar *macro-expansion-count* 0)
+
+(defmacro snapshot-token ()
+  (incf *macro-expansion-count*))
 
 (defun note-event (event)
   (push event *events*)
@@ -83,24 +87,42 @@
           (defun indirect (n)
             (let ((function #'start))
               (funcall function (make-instance 'child :value n) 7)))
-          (defun spread (n) (apply #'start (list (make-instance 'child :value n) 7))))"
-       "(entry indirect spread)" "((entry (number)) (indirect (number)) (spread (number)))"
+          (defun spread (n) (apply #'start (list (make-instance 'child :value n) 7)))
+          (defun map-relay (object) (start object 7))
+          (defun mapped (n)
+            (flet ((map-relay (object) (declare (ignore object)) :wrong-local))
+              (mapcar 'map-relay (list (make-instance 'child :value n)))))
+          (defun keyed (n)
+            (let ((target (make-instance 'child :value n)))
+              (eq target (find n (list (make-instance 'child :value (+ n 1)) target) :key 'value)))))"
+       "(entry indirect spread mapped keyed)"
+       "((entry (number)) (indirect (number)) (spread (number)) (mapped (number)) (keyed (number)))"
        "(value (setf value) finish start)" :universe "(base child number)"
        :external '(note-event))
-    (let ((expected '((12 :finished) (:around-enter :before :child-next :base :finish :after :around-exit))))
+    (let ((expected '((12 :finished) (:around-enter :before :child-next :base :finish :after :around-exit)))
+          (mapped-expected '(((12)) (:around-enter :before :child-next :base :finish :after :around-exit))))
       (dolist (name '("ENTRY" "INDIRECT" "SPREAD"))
         (compare-entry unit package name '(5) expected))
+      (compare-entry unit package "MAPPED" '(5) mapped-expected)
+      (compare-entry unit package "KEYED" '(5) '((t) nil))
       ;; Poison both generic leaves and the intervening original helper.
       ;; A hidden open call now fails instead of accidentally matching output.
       (dolist (name '("START" "FINISH" "VALUE"))
         (sb-mop:set-funcallable-instance-function
          (fdefinition (find-symbol name package))
          (lambda (&rest arguments) (declare (ignore arguments)) (error "Original generic reached."))))
-      (setf (fdefinition (find-symbol "RELAY" package))
-            (lambda (&rest arguments) (declare (ignore arguments)) (error "Original helper reached.")))
+      (dolist (name '("RELAY" "MAP-RELAY"))
+        (setf (fdefinition (find-symbol name package))
+              (lambda (&rest arguments) (declare (ignore arguments)) (error "Original helper reached."))))
       (dolist (name '("ENTRY" "INDIRECT" "SPREAD"))
         (check (equal expected (observed-call (snowgrave:unit-function unit (find-symbol name package)) '(5)))
-               "~A retained an original binding" name)))))
+               "~A retained an original binding" name))
+      (check (equal mapped-expected
+                    (observed-call (snowgrave:unit-function unit (find-symbol "MAPPED" package)) '(5)))
+             "Quoted MAPCAR callback retained its original helper")
+      (check (equal '((t) nil)
+                    (observed-call (snowgrave:unit-function unit (find-symbol "KEYED" package)) '(5)))
+             "Quoted FIND key retained its original reader"))))
 
 (defun record-tests ()
   (multiple-value-bind (unit package)
@@ -237,6 +259,30 @@
         (check (second (first observation)) "~A did not take its condition path" name)))
     (compare-entry unit package "TEXT-RESULT" nil '(("hello") nil))))
 
+(defun frozen-macro-tests ()
+  ;; Do not evaluate an independent open fixture first: that would expand the
+  ;; stateful macro against different build inputs than the snapshot under test.
+  (let* ((number (incf *fixture-sequence*))
+         (package (make-package (format nil "SNOWGRAVE.CORE.FIXTURE.~D" number) :use '("COMMON-LISP")))
+         (forms (fixture-read package
+                 "((defgeneric version ())
+                    (defmethod version ()
+                      (return-from version (values (snowgrave.tests::snapshot-token) :snapshot)))
+                    (defun entry () (return-from entry (version))))"))
+         (*macro-expansion-count* 0)
+         (unit (snowgrave:close-source-unit
+                (list :forms forms) :unit-name (list :core :frozen-macro number)
+                :closed-classes nil :closed-generics (fixture-read package "(version)")
+                :universe nil :entries (fixture-read package "(entry)")
+                :external-domains (fixture-read package "((entry ()))")))
+         (entry (snowgrave:unit-function unit (find-symbol "ENTRY" package))))
+    (check (= 1 *macro-expansion-count*) "Owned macro expanded ~D times while closing" *macro-expansion-count*)
+    (check (equal '(1 :snapshot) (multiple-value-list (funcall entry)))
+           "Zero-argument effective method did not retain the frozen expansion")
+    (check (equal '(1 :snapshot) (multiple-value-list (funcall entry)))
+           "Repeated call changed the frozen expansion")
+    (check (= 1 *macro-expansion-count*) "Runtime call expanded source again")))
+
 (defun fresh-artifact-test ()
   (multiple-value-bind (unit package)
       (make-fixture
@@ -306,6 +352,9 @@
 (defun rejection-tests ()
   (dolist (source '("((defun entry () (eval '(+ 1 2))))"
                     "((defclass cell () ()) (defun entry () (class-of (make-instance 'cell))))"
+                    "((defclass cell () ())
+                       (defun entry ()
+                         (let ((object (make-instance 'cell))) (funcall #'equalp object object))))"
                     "((defun entry () (snowgrave.tests::note-event :undeclared)))"))
     (let ((rejected nil))
       (handler-case (make-fixture :rejection source "(entry)" "((entry ()))" "()")
@@ -355,6 +404,7 @@
     (binding-tests)
     (native-partition-tests)
     (method-boundary-tests)
+    (frozen-macro-tests)
     (fresh-artifact-test)
     (rejection-tests)
     (format t "Snowgrave core: ~D checks passed.~%" *checks*)

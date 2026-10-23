@@ -113,6 +113,24 @@
   (let ((*package* (find-package :cl)) (*print-readably* t) (*print-circle* t))
     (write (closed-unit-metadata unit) :stream stream) (terpri stream)))
 
+(defun compile-definition (build form)
+  (multiple-value-bind (thunk warnings failure)
+      (compile nil (list 'lambda nil form))
+    (declare (ignore warnings))
+    (when failure
+      (unsupported build :compilation "The host could not compile a generated definition."))
+    (funcall thunk)))
+
+(defun discard-builder (build)
+  (let ((package (build-open-package build)))
+    (do-symbols (symbol package)
+      (when (eq (symbol-package symbol) package)
+        (when (fboundp symbol) (fmakunbound symbol))
+        (when (fboundp (list 'setf symbol)) (fmakunbound (list 'setf symbol)))
+        (when (boundp symbol) (makunbound symbol))
+        (when (find-class symbol nil) (setf (find-class symbol) nil))))
+    (delete-package package)))
+
 (defun close-source-unit (source &rest declaration
                           &key unit-name entries closed-classes closed-generics universe
                             external-domains external-operations (domain-violation :signal) (adapter :sbcl)
@@ -136,6 +154,7 @@
     (unwind-protect
          (progn
            (index-source build)
+           (normalize-owned-source build)
            (loop for (key actual) in (list (list :closed-classes (build-classes build))
                                            (list :closed-generics (build-generics build)))
                  when (loop for tail on declaration by #'cddr thereis (eq (first tail) key))
@@ -156,8 +175,8 @@
                             "Authored ~S needs a closed initialization realization." (second form))))
            (let* ((open-forms (mapcar (lambda (form) (open-definition build form)) (build-forms build)))
                   (literals (literal-definition build :open)))
-             (when literals (eval literals))
-             (dolist (form open-forms) (eval form)))
+             (when literals (compile-definition build literals))
+             (dolist (form open-forms) (compile-definition build form)))
            (prepare-records build)
            (emit-records build)
            (emit-generics build)
@@ -176,10 +195,10 @@
                                                              (list (package-name output) (symbol-name symbol)))))
                                                    entries))))
              (check-residual-source build forms)
-             (dolist (form forms) (eval form))
+             (dolist (form forms) (compile-definition build form))
              (let ((unit (%make-unit metadata forms
                                     (mapcar (lambda (name) (cons name (fdefinition (closed-name build name)))) entries))))
                (setf success t)
                unit)))
-      (delete-package open)
+      (discard-builder build)
       (unless success (delete-package output)))))

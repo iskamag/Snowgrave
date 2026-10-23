@@ -41,7 +41,7 @@
 
 (defun method-parts (form)
   (let ((tail (cddr form)) (qualifiers nil))
-    (loop while (and tail (atom (first tail))) do (push (pop tail) qualifiers))
+    (loop while (and tail (not (listp (first tail)))) do (push (pop tail) qualifiers))
     (values (nreverse qualifiers) (first tail) (rest tail))))
 
 (defun index-source (build)

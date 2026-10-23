@@ -6,6 +6,7 @@
   :components ((:file "src/package")
                (:file "src/source")
                (:file "src/rewrite")
+               (:file "src/normalize")
                (:file "src/records")
                (:file "src/methods")
                (:file "src/unit"))
