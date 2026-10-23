@@ -16,6 +16,13 @@
   (push event *events*)
   event)
 
+(defun external-operation (value)
+  (+ value 100))
+
+(defun switch-external-operation (value)
+  (setf (fdefinition 'external-operation) (lambda (argument) (+ argument 200)))
+  value)
+
 (defun check (truth description &rest arguments)
   (incf *checks*)
   (unless truth
@@ -216,11 +223,33 @@
           (defun dynamic-entry (n)
             (values (read-offset)
                     (let ((*offset* n)) (read-offset))
-                    (read-offset) (keyword-offset :*offset* n) (read-offset))))"
-       "(entry dynamic-entry)" "((entry (number)) (dynamic-entry (number)))"
-       "(operation)" :universe "(number)")
+                    (read-offset) (keyword-offset :*offset* n) (read-offset)))
+          (defun external-callback (n)
+            (flet ((snowgrave.tests::external-operation (x) (+ x 1)))
+              (values (funcall 'snowgrave.tests::external-operation n)
+                      (mapcar 'snowgrave.tests::external-operation (list n))
+                      (funcall #'snowgrave.tests::external-operation n))))
+          (defun external-timing (n)
+            (funcall 'snowgrave.tests::external-operation
+                     (snowgrave.tests::switch-external-operation n))))"
+       "(entry dynamic-entry external-callback external-timing)"
+       "((entry (number)) (dynamic-entry (number)) (external-callback (number)) (external-timing (number)))"
+       "(operation)" :universe "(number)"
+       :external '(external-operation switch-external-operation))
     (compare-entry unit package "ENTRY" '(7) '((3 4 8 9) nil))
-    (compare-entry unit package "DYNAMIC-ENTRY" '(27) '((10 27 10 27 10) nil))))
+    (compare-entry unit package "DYNAMIC-ENTRY" '(27) '((10 27 10 27 10) nil))
+    (compare-entry unit package "EXTERNAL-CALLBACK" '(7) '((107 (107) 8) nil))
+    ;; A quoted symbol resolves its global function after argument evaluation.
+    ;; Reset before each call so the open run cannot prepare the closed run.
+    (let ((original (fdefinition 'external-operation))
+          (name (find-symbol "EXTERNAL-TIMING" package)))
+      (unwind-protect
+           (let ((open (observed-call (fdefinition name) '(7))))
+             (check (equal open '((207) nil)) "Open symbol-designator lookup happened too early")
+             (setf (fdefinition 'external-operation) original)
+             (check (equal open (observed-call (snowgrave:unit-function unit name) '(7)))
+                    "Closing changed global symbol-designator lookup timing"))
+        (setf (fdefinition 'external-operation) original)))))
 
 (defun native-partition-tests ()
   (multiple-value-bind (unit package)

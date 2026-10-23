@@ -64,9 +64,12 @@
                (let ((argument (nth position arguments)))
                  (when (and (quoted argument) (second argument)
                             (symbolp (second argument)))
-                   (setf (nth position arguments)
-                         (list 'function (funcall resolve (second argument) nil))
-                         changed t)))))
+                   (let ((name (funcall resolve (second argument) nil)))
+                     ;; Keep symbol lookup global and at invocation time.
+                     ;; FUNCTION here would capture a same-named FLET binding.
+                     (unless (eq name (second argument))
+                       (setf (nth position arguments) (list 'quote name)
+                             changed t)))))))
       (dolist (position (rest (assoc (first form) *callback-arguments*)))
         (replace-at position))
       (let ((start (cdr (assoc (first form) *callback-keywords*))))
