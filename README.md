@@ -1,23 +1,17 @@
 # Snowgrave
 
-Snowgrave closes authored CLOS into ordinary functions and records. The SBCL
-adapter builds portable source artifacts; Mezzano adapters provide cold typed
-record materialization and admitted native access primitives. Full Mezzano
-supervisor admission remains incomplete.
+Snowgrave is an SBCL prototype that obtains effective methods through the MOP,
+turns classes into structures, and recompiles the source so methods, helpers
+and accessors use the generated ordinary functions.
 
-With this directory registered with ASDF:
+From the repository root:
 
 ```lisp
-(asdf:load-system "snowgrave/sbcl")
-(asdf:test-system "snowgrave")
+(require :asdf)
+(asdf:load-asd (truename "snowgrave.asd"))
+(asdf:load-system "snowgrave")
 ```
 
-The [specification](paper/README.md) is in `paper/`.
+Run the tests with `make check`.
 
-Hosted import, resource-indexing and generic-call measurements:
-
-```sh
-sbcl --script scripts/bench-configuration-imports.lisp
-sbcl --script scripts/bench-native-resources.lisp
-sbcl --script scripts/bench-generic-call-conventions.lisp
-```
+The [paper](paper/README.md) describes the design and current implementation scope.
