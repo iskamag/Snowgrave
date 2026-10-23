@@ -17,8 +17,11 @@ Run the tests with `make check`.
 Run the optional Clamsara gates with `make check-clamsara` or
 `make check-clamsara-index-set`, setting `CLAMSARA_ROOT` to its engine rewrite
 checkout. The whole-engine gate also needs Closer MOP registered with ASDF.
-It currently fails at dynamic class construction, before closed collection
-runs. The complete index-set component passes closed execution and fresh
-source/FASL replay.
+The gates compare original and closed execution, disable the original
+functions, and replay generated source and FASLs in fresh SBCL processes.
+The whole-engine gate closes all engine and word-memory definitions and runs
+selected unchanged collector workloads. The other gate exercises the complete
+index-set component. Set `SBCL_TEST_HEAP_MB` to change the compiler heap
+(default: 2048 MiB).
 
 The [paper](paper/README.md) describes the design and current implementation scope.
