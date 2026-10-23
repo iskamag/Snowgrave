@@ -100,6 +100,10 @@
 
 (defun representation-sensitive-type-p (type)
   (cond ((member type '(structure-object standard-object generic-function compiled-function)) t)
+        ;; Logical metadata are ordinary structures, not host metaobjects.
+        ;; Refuse these physical assertions until logical TYPEP is provided.
+        ((and (symbolp type) (find-class type nil)
+              (subtypep type 'sb-mop:metaobject)) t)
         ((consp type) (some #'representation-sensitive-type-p type))))
 
 (defun rewrite-variable-name (build name phase)
@@ -164,6 +168,13 @@
     (labels
         ((function-reference (name env)
            (cond ((local-function-p name env) name)
+                 ((eq name 'make-instance)
+                  (unless (build-classes build)
+                    (unsupported build :external-construction "MAKE-INSTANCE needs an owned class universe."))
+                  (record-make-instance-name build phase))
+                 ((metadata-operation-name name)
+                  (metadata-function-name build name phase))
+                 ((observation-function-name build name phase))
                  ((and (eq phase :closed)
                        (or (member name *indirect-record-operations* :test #'equal)
                            (member name *unsupported-operations*)
@@ -235,6 +246,20 @@
                  (let ((replacement (rewrite-callback-designators node #'function-reference)))
                    (if (eq replacement node) node
                        (values (walk replacement lexical) t))))
+                ((metadata-operation-name (first node))
+                 (multiple-value-bind (replacement handled)
+                     (metadata-operation-form build node phase)
+                   (if handled
+                       (values
+                        (if (eq (first replacement) (first node))
+                            (cons (first replacement)
+                                  (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
+                            (walk replacement lexical))
+                        t)
+                       node)))
+                ((and (eq phase :closed) (build-classes build) (eq (first node) 'equalp))
+                 (values (cons (observation-function-name build 'equalp phase)
+                               (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
                 ((and (eq phase :closed) (member (first node) *unsupported-operations*))
                  (unsupported build :open-operation "Operation ~S has no closed source realization." (first node)))
                 ((and (eq phase :closed) (build-classes build)
@@ -252,9 +277,10 @@
                  (multiple-value-bind (replacement handled)
                      (record-operation-form build node phase)
                    (if handled
-                       ;; Walk operands, not the replacement's operator again:
-                       ;; open MAKE-INSTANCE is still a host construction.
-                       (values (if (eq phase :open)
+                       ;; An open primitive can retain its operator. Other
+                       ;; replacements may introduce binders or dispatch calls.
+                       (values (if (and (eq phase :open)
+                                        (eq (first replacement) (first node)))
                                    (cons (first replacement)
                                          (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
                                    (walk replacement lexical)) t)

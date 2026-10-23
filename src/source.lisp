@@ -114,16 +114,17 @@
             (let ((,nodes (vector
                           ,@(loop for value across objects
                                   collect (cond ((consp value) '(cons nil nil))
-                                                ((stringp value) `(make-string ,(length value)))
+                                                ;; COPY-SEQ gives each owned string a
+                                                ;; distinct allocation even if the
+                                                ;; compiler coalesces equal literals.
+                                                ((stringp value) `(copy-seq ,value))
                                                 (t `(make-array ,(length value))))))))
               ,@(loop for value across objects for i from 0
                       append (cond
                                ((consp value)
                                 (list `(setf (car (aref ,nodes ,i)) ,(reference (car value))
                                               (cdr (aref ,nodes ,i)) ,(reference (cdr value)))))
-                               ((stringp value)
-                                (loop for character across value for j from 0
-                                      collect `(setf (char (aref ,nodes ,i) ,j) ,character)))
+                               ((stringp value) nil)
                                (t (loop for item across value for j from 0
                                         collect `(setf (aref (aref ,nodes ,i) ,j) ,(reference item))))))
               ,nodes))))))

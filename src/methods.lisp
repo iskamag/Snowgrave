@@ -165,10 +165,6 @@
       (loop for item in (first axes) append
         (loop for tail in (method-cartesian-product (rest axes)) collect (cons item tail)))))
 
-(defun method-cell-test (build cell arguments)
-  `(and ,@(loop for cut in cell for index from 0
-                collect (axis-cut-test build cut `(nth ,index ,arguments)))))
-
 (defun no-applicable-method-form (build generic arguments)
   `(restart-case
        (error 'sb-pcl::no-applicable-method-error
@@ -269,12 +265,20 @@
                   (values)))
     `(apply #',name ,arguments)))
 
+(defun method-axis-index-form (build axis argument)
+  ;; Exact owned classes and admitted native cuts partition one argument.
+  ;; The final remainder is exhaustive after all preceding tests fail.
+  `(cond ,@(loop for tail on axis for index from 0
+                 collect `(,(if (rest tail) (axis-cut-test build (first tail) argument) t)
+                            ,index))))
+
 (defun emit-one-generic (build generic)
   (let* ((gf (validate-generic-methods build generic (generic-open-function build generic)))
          (methods (sb-mop:generic-function-methods gf))
          (required (length (getf (method-lambda-shape (sb-mop:generic-function-lambda-list gf)) :required)))
          (axes (loop for position below required collect (generic-axis-cuts build methods position)))
          (arguments (gensym "ARGUMENTS"))
+         (cell-index (gensym "CELL"))
          (rows
            (loop for cell in (method-cartesian-product axes) collect
              (multiple-value-bind (applicable certainp)
@@ -283,19 +287,28 @@
                  (unsupported build :method-applicability "The MOP cannot establish class-only applicability for ~S." generic))
                (list cell applicable))))
          (*method-source-cache* (make-hash-table :test #'equal))
-         (clauses nil))
-    (dolist (row rows)
-      (let* ((applicable (second row))
-             (body (if (null applicable)
-                       (no-applicable-method-form build generic arguments)
-                       (multiple-value-bind (effective options)
-                           (sb-mop:compute-effective-method
-                            gf (sb-mop:generic-function-method-combination gf) applicable)
-                         (when options
-                           (unsupported build :effective-options "~S returned unsupported effective-method options." generic))
-                         `(progn ,(generic-validator-form build gf applicable arguments)
-                                 ,(emit-effective-source build generic effective arguments))))))
-        (push `(,(method-cell-test build (first row) arguments) ,body) clauses)))
+         (groups nil) (clauses nil))
+    ;; Many exact class tuples have the same ordered method list. Materialize
+    ;; each effective method once and classify each argument once per call.
+    ;; A giant repeated COND otherwise makes the host compiler's control-flow
+    ;; graph grow with every duplicate body and every missing-method cell.
+    (loop for row in rows for index from 0
+          for applicable = (second row)
+          when applicable
+            do (let ((group (assoc applicable groups :test #'equal)))
+                 (if group (push index (cdr group))
+                     (push (list applicable index) groups))))
+    (dolist (group (nreverse groups))
+      (let ((applicable (car group)))
+        (multiple-value-bind (effective options)
+            (sb-mop:compute-effective-method
+             gf (sb-mop:generic-function-method-combination gf) applicable)
+          (when options
+            (unsupported build :effective-options "~S returned unsupported effective-method options." generic))
+          (push `(,(nreverse (cdr group))
+                  ,(generic-validator-form build gf applicable arguments)
+                  ,(emit-effective-source build generic effective arguments))
+                clauses))))
     (emit-form build
                `(defun ,(closed-name build generic) (&rest ,arguments)
                   ,@(when (plusp required)
@@ -303,7 +316,14 @@
                           (error 'sb-int:simple-program-error
                                  :format-control "Too few arguments for closed generic ~S: ~S."
                                  :format-arguments (list ',generic ,arguments)))))
-                  (cond ,@(nreverse clauses))))
+                  (let ((,cell-index 0))
+                    ,@(loop for axis in axes for index from 0
+                            collect `(setf ,cell-index
+                                           (+ (* ,cell-index ,(length axis))
+                                              ,(method-axis-index-form build axis `(nth ,index ,arguments)))))
+                    (case ,cell-index
+                      ,@(nreverse clauses)
+                      (otherwise ,(no-applicable-method-form build generic arguments))))))
     (list :name generic :code-name (closed-name build generic)
           :lambda-list (sb-mop:generic-function-lambda-list gf)
           :cells (loop for row in rows

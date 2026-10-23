@@ -164,6 +164,82 @@
     (check (>= (count 'defstruct (snowgrave:unit-source unit) :key #'first) 3)
            "Emitted source does not contain the three class structures")))
 
+(defun dynamic-record-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :dynamic-records
+       "((defun mark (label value) (snowgrave.tests::note-event label) value)
+          (defclass alpha ()
+            ((x :initarg :x :initform 7) (fresh :initform (list 5)))
+            (:default-initargs :x (mark :default-x 11)))
+          (defclass beta () ((y :initarg :y :initform 8)))
+          (defparameter *cold* (make-instance (identity 'alpha) :x 91))
+          (defun cold () (slot-value *cold* 'x))
+          (defun indirect ()
+            (let ((class 'alpha) (constructor #'make-instance))
+              (values (slot-value (funcall constructor class :x 27) 'x)
+                      (slot-value (make-instance (find-class class) :x 33) 'x))))
+          (defun construct ()
+            (let ((a (make-instance (mark :class 'alpha)
+                                   (mark :key-1 :x) (mark :value-1 nil)
+                                   (mark :key-2 :x) (mark :value-2 23)))
+                  (b (make-instance (identity 'alpha) :unknown 2 :allow-other-keys t)))
+              (values (slot-value a 'x) (slot-value b 'x)
+                      (eq (slot-value a 'fresh) (slot-value b 'fresh)))))
+          (defun reject-class ()
+            (handler-case
+                (make-instance (mark :class 'beta) (mark :key :x) (mark :value 2))
+              (program-error () :program-error)))
+          (defun reject-default ()
+            (handler-case
+                (make-instance (mark :class 'alpha) (mark :key :unknown) (mark :value 2))
+              (program-error () :program-error)))
+          (defun bad-condition ()
+            (handler-case (make-instance 'alpha :unknown 2)
+              (program-error (condition) condition)))
+          (defun dynamic-slots ()
+            (let ((object (make-instance (identity 'beta))) (name 'y))
+              (setf (slot-value (mark :object object) (mark :slot name)) (mark :new 19))
+              (let ((before (list (slot-value object name) (slot-boundp object name))))
+                (slot-makunbound object name)
+                (values before (slot-boundp object name))))))"
+       "(cold indirect construct reject-class reject-default bad-condition dynamic-slots)"
+       "((cold ()) (indirect ()) (construct ()) (reject-class ()) (reject-default ()) (bad-condition ()) (dynamic-slots ()))"
+       "()" :external '(note-event))
+    (compare-entry unit package "COLD" nil '((91) nil))
+    (compare-entry unit package "INDIRECT" nil '((27 33) nil))
+    (compare-entry unit package "CONSTRUCT" nil
+                   '((nil 11 nil) (:class :key-1 :value-1 :key-2 :value-2 :default-x)))
+    (compare-entry unit package "REJECT-CLASS" nil '((:program-error) (:class :key :value)))
+    (compare-entry unit package "REJECT-DEFAULT" nil
+                   '((:program-error) (:class :key :value :default-x)))
+    (compare-entry unit package "DYNAMIC-SLOTS" nil '(((19 t) nil) (:object :slot :new)))
+    (let* ((entry (find-symbol "BAD-CONDITION" package))
+           (original (funcall entry))
+           (closed (funcall (snowgrave:unit-function unit entry))))
+      (check (string= (princ-to-string original) (princ-to-string closed))
+             "Closed initarg condition exposes its physical class descriptor: ~A" closed))
+    (let* ((source (snowgrave:unit-source unit))
+           (definition (find-if (lambda (form)
+                                  (and (eq (first form) 'defun) (symbolp (second form))
+                                       (string= (symbol-name (second form)) "MAKE-INSTANCE")))
+                                source))
+           (name (second definition))
+           (direct nil) (captured nil) (original nil))
+      (labels ((visit (form)
+                 (when (consp form)
+                   (when (eq (first form) name) (setf direct t))
+                   (when (equal form (list 'function name)) (setf captured t))
+                   (when (or (eq (first form) 'make-instance)
+                             (equal form '(function make-instance)))
+                     (setf original t))
+                   (visit (car form)) (visit (cdr form)))))
+        (visit source))
+      (check (and name (not (eq name 'make-instance))
+                  (not (eq (symbol-package name) (find-package :cl)))
+                  direct captured (not original))
+             "Construction did not consistently use the output package's MAKE-INSTANCE binding"))))
+
 (defun argument-tests ()
   (multiple-value-bind (unit package)
       (make-fixture
@@ -309,18 +385,61 @@
        "(entry)" "((entry ()))" "(value total)")
     (compare-entry unit package "ENTRY" nil '((34) nil)))
   ;; The builder installs this constant before closed rewriting refuses the
-  ;; reflection call. Cleanup must preserve that original Snowgrave condition.
+  ;; EVAL call. Cleanup must preserve the original condition.
   (let ((feature nil))
     (handler-case
         (make-fixture
          :constant-cleanup
          "((defconstant +base+ 17)
-            (defun entry () (class-of +base+)))"
+            (defun entry () (eval '+base+)))"
          "(entry)" "((entry ()))" "()")
       (snowgrave:snowgrave-error (condition)
         (setf feature (snowgrave:error-feature condition))))
     (check (eq :open-operation feature)
-           "Constant cleanup lost the original reflection refusal: ~S" feature)))
+           "Constant cleanup lost the original EVAL refusal: ~S" feature)))
+
+(defun logical-equalp-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :logical-equalp
+       "((defclass cell () ((value :initform 7)))
+          (defun entry ()
+            (let ((a (make-instance 'cell)) (b (make-instance 'cell)))
+              (values (equalp a b) (equalp a a)
+                      (equalp (list a) (list b))
+                      (equalp (vector (list a)) (vector (list b)))
+                      (funcall #'equalp a b)
+                      (equalp \"AbC\" \"aBc\") (equalp 3 3.0)
+                      (equalp #(1 #\\A (2)) #(1.0 #\\a (2.0)))))))"
+       "(entry)" "((entry ()))" "()")
+    (compare-entry unit package "ENTRY" nil '((nil t nil nil nil t t t) nil))))
+
+(defun logical-metadata-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :logical-metadata
+       "((defclass base () ((x :initform 7)))
+          (defclass child (base) ())
+          (defun admitted-p (object name)
+            (let ((class (class-of object)))
+              (and (eq (class-of class) (find-class 'standard-class))
+                   (progn (sb-mop:finalize-inheritance class) t)
+                   (let ((slot (find name (sb-mop:class-slots class)
+                                     :key #'sb-mop:slot-definition-name)))
+                     (and slot
+                          (eq (class-of slot) (find-class 'sb-mop:standard-effective-slot-definition))
+                          (eq (sb-mop:slot-definition-allocation slot) :instance)
+                          (eq (sb-mop:slot-definition-type slot) t)
+                          (slot-boundp object name))))))
+          (defun entry ()
+            (let ((object (make-instance 'child)))
+              (values (slot-value object 'x) (admitted-p object 'x)
+                      (eq (class-of object) (find-class 'child))
+                      (eq (class-of object) (find-class 'base))
+                      (class-name (class-of object))))))"
+       "(entry)" "((entry ()))" "()")
+    (compare-entry unit package "ENTRY" nil
+                   (list (list 7 t t nil (find-symbol "CHILD" package)) nil))))
 
 (defun frozen-macro-tests ()
   ;; Do not evaluate an independent open fixture first: that would expand the
@@ -414,15 +533,51 @@
 
 (defun rejection-tests ()
   (dolist (source '("((defun entry () (eval '(+ 1 2))))"
-                    "((defclass cell () ()) (defun entry () (class-of (make-instance 'cell))))"
+                    "((defclass cell () ()) (defun entry () (sxhash (make-instance 'cell))))"
                     "((defclass cell () ())
                        (defun entry ()
-                         (let ((object (make-instance 'cell))) (funcall #'equalp object object))))"
+                         (let ((object (make-instance 'cell))) (funcall #'sxhash object))))"
                     "((defun entry () (snowgrave.tests::note-event :undeclared)))"))
     (let ((rejected nil))
       (handler-case (make-fixture :rejection source "(entry)" "((entry ()))" "()")
         (snowgrave:snowgrave-error () (setf rejected t)))
       (check rejected "Unsupported source was admitted: ~A" source)))
+  ;; The metadata queries return logical descriptors. A native TYPEP on their
+  ;; physical DEFSTRUCT representation must not silently change a true answer.
+  (dolist (observation
+           '("(typep (find-class 'sample) 'class)"
+             "(typep (find-class 'sample) 'standard-class)"
+             "(typep (find-class 'sample) 'sb-mop:metaobject)"
+             "(typep (first (sb-mop:class-slots (find-class 'sample)))
+                      'sb-mop:slot-definition)"
+             "(typep (first (sb-mop:class-slots (find-class 'sample)))
+                      'sb-mop:standard-effective-slot-definition)"
+             "(typep (find-class 'sample) '(or null standard-class))"
+             "(the standard-class (find-class 'sample))"
+             "(let ((class (find-class 'sample)))
+                (declare (type standard-class class)) class)"))
+    (let ((feature nil))
+      (handler-case
+          (make-fixture :metadata-type-refusal
+                        (format nil "((defclass sample () ((value :initform nil)))
+                                      (defun entry () ~A))" observation)
+                        "(entry)" "((entry ()))" "()")
+        (snowgrave:snowgrave-error (condition)
+          (setf feature (snowgrave:error-feature condition))))
+      (check (eq feature :physical-type)
+             "Metadata observation ~A needs physical-type refusal, got ~S"
+             observation feature)))
+  (dolist (type '(standard-class (or null standard-class)))
+    (let ((feature nil))
+      (handler-case
+          (make-fixture :metadata-slot-refusal
+                        (format nil "((defclass holder () ((class :initarg :class :type ~S)))
+                                      (defun entry () (make-instance 'holder :class nil)))" type)
+                        "(entry)" "((entry ()))" "()")
+        (snowgrave:snowgrave-error (condition)
+          (setf feature (snowgrave:error-feature condition))))
+      (check (eq feature :slot-type)
+             "Physical metadata slot type ~S was admitted, feature ~S" type feature)))
   (dolist (case '(("((defgeneric classify (x))
                      (defmethod classify ((x array)) :array)
                      (defmethod classify ((x sequence)) :sequence)
@@ -462,12 +617,15 @@
   (let ((*checks* 0))
     (method-linkage-tests)
     (record-tests)
+    (dynamic-record-tests)
     (argument-tests)
     (control-tests)
     (binding-tests)
     (native-partition-tests)
     (method-boundary-tests)
     (constant-tests)
+    (logical-equalp-tests)
+    (logical-metadata-tests)
     (frozen-macro-tests)
     (fresh-artifact-test)
     (rejection-tests)

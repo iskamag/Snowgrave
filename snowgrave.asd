@@ -8,6 +8,8 @@
                (:file "src/rewrite")
                (:file "src/normalize")
                (:file "src/records")
+               (:file "src/metadata")
+               (:file "src/observation")
                (:file "src/methods")
                (:file "src/unit"))
   :in-order-to ((asdf:test-op (asdf:test-op "snowgrave/tests"))))

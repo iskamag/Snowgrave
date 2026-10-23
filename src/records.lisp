@@ -13,6 +13,41 @@
 (defun record-helper-name (build name)
   (closed-name build name))
 
+(defun record-make-instance-name (build phase)
+  (if (eq phase :closed)
+      (let ((package (build-output-package build)))
+        (shadow "MAKE-INSTANCE" package)
+        (intern "MAKE-INSTANCE" package))
+      (open-name build '%make-instance)))
+
+(defun record-open-class-registry-name (build)
+  (open-name build '%source-class-names))
+
+(defun emit-open-record-helpers (build)
+  "Keep stage-one construction in its isolated CLOS class namespace."
+  (when (build-classes build)
+    (let ((class (gensym "CLASS")) (initargs (gensym "INITARGS"))
+          (binding (gensym "BINDING")) (target (gensym "TARGET"))
+          (registry (record-open-class-registry-name build)))
+      (compile-definition
+       build
+       `(defparameter ,registry
+          ',(loop for source-class in (build-classes build)
+                  collect (cons source-class (open-name build source-class)))))
+      (compile-definition
+       build
+       `(defun ,(record-make-instance-name build :open) (,class &rest ,initargs)
+          (let ((,target
+                  (if (symbolp ,class)
+                      (let ((,binding (assoc ,class ,registry :test #'eq)))
+                        (cond (,binding (find-class (cdr ,binding)))
+                              ((member ,class ,registry :key #'cdr :test #'eq)
+                               (find-class ,class))
+                              (t (error 'simple-error :format-control "No owned class named ~S."
+                                        :format-arguments (list ,class)))))
+                      ,class)))
+            (apply #'make-instance ,target ,initargs)))))))
+
 (defun source-class-form (build name)
   (find-if (lambda (form) (and (consp form) (eq (first form) 'defclass)
                               (eq (second form) name)))
@@ -27,7 +62,8 @@
     (let* ((form (source-class-form build name))
            (slot (find slot-name (fourth form)
                        :key (lambda (slot) (if (consp slot) (first slot) slot)))))
-      (when (and (consp slot) (member :initform (rest slot)))
+      (when (and (consp slot)
+                 (loop for (key) on (rest slot) by #'cddr thereis (eq key :initform)))
         (return (values (getf (rest slot) :initform) t))))))
 
 (defun source-default-initarg (build precedence key)
@@ -48,6 +84,8 @@
   ;; A SATISFIES predicate or ambient user DEFTYPE would create a second
   ;; untracked call/expansion boundary. Keep the initial storage contract
   ;; to native types and logical class predicates.
+  (when (representation-sensitive-type-p type)
+    (return-from record-slot-type-supported-p nil))
   (cond ((symbolp type)
          (or (member type (build-classes build))
              (eq (symbol-package type) (find-package :common-lisp))))
@@ -124,14 +162,6 @@
                               :type type
                               :initargs (copy-list (sb-mop:slot-definition-initargs slot))
                               :initform initform :initform-p presentp))))))))))
-  (dolist (description (build-layouts build))
-    (let ((keys (loop for slot in (class-description-slots description)
-                      append (slot-description-initargs slot))))
-      (dolist (default (class-description-defaults description))
-        (unless (or (eq (first default) :allow-other-keys) (member (first default) keys))
-          (unsupported build :construction-initargs
-                       "Default initarg ~S of ~S has no stock slot initialization."
-                       (first default) (class-description-name description))))))
   (build-layouts build))
 
 (defun closed-exact-class-test (build source-class object-form)
@@ -173,6 +203,8 @@
     (emit-form
      build
      `(defun ,name ,(if (eq operation :write) (list value object slot-name) (list object slot-name))
+        (unless (symbolp ,slot-name)
+          (error 'type-error :datum ,slot-name :expected-type 'symbol))
         (cond
           ,@(loop for description in (build-layouts build)
                   collect
@@ -214,10 +246,19 @@
     (emit-form
      build
      `(defun ,(class-description-constructor description) (&rest ,args)
+        (unless (evenp (length ,args))
+          (error 'sb-int:simple-program-error
+                 :format-control "Odd number of initialization arguments."))
         ,@(loop for (key form) in (class-description-defaults description)
                 collect
                 `(unless (nth-value 1 (,lookup ,args '(,key)))
                    (setf ,args (append ,args (list ',key ,(rewrite-form build form :closed))))))
+        (,(record-helper-name build '%check-initargs)
+         ,args ',(remove-duplicates
+                  (cons :allow-other-keys
+                        (loop for slot in (class-description-slots description)
+                              append (slot-description-initargs slot))))
+         ,(closed-class-token-form build (class-description-name description)))
         (let ((,object (,(class-description-allocator description))))
           ,@(loop for slot in (class-description-slots description)
                   collect
@@ -229,6 +270,17 @@
                                `((t (setf (,(record-helper-name build '%record-read) ,object ',(slot-description-name slot))
                                           ,(rewrite-form build (slot-description-initform slot) :closed))))))))
           ,object)))))
+
+(defun emit-record-make-instance-binding (build)
+  (let ((class (gensym "CLASS")) (initargs (gensym "INITARGS"))
+        (descriptor (gensym "CLASS-DESCRIPTOR")))
+    (emit-form
+     build
+     `(defun ,(record-make-instance-name build :closed) (,class &rest ,initargs)
+        (let ((,descriptor (if (symbolp ,class)
+                               (,(metadata-function-name build 'find-class :closed) ,class)
+                               ,class)))
+          (apply ,(closed-constructor-function-form build descriptor) ,initargs))))))
 
 (defun emit-records (build)
   (unless (build-layouts build) (return-from emit-records nil))
@@ -247,14 +299,22 @@
                 (loop for (key value) on arguments by #'cddr
                       when (member key keys :test #'eq) return (values value t)
                       finally (return (values nil nil)))))
+  (let ((args (gensym "INITARGS")) (allowed (gensym "ALLOWED"))
+        (class (gensym "CLASS")) (key (gensym "KEY")) (invalid (gensym "INVALID")))
+    (emit-form
+     build
+     `(defun ,(record-helper-name build '%check-initargs) (,args ,allowed ,class)
+        (unless (,(record-helper-name build '%find-initarg) ,args '(:allow-other-keys))
+          (let ((,invalid
+                  (loop for (,key) on ,args by #'cddr
+                        unless (member ,key ,allowed :test #'eq) collect ,key)))
+            (when ,invalid
+              (error 'sb-pcl::initarg-error :class ,class :initargs (nreverse ,invalid))))))))
   (dolist (operation '(:read :write :boundp :unbind))
     (emit-record-slot-dispatch build operation))
   (dolist (description (build-layouts build))
-    (emit-record-constructor build description)))
-
-(defun literal-record-symbol (form)
-  (when (and (consp form) (eq (first form) 'quote) (null (cddr form)) (symbolp (second form)))
-    (values (second form) t)))
+    (emit-record-constructor build description))
+  (emit-record-make-instance-binding build))
 
 (defun record-type-mentioned-p (build type)
   (if (consp type)
@@ -272,38 +332,17 @@ Operands remain source forms for the shared lexical rewriter."
   (let ((operator (first form)))
     (case operator
       (make-instance
-       (multiple-value-bind (class literalp) (literal-record-symbol (second form))
-         (unless literalp
-           (unsupported build :dynamic-construction "MAKE-INSTANCE needs an owned literal class name."))
-         (let ((description (find-record-class build class)))
-           ;; During the open pass layouts do not yet exist.
-           (unless (member class (build-classes build))
-             (unsupported build :external-construction "Class ~S has no owned definition." class))
-           (if (eq phase :open)
-               (values `(make-instance ',(open-name build class) ,@(cddr form)) t)
-               (progn
-                 (unless (evenp (length (cddr form)))
-                   (unsupported build :construction-initargs "MAKE-INSTANCE needs paired literal initarg names."))
-                 (let ((allowed (append '(:allow-other-keys)
-                                        (loop for slot in (class-description-slots description)
-                                              append (slot-description-initargs slot)))))
-                   (loop for tail on (cddr form) by #'cddr for key = (first tail)
-                         do (unless (and (keywordp key) (member key allowed))
-                              (unsupported build :construction-initargs "Unsupported initarg ~S for ~S." key class))))
-                 (values `(,(class-description-constructor description) ,@(cddr form)) t))))))
+       (unless (build-classes build)
+         (unsupported build :external-construction "MAKE-INSTANCE needs an owned class universe."))
+       ;; Direct and captured calls share the same replacement function.
+       ;; Ordinary evaluation completes every operand before class lookup.
+       (values `(,(record-make-instance-name build phase) ,@(rest form)) t))
       ((slot-value slot-boundp slot-makunbound)
        (if (eq phase :open) (values form t)
-           (multiple-value-bind (slot literalp) (literal-record-symbol (third form))
-             (unless literalp
-               (unsupported build :dynamic-slot "~S needs a literal slot name." operator))
-             (unless (some (lambda (description)
-                             (find slot (class-description-slots description) :key #'slot-description-name))
-                           (build-layouts build))
-               (unsupported build :missing-slot "No owned class defines slot ~S." slot))
-             (values `(,(record-helper-name build
-                                           (ecase operator (slot-value '%record-read)
-                                                   (slot-boundp '%record-boundp) (slot-makunbound '%record-unbind)))
-                       ,(second form) ',slot) t))))
+           (values `(,(record-helper-name build
+                                         (ecase operator (slot-value '%record-read)
+                                                 (slot-boundp '%record-boundp) (slot-makunbound '%record-unbind)))
+                     ,@(rest form)) t)))
       (typep
        (let ((type-form (third form)))
          (when (and (consp type-form) (eq (first type-form) 'quote)
