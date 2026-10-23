@@ -54,9 +54,9 @@
                                      (block ,(if (consp name) (second name) name)
                                        ,@checks ,@executable))
                                  :closed)))
-            (emit-form build (list* 'defun (closed-name build name) (rest lambda-form))))))))
-  ;; Install globals only after all ordinary function definitions exist.
-  (dolist (form (build-forms build))
+            (emit-form build (list* 'defun (closed-name build name) (rest lambda-form)))))))
+    ;; Keep source initialization order: constants must be established before
+    ;; compiling their users, and their initializers may call earlier helpers.
     (when (member (first form) '(defvar defparameter defconstant))
       (emit-form build (list* (first form) (closed-name build (second form))
                              (when (cddr form)
@@ -127,7 +127,7 @@
       (when (eq (symbol-package symbol) package)
         (when (fboundp symbol) (fmakunbound symbol))
         (when (fboundp (list 'setf symbol)) (fmakunbound (list 'setf symbol)))
-        (when (boundp symbol) (makunbound symbol))
+        (when (and (boundp symbol) (not (constantp symbol))) (makunbound symbol))
         (when (find-class symbol nil) (setf (find-class symbol) nil))))
     (delete-package package)))
 

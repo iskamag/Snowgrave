@@ -185,7 +185,14 @@
                 ((symbolp node)
                  (if (and (member node (build-globals build))
                           (not (sb-walker:var-lexical-p node lexical)))
-                     (mapped-name build node phase) node))
+                     (if (member node (build-constants build))
+                         ;; Generated methods/constructors can be compiled
+                         ;; before the source constant is initialized. An
+                         ;; explicit cell read preserves initialization order
+                         ;; without falsely declaring the constant SPECIAL.
+                         (values (list 'symbol-value (list 'quote (mapped-name build node phase))) t)
+                         (mapped-name build node phase))
+                     node))
                 ((or (stringp node) (simple-vector-p node))
                  (values (literal-reference build node phase) t))
                 ((atom node) node)

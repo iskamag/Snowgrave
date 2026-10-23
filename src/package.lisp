@@ -24,7 +24,7 @@
 
 (defstruct build
   identity declaration forms open-package output-package
-  classes functions generics globals method-sources layouts
+  classes functions generics globals constants method-sources layouts
   (generated nil) (sequence 0)
   (open-names (make-hash-table :test #'equal))
   (closed-names (make-hash-table :test #'equal))

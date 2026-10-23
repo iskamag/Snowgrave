@@ -288,6 +288,40 @@
         (check (second (first observation)) "~A did not take its condition path" name)))
     (compare-entry unit package "TEXT-RESULT" nil '(("hello") nil))))
 
+(defun constant-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :constant-order
+       "((defconstant +base+ 17)
+          (defun make-offset () (+ +base+ 15))
+          (defconstant +offset+ (make-offset))
+          (defun entry () (+ +base+ +offset+)))"
+       "(entry)" "((entry ()))" "()")
+    (compare-entry unit package "ENTRY" nil '((49) nil)))
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :constant-generated-code
+       "((defconstant +base+ 17)
+          (defclass cell () ((value :initform +base+ :reader value)))
+          (defgeneric total (object))
+          (defmethod total ((object cell)) (+ +base+ (value object)))
+          (defun entry () (total (make-instance 'cell))))"
+       "(entry)" "((entry ()))" "(value total)")
+    (compare-entry unit package "ENTRY" nil '((34) nil)))
+  ;; The builder installs this constant before closed rewriting refuses the
+  ;; reflection call. Cleanup must preserve that original Snowgrave condition.
+  (let ((feature nil))
+    (handler-case
+        (make-fixture
+         :constant-cleanup
+         "((defconstant +base+ 17)
+            (defun entry () (class-of +base+)))"
+         "(entry)" "((entry ()))" "()")
+      (snowgrave:snowgrave-error (condition)
+        (setf feature (snowgrave:error-feature condition))))
+    (check (eq :open-operation feature)
+           "Constant cleanup lost the original reflection refusal: ~S" feature)))
+
 (defun frozen-macro-tests ()
   ;; Do not evaluate an independent open fixture first: that would expand the
   ;; stateful macro against different build inputs than the snapshot under test.
@@ -433,6 +467,7 @@
     (binding-tests)
     (native-partition-tests)
     (method-boundary-tests)
+    (constant-tests)
     (frozen-macro-tests)
     (fresh-artifact-test)
     (rejection-tests)
