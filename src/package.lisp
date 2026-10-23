@@ -1,35 +1,59 @@
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-cltl2))
+
 (defpackage #:snowgrave
   (:use #:common-lisp)
-  (:shadow #:defclass #:defgeneric #:defmethod #:define-method-combination)
-  (:export
-   #:defclass #:defgeneric #:defmethod #:define-method-combination #:close-source-unit
-   #:snowgrave-error #:unsupported-definition #:unclosed-call
-   #:unclosed-class-operation #:nonreproducible-source #:mop-failure
-   #:incomplete-domain #:residual-metaobject #:audit-failure
-   #:error-source-key #:error-feature #:error-phase #:error-path #:error-detail
-   #:domain-violation #:violation-unit #:violation-name #:violation-arguments
-   #:closed-unit #:closed-unit-p #:unit-metadata #:unit-source
-   #:unit-function #:unit-report #:write-unit-source #:write-unit-metadata #:with-native-bindings
-   #:make-reference-domain #:make-layout #:layout-identity #:sg-make-record #:sg-record-p
-   #:sg-record-class #:sg-record-typep #:sg-record-unit-p #:sg-record-layout-p
-   #:sg-record-matches-layout-p #:sg-record-boundp #:sg-record-read
-   #:sg-record-write #:sg-record-unbind #:sg-domain-violation
-   #:write-mezzano-unit-source #:register-source-adapter
-   #:source-name-key #:source-defining-kind #:make-authored-source #:authored-source
-   #:authored-source-forms #:authored-source-definitions #:authored-source-names
-   #:authored-source-kind-forms #:authored-source-specials #:find-authored-definition
-   #:authored-form-position #:authored-definition #:authored-definition-kind
-   #:authored-definition-name #:authored-definition-form #:authored-definition-position
-   #:source-lambda-contract #:source-body-special-domains #:source-body-parts #:source-block-body
-   #:analyze-source-bindings #:analyze-source-lambda-bindings #:source-required-binding-variables))
+  (:export #:close-source-unit #:closed-unit #:closed-unit-p
+           #:unit-function #:unit-source #:unit-metadata #:unit-report
+           #:write-unit-source #:write-unit-metadata
+           #:snowgrave-error #:unsupported-definition #:unclosed-call
+           #:error-feature #:error-detail))
 
-(defpackage #:snowgrave.class-identities
-  (:use))
+(in-package #:snowgrave)
 
-(defpackage #:snowgrave.sbcl
-  (:use #:common-lisp)
-  (:export #:close-source))
+(define-condition snowgrave-error (error)
+  ((feature :initarg :feature :reader error-feature)
+   (detail :initarg :detail :reader error-detail))
+  (:report (lambda (condition stream)
+             (format stream "Snowgrave ~S: ~A" (error-feature condition) (error-detail condition)))))
+(define-condition unsupported-definition (snowgrave-error) ())
+(define-condition unclosed-call (snowgrave-error) ())
 
-(defpackage #:snowgrave.mezzano-materializer
-  (:use #:common-lisp)
-  (:export #:define-materialized-unit #:native-unit-layouts #:admit-supervisor-unit))
+(defun unsupported (build feature control &rest arguments)
+  (declare (ignore build))
+  (error 'unsupported-definition :feature feature :detail (apply #'format nil control arguments)))
+
+(defstruct build
+  identity declaration forms open-package output-package
+  classes functions generics globals method-sources layouts
+  (generated nil) (sequence 0)
+  (open-names (make-hash-table :test #'equal))
+  (closed-names (make-hash-table :test #'equal))
+  (open-literals (make-array 0 :adjustable t :fill-pointer 0))
+  (closed-literals (make-array 0 :adjustable t :fill-pointer 0))
+  (open-literal-index (make-hash-table :test #'eq))
+  (closed-literal-index (make-hash-table :test #'eq))
+  open-literal-name closed-literal-name
+  (temporary-methods nil))
+
+(defun mapped-name (build name phase)
+  (if (consp name)
+      (list 'setf (mapped-name build (second name) phase))
+      (let ((table (if (eq phase :open) (build-open-names build) (build-closed-names build)))
+            (package (if (eq phase :open) (build-open-package build) (build-output-package build))))
+        (or (gethash name table)
+            (setf (gethash name table)
+                  (intern (format nil "~A-~D" (symbol-name name) (hash-table-count table)) package))))))
+(defun open-name (build name) (mapped-name build name :open))
+(defun closed-name (build name) (mapped-name build name :closed))
+(defun fresh-name (build prefix)
+  (intern (format nil "%~A-~D" prefix (incf (build-sequence build))) (build-output-package build)))
+(defun emit-form (build form) (push form (build-generated build)) form)
+
+(defun function-name-p (name)
+  (or (symbolp name) (and (consp name) (eq (first name) 'setf)
+                         (consp (rest name)) (null (cddr name)) (symbolp (second name)))))
+(defun source-function-p (build name)
+  (member name (append (build-functions build) (build-generics build)) :test #'equal))
+(defun source-class-p (build name) (member name (build-classes build)))
+(defun quoted (form)
+  (and (consp form) (eq (first form) 'quote) (consp (rest form)) (null (cddr form))))

@@ -1,197 +1,185 @@
 (in-package #:snowgrave)
 
-(defvar *source-adapters* (make-hash-table :test #'eq))
+(defstruct (closed-unit (:constructor %make-unit (metadata source bindings)))
+  metadata source bindings)
 
-(defun register-source-adapter (name function)
-  (check-type function function)
-  (setf (gethash name *source-adapters*) function)
-  name)
+(defvar *unit-sequence* 0)
 
-(defstruct (closed-unit (:constructor %make-unit))
-  (metadata nil :read-only t)
-  (source nil :read-only t)
-  (bindings nil :read-only t)
-  (configuration-bindings nil :read-only t)
-  (report nil :read-only t))
-
-(defun unit-metadata (unit)
-  (immutable-copy (closed-unit-metadata unit)))
-
-(defun unit-source (unit)
-  (immutable-copy (closed-unit-source unit)))
-
+(defun unit-metadata (unit) (copy-source-graph (closed-unit-metadata unit)))
+(defun unit-source (unit) (copy-source-graph (closed-unit-source unit)))
 (defun unit-report (unit)
-  (immutable-copy (closed-unit-report unit)))
+  (list :mechanism :mop-two-pass :profile :source-core
+        :target-accepted nil :configuration-capture nil
+        :classes (length (getf (closed-unit-metadata unit) :classes))))
+(defun unit-function (unit name)
+  (or (cdr (assoc name (closed-unit-bindings unit) :test #'equal))
+      (error "Not a public entry: ~S." name)))
 
-(defun function-name-key (name) (source-name-key name))
+(defun body-parts (body)
+  (let ((prefix nil))
+    (when (and (stringp (first body)) (rest body)) (push (pop body) prefix))
+    (loop while (and (consp (first body)) (eq (caar body) 'declare))
+          do (push (pop body) prefix))
+    (values (nreverse prefix) body)))
 
-(defun unit-binding-key (unit name)
-  (let ((bindings (remove-duplicates
-                   (append (closed-unit-bindings unit) (closed-unit-configuration-bindings unit))
-                   :key #'car :test #'equal)))
-    (if (stringp name)
-        (let ((matches (remove-if-not
-                        (lambda (binding)
-                          (let ((key (car binding)))
-                            (and (stringp (car key)) (string= name (second key)))))
-                        bindings)))
-          (when (= (length matches) 1) (caar matches)))
-        (function-name-key name))))
+(defun entry-domain-test (build domain variable)
+  (cond ((source-class-p build domain) (closed-class-test build domain variable))
+        ((and (consp domain) (eq (first domain) 'eql))
+         (unless (or (numberp (second domain)) (characterp (second domain)) (symbolp (second domain)))
+           (unsupported build :configuration-input "Object identity capture is outside the source core."))
+         `(eql ,variable ',(second domain)))
+        (t `(typep ,variable ',domain))))
 
-(defun unit-function (unit name &key bind-configuration)
-  "Resolve an installed entry. BIND-CONFIGURATION explicitly selects its
-zero-argument fixed-root binding; the artifact retains its original arity."
-  (let* ((key (unit-binding-key unit name))
-         (configured (cdr (assoc key (closed-unit-configuration-bindings unit) :test #'equal))))
-    (when configured
-      (unless bind-configuration
-        (error "Entry ~S requires :BIND-CONFIGURATION T for its fixed-root binding." name))
-      (return-from unit-function configured))
-    (when bind-configuration (error "Entry ~S has no fixed configuration binding." name))
-    (or (cdr (assoc key (closed-unit-bindings unit) :test #'equal))
-        (error "~S is not an entry of Snowgrave unit ~S."
-               name (getf (closed-unit-metadata unit) :identity)))))
+(defun emit-functions (build)
+  (dolist (form (build-forms build))
+    (when (eq (first form) 'defun)
+      (destructuring-bind (operator name lambda-list &rest body) form
+        (declare (ignore operator))
+        (multiple-value-bind (prefix executable) (body-parts body)
+          (let* ((entryp (member name (getf (build-declaration build) :entries) :test #'equal))
+                 (domains (second (assoc name (getf (build-declaration build) :external-domains) :test #'equal)))
+                 (checks
+                   (when entryp
+                     (unless (and (every #'symbolp lambda-list)
+                                  (notany (lambda (x) (member x lambda-list-keywords)) lambda-list)
+                                  (= (length lambda-list) (length domains)))
+                       (unsupported build :entry-domain
+                                    "Entry ~S needs required parameters and one declared domain per parameter." name))
+                     (loop for variable in lambda-list for domain in domains
+                           collect `(unless ,(entry-domain-test build domain variable)
+                                       (error 'type-error :datum ,variable :expected-type ',domain)))))
+                 (lambda-form
+                   (rewrite-form build
+                                 `(lambda ,lambda-list ,@prefix
+                                     (block ,(if (consp name) (second name) name)
+                                       ,@checks ,@executable))
+                                 :closed)))
+            (emit-form build (list* 'defun (closed-name build name) (rest lambda-form))))))))
+  ;; Install globals only after all ordinary function definitions exist.
+  (dolist (form (build-forms build))
+    (when (member (first form) '(defvar defparameter defconstant))
+      (emit-form build (list* (first form) (closed-name build (second form))
+                             (when (cddr form)
+                               (cons (rewrite-form build (third form) :closed) (cdddr form))))))))
 
-(defstruct (identity-operand (:constructor make-identity-operand (value))) value)
+(defun check-residual-source (build forms)
+  "The final source must contain no builder symbols or live builder objects."
+  (let ((seen (make-hash-table :test #'eq)))
+    (labels ((visit (value)
+               (cond ((symbolp value)
+                      (when (eq (symbol-package value) (build-open-package build))
+                        (unsupported build :builder-reference "Builder symbol remains: ~S." value)))
+                     ((consp value)
+                      (unless (gethash value seen)
+                        (setf (gethash value seen) t) (visit (car value)) (visit (cdr value))))
+                     ((or (numberp value) (characterp value) (stringp value)) nil)
+                     ((simple-vector-p value) (map nil #'visit value))
+                     (t (unsupported build :builder-object "Non-source object remains: ~S." (type-of value))))))
+      (visit forms))))
 
-(defun own-closing-declaration (declaration)
-  "Own structural data without copying identity operands before joint capture.
-An object used both as an identity operand and as metadata still has an owned
-metadata copy. Temporary handles occur only at explicit operand positions."
-  (labels ((entry-map (entries function)
-             (if (source-finite-list-p entries)
-                 (mapcar (lambda (entry)
-                           (if (and (source-finite-list-p entry) (= (length entry) 2)
-                                    (source-finite-list-p (second entry)))
-                               (list (first entry)
-                                     (mapcar (lambda (domain)
-                                               (if (and (consp domain) (source-finite-list-p domain)
-                                                        (= (length domain) 2) (eq (first domain) 'eql))
-                                                   (list 'eql (funcall function (second domain))) domain))
-                                             (second entry))) entry)) entries) entries))
-           (binding-map (bindings function)
-             (if (source-finite-list-p bindings)
-                 (mapcar (lambda (binding)
-                           (if (and (source-finite-list-p binding) (= (length binding) 2))
-                               (list (first binding) (funcall function (second binding))) binding)) bindings)
-                 bindings)))
-    (let ((skeleton (copy-list declaration)))
-      (setf (getf skeleton :external-domains)
-            (entry-map (getf skeleton :external-domains) #'make-identity-operand)
-            (getf skeleton :native-bindings)
-            (binding-map (getf skeleton :native-bindings) #'make-identity-operand))
-      (let ((owned (immutable-copy skeleton)))
-        (setf (getf owned :external-domains)
-              (entry-map (getf owned :external-domains) #'identity-operand-value)
-              (getf owned :native-bindings)
-              (binding-map (getf owned :native-bindings) #'identity-operand-value))
-        owned))))
+(defun package-bootstrap-forms (forms)
+  (let ((packages (make-hash-table :test #'equal)) (seen (make-hash-table :test #'eq)))
+    (labels ((visit (value)
+               (cond ((symbolp value)
+                      (let ((package (symbol-package value)))
+                        (when (and package (not (member (package-name package) '("COMMON-LISP" "KEYWORD") :test #'string=)))
+                          (pushnew (symbol-name value) (gethash (package-name package) packages) :test #'string=))))
+                     ((consp value)
+                      (unless (gethash value seen)
+                        (setf (gethash value seen) t) (visit (car value)) (visit (cdr value))))
+                     ((simple-vector-p value) (map nil #'visit value)))))
+      (visit forms))
+    (let ((package-variable (gensym "PACKAGE")) (name-variable (gensym "NAME")))
+     (loop for name in (sort (loop for name being the hash-keys of packages collect name) #'string<)
+          collect
+          ;; Exporting referenced names in newly created source packages also
+          ;; makes original single-colon literal symbols readable on replay.
+          `(eval-when (:compile-toplevel :load-toplevel :execute)
+              (unless (find-package ,name)
+                (let ((,package-variable (make-package ,name :use '("COMMON-LISP"))))
+                  (dolist (,name-variable ',(sort (gethash name packages) #'string<))
+                    (shadow ,name-variable ,package-variable)
+                    (export (intern ,name-variable ,package-variable) ,package-variable)))))))))
 
 (defun write-unit-source (unit stream)
-  (let ((*print-readably* t) (*print-pretty* t) (*print-circle* t) (*package* (find-package :cl)))
+  (let ((*package* (find-package :cl)) (*print-readably* t) (*print-circle* t) (*print-pretty* t))
     (write '(in-package #:common-lisp) :stream stream)
     (terpri stream)
-    (let ((packages nil) (shadows nil) (exports nil) (seen (make-hash-table :test #'eq)))
-      (labels ((collect (x)
-                 (cond ((symbolp x)
-                        (let ((package (symbol-package x)))
-                          (when (and package
-                                     (not (member (package-name package)
-                                                  '("COMMON-LISP" "KEYWORD" "SNOWGRAVE") :test #'string=)))
-                            (pushnew (package-name package) packages :test #'string=)
-                            (when (eq (nth-value 1 (find-symbol (symbol-name x) package)) :external)
-                              (pushnew (cons (package-name package) (symbol-name x)) exports :test #'equal))
-                            (let ((common (find-symbol (symbol-name x) :cl)))
-                              (when (and common (not (eq common x)))
-                                (pushnew (cons (package-name package) (symbol-name x)) shadows
-                                         :test #'equal))))))
-                       ((or (consp x) (arrayp x))
-                        (unless (gethash x seen)
-                          (setf (gethash x seen) t)
-                          (if (consp x) (progn (collect (car x)) (collect (cdr x)))
-                              (multiple-value-bind (parent offset) (array-displacement x)
-                                (declare (ignore offset))
-                                (if parent (collect parent)
-                                    (unless (null (array-element-type x))
-                                      (dotimes (index (array-total-size x))
-                                        (collect (row-major-aref x index))))))))))))
-        (collect (closed-unit-source unit))
-        ;; Metadata can mention exported source names absent from emitted code,
-        ;; such as an entry whose zero-argument body is a scalar constant.
-        (collect (closed-unit-metadata unit)))
-      (dolist (name (sort packages #'string<))
-        (write `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (unless (find-package ,name) (make-package ,name :use '("COMMON-LISP")))
-                  ,@(when (assoc name shadows :test #'string=)
-                      `((shadow ',(sort (loop for (package . symbol) in shadows
-                                             when (string= package name) collect symbol)
-                                       #'string<)
-                                ,name)))
-                  ,@(when (assoc name exports :test #'string=)
-                      `((export (mapcar (lambda (symbol-name) (intern symbol-name ,name))
-                                       ',(sort (loop for (package . symbol) in exports
-                                                     when (string= package name) collect symbol)
-                                               #'string<))
-                                ,name)))) :stream stream)
-        (terpri stream)))
-    ;; Reader labels have one whole-form scope. Preserve sharing between
-    ;; constructor initforms and ordinary definitions as well as inside each.
-    (write `(progn ,@(closed-unit-source unit)) :stream stream)
-    (terpri stream)))
-
+    (dolist (form (package-bootstrap-forms (closed-unit-source unit)))
+      (write form :stream stream) (terpri stream))
+    (dolist (form (closed-unit-source unit))
+      (write form :stream stream) (terpri stream))))
 (defun write-unit-metadata (unit stream)
-  (let ((*print-readably* t) (*print-pretty* nil) (*print-circle* t) (*package* (find-package :cl)))
-    (write (closed-unit-metadata unit) :stream stream)
-    (terpri stream)))
+  (let ((*package* (find-package :cl)) (*print-readably* t) (*print-circle* t))
+    (write (closed-unit-metadata unit) :stream stream) (terpri stream)))
 
-(defun close-source-unit (source-unit &rest declaration
-                         &key unit-name closed-classes universe closed-generics
-                           entries external-domains external-operations external-return-domains
-                           external-value-guards external-argument-domains native-bindings
-                           (domain-violation :signal) (deployment-roots :selected) (adapter :sbcl)
-                         &allow-other-keys)
-  "Close an ordered source unit through a registered compiler adapter.
-No unit is returned until the adapter's semantic and residual audits pass.
-DEPLOYMENT-ROOTS is :SELECTED (selected methods retain independent roots) or
-:ENTRIES (only proven entry/call/capture/global/construction roots are deployed).
-Both policies retain the complete sealed authored source and its open audits.
-Identity-bearing EQL entry operands request joint cold graph capture. Native
-array bindings are (stable-key array) pairs whose identities are preserved;
-other captured storage becomes a private installed copy without initialization.
-Successful closing adopts this source configuration exclusively: the caller
-must stop using its original mutation and cleanup routes. Failure retains the
-original configuration's custody. Native installation owners maintain admitted
-geometry, alias relations and external resource lifetime. Resolve such entries
-with UNIT-FUNCTION :BIND-CONFIGURATION T; their bindings take no arguments.
-EXTERNAL-RETURN-DOMAINS optionally records (operation exact-native-value-tuple)
-owner ABI guarantees. It grants no purity, placement, or opaque-object proof;
-an installed external binding must satisfy its published result contract.
-EXTERNAL-VALUE-GUARDS records (owner-key predicate native-structure-type): an
-ordinary one-argument BOOLEAN predicate must reject foreign logical values by
-identity before interpretation, and establish a live unchanged native authority.
-Positive lexical checks establish (:EXTERNAL-VALUE owner-key). They grant no
-nominal cohort interpretation or target admission. EXTERNAL-ARGUMENT-DOMAINS
-requires each external call's exact value tuple; corresponding result promises
-apply only on that tuple. Opaque returned keys must forward an already guarded
-argument authority. Definition/resource/alias lifetime remains installation-owned."
-  (declare (ignore closed-classes universe closed-generics external-domains
-                   external-operations external-return-domains external-value-guards external-argument-domains))
-  (unless (and unit-name entries)
-    (reject 'unsupported-definition :declaration :unit-identity-and-entries
-            "Both an immutable unit identity and ordinary-function entries are required."))
-  (unless (member deployment-roots '(:selected :entries))
-    (reject 'unsupported-definition :declaration :deployment-roots
-            "Deployment roots must be :SELECTED or :ENTRIES."))
-  (unless (eq domain-violation :signal)
-    (reject 'unsupported-definition :declaration :violation-action
-            "This portable binding supplies only the non-returning :SIGNAL action."))
-  (let ((closer (gethash adapter *source-adapters*)))
-    (unless closer
-      (reject 'unsupported-definition :declaration :adapter
-              (format nil "Load the compiler adapter for ~S before closing." adapter)))
-    (let ((effective (copy-list declaration)))
-      (setf (getf effective :deployment-roots) deployment-roots)
-      (flet ((close-it () (funcall closer source-unit (own-closing-declaration effective))))
-        (if native-bindings
-            (call-with-native-bindings unit-name native-bindings #'close-it)
-            (close-it))))))
+(defun close-source-unit (source &rest declaration
+                          &key unit-name entries closed-classes closed-generics universe
+                            external-domains external-operations (domain-violation :signal) (adapter :sbcl)
+                          &allow-other-keys)
+  (declare (ignore closed-classes closed-generics universe external-domains external-operations))
+  (loop for (key value) on declaration by #'cddr
+        do (unless (member key '(:unit-name :entries :closed-classes :closed-generics :universe
+                                 :external-domains :external-operations :domain-violation :adapter))
+             (unsupported nil :declaration "Unsupported source-core option ~S = ~S." key value)))
+  (unless (and unit-name entries (eq adapter :sbcl) (eq domain-violation :signal))
+    (unsupported nil :declaration "A named unit, public entries, SBCL and :SIGNAL policy are required."))
+  (let* ((number (incf *unit-sequence*))
+         (open (make-package (format nil "SNOWGRAVE.BUILD.~D" number) :use '(:cl)))
+         (output (make-package (format nil "SNOWGRAVE.CLOSED.~D" number) :use '(:cl)))
+         (build (make-build :identity (copy-source-graph unit-name)
+                            :declaration (copy-source-graph declaration)
+                            :forms (read-source source) :open-package open :output-package output))
+         (success nil))
+    (setf (build-open-literal-name build) (intern "%LITERALS" open)
+          (build-closed-literal-name build) (intern "%LITERALS" output))
+    (unwind-protect
+         (progn
+           (index-source build)
+           (loop for (key actual) in (list (list :closed-classes (build-classes build))
+                                           (list :closed-generics (build-generics build)))
+                 when (loop for tail on declaration by #'cddr thereis (eq (first tail) key))
+                   do (let ((selected (getf declaration key)))
+                        (unless (and (null (set-difference actual selected :test #'equal))
+                                     (null (set-difference selected actual :test #'equal)))
+                          (unsupported build :partial-cohort
+                                       "~S must name the complete owned set ~S." key actual))))
+           (dolist (entry entries)
+             (unless (member entry (build-functions build) :test #'equal)
+               (unsupported build :entry "Entry ~S needs an owned ordinary definition." entry)))
+           ;; Unsupported construction metaprotocols must fail before installing
+           ;; any methods on the host's standard initialization generics.
+           (dolist (form (build-method-sources build))
+             (when (member (second form) '(make-instance allocate-instance initialize-instance
+                                          shared-initialize reinitialize-instance slot-missing slot-unbound))
+               (unsupported build :custom-record-protocol
+                            "Authored ~S needs a closed initialization realization." (second form))))
+           (let* ((open-forms (mapcar (lambda (form) (open-definition build form)) (build-forms build)))
+                  (literals (literal-definition build :open)))
+             (when literals (eval literals))
+             (dolist (form open-forms) (eval form)))
+           (prepare-records build)
+           (emit-records build)
+           (emit-generics build)
+           (emit-functions build)
+           (let* ((literals (literal-definition build :closed))
+                  (specials (loop for form in (build-forms build)
+                                  when (member (first form) '(defvar defparameter))
+                                    collect (closed-name build (second form))))
+                  (forms (append (when specials (list (list 'declaim (cons 'special specials))))
+                                 (when literals (list literals)) (nreverse (build-generated build))))
+                  (metadata (list :identity (build-identity build) :mechanism :mop-two-pass :profile :source-core
+                                  :classes (copy-list (build-classes build))
+                                  :entries (mapcar (lambda (name)
+                                                     (let ((symbol (closed-name build name)))
+                                                       (list :name name :code-key
+                                                             (list (package-name output) (symbol-name symbol)))))
+                                                   entries))))
+             (check-residual-source build forms)
+             (dolist (form forms) (eval form))
+             (let ((unit (%make-unit metadata forms
+                                    (mapcar (lambda (name) (cons name (fdefinition (closed-name build name)))) entries))))
+               (setf success t)
+               unit)))
+      (delete-package open)
+      (unless success (delete-package output)))))
