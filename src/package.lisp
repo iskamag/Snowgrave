@@ -5,6 +5,7 @@
   (:export #:close-source-unit #:closed-unit #:closed-unit-p
            #:unit-function #:unit-source #:unit-metadata #:unit-report
            #:write-unit-source #:write-unit-metadata
+           #:bind-entry
            #:snowgrave-error #:unsupported-definition #:unclosed-call
            #:error-feature #:error-detail))
 
@@ -25,6 +26,7 @@
 (defstruct build
   identity declaration forms open-package output-package
   classes functions generics globals constants method-sources layouts
+  (generic-plans nil) (slot-plans nil) (method-functions nil)
   (generated nil) (sequence 0)
   (open-names (make-hash-table :test #'equal))
   (closed-names (make-hash-table :test #'equal))

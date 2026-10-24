@@ -242,6 +242,7 @@
                                           abi)))
            (source (owned-method-source build generic method)))
       (setf (gethash key *method-source-cache*) name)
+      (push name (build-method-functions build))
       (cond
         ((typep method 'sb-mop:standard-accessor-method)
          (let* ((slot (sb-mop:slot-definition-name (sb-mop:accessor-method-slot-definition method)))
@@ -371,6 +372,20 @@
                                  :format-arguments (list ',generic))))
                   ,(emit-effective-source build generic effective abi))
                 clauses))))
+    (push (list :name (closed-name build generic) :source generic
+                :required required :optional (length (getf shape :optional))
+                :variable-tail (not (null arguments))
+                :arguments (method-call-abi-arguments abi)
+                :optional-count (method-call-abi-optional-count abi)
+                :overflow overflow
+                :axes (mapcar (lambda (axis)
+                                (mapcar (lambda (cut)
+                                          (list (first cut)
+                                                (if (eq (first cut) :record)
+                                                    (class-description-type (find-record-class build (second cut)))
+                                                    (second cut)))) axis)) axes)
+                :clauses (reverse clauses))
+          (build-generic-plans build))
     (emit-form build
                `(defun ,(closed-name build generic)
                     ,(if arguments `(&rest ,arguments)

@@ -258,16 +258,25 @@
                        append (mapcar #'slot-description-name (class-description-slots description)))))
          (arguments (if (eq operation :write) (list value object) (list object))))
     (dolist (slot slots)
-      (emit-form build
-        `(defun ,(record-slot-function build operation slot) ,arguments
-           (cond
-             ,@(loop for description in (build-layouts build)
-                     for field = (find slot (class-description-slots description)
-                                       :key #'slot-description-name)
-                     when field collect
-                       `((,(class-description-predicate description) ,object)
-                         ,(record-slot-body build description field operation object value)))
-             (t (,(record-helper-name build '%record-invalid-slot) ,object ',slot))))))
+      (let ((cases (loop for description in (build-layouts build)
+                         for field = (find slot (class-description-slots description)
+                                           :key #'slot-description-name)
+                         when field collect
+                           (list (class-description-type description)
+                                 (class-description-predicate description)
+                                 (slot-description-field field)
+                                 (record-slot-body build description field operation object value)))))
+        (push (list :name (record-slot-function build operation slot)
+                    :operation operation :slot slot :arguments arguments
+                    :invalid (record-helper-name build '%record-invalid-slot)
+                    :object object :value value :cases cases)
+              (build-slot-plans build))
+        (emit-form build
+          `(defun ,(record-slot-function build operation slot) ,arguments
+             (cond
+               ,@(loop for (type predicate field body) in cases
+                       collect `((,predicate ,object) ,body))
+               (t (,(record-helper-name build '%record-invalid-slot) ,object ',slot)))))))
     (emit-form
      build
      `(defun ,name ,(if (eq operation :write) (list value object slot-name) (list object slot-name))

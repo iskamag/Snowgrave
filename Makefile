@@ -1,4 +1,4 @@
-.PHONY: test check paper check-clamsara check-clamsara-index-set
+.PHONY: test check paper check-clamsara check-clamsara-index-set check-clamsara-configuration
 SBCL_TEST_HEAP_MB ?= 1024
 CLAMSARA_ROOT ?= ../Clamsara/.worktrees/sane-engine
 test:
@@ -9,5 +9,7 @@ check-clamsara:
 	sbcl --dynamic-space-size $(SBCL_TEST_HEAP_MB) --no-sysinit --no-userinit --script scripts/check-clamsara.lisp "$(CLAMSARA_ROOT)"
 check-clamsara-index-set:
 	sbcl --dynamic-space-size $(SBCL_TEST_HEAP_MB) --no-sysinit --no-userinit --script scripts/check-clamsara-index-set.lisp "$(CLAMSARA_ROOT)"
+check-clamsara-configuration:
+	sbcl --dynamic-space-size $(SBCL_TEST_HEAP_MB) --no-sysinit --no-userinit --script scripts/check-clamsara-configuration.lisp "$(CLAMSARA_ROOT)"
 paper:
 	$(MAKE) -C paper

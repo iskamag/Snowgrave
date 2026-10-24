@@ -1,5 +1,5 @@
 ;;; Optional whole-source Clamsara integration gate, run in a fresh SBCL:
-;;;   sbcl --dynamic-space-size 2048 --noinform --script scripts/check-clamsara.lisp \
+;;;   sbcl --dynamic-space-size 1024 --noinform --script scripts/check-clamsara.lisp \
 ;;;     /path/to/Clamsara/checkout /path/to/artifacts/
 ;;; Defaults: sibling Clamsara/.worktrees/sane-engine and .build/clamsara/.
 ;;; Closer MOP must be visible to ASDF; for a standalone checkout, set e.g.
@@ -14,29 +14,10 @@
    (uiop:pathname-directory-pathname *load-truename*)))
 (asdf:load-asd (merge-pathnames "snowgrave.asd" *snowgrave-root*))
 (asdf:load-system "snowgrave")
+(load (merge-pathnames "scripts/clamsara-source.lisp" *snowgrave-root*))
 
-(defpackage #:snowgrave.clamsara-check (:use #:cl))
+(defpackage #:snowgrave.clamsara-check (:use #:cl #:snowgrave.clamsara-source))
 (in-package #:snowgrave.clamsara-check)
-
-(defun source-files (component)
-  "Keep the ASDF component order; do not substitute a hand-picked file list."
-  (cond ((typep component 'asdf:cl-source-file)
-         (list (truename (asdf:component-pathname component))))
-        ((typep component 'asdf:parent-component)
-         (mapcan #'source-files (asdf:component-children component)))))
-
-(defun read-definitions (path)
-  "Only package setup is consumed here. Every other top-level form is kept."
-  (let ((*package* (find-package :cl-user)) (*read-eval* nil) (forms nil))
-    (with-open-file (stream path)
-      (loop for form = (read stream nil stream) until (eq form stream)
-            do (case (and (consp form) (first form))
-                 (defpackage (eval form))
-                 (in-package
-                  (setf *package* (or (find-package (second form))
-                                      (error "Missing reader package ~S" (second form)))))
-                 (otherwise (push form forms)))))
-    (nreverse forms)))
 
 (defun git-output (checkout &rest arguments)
   (string-trim '(#\Newline #\Return)

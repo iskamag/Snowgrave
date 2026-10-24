@@ -1,7 +1,9 @@
 (in-package #:snowgrave)
 
-(defstruct (closed-unit (:constructor %make-unit (metadata source bindings)))
-  metadata source bindings)
+(defstruct (closed-unit (:constructor %make-unit (metadata source bindings compiler-data)))
+  metadata source bindings compiler-data
+  (seals (make-hash-table :test #'eq))
+  (sealed-writers (make-hash-table :test #'equal)))
 
 (defvar *unit-sequence* 0)
 
@@ -121,6 +123,31 @@
       (unsupported build :compilation "The host could not compile a generated definition."))
     (funcall thunk)))
 
+(defun unit-compiler-data (build)
+  ;; These are plain source descriptions, never open MOP objects. Keep enough
+  ;; information for a configured entry without reopening the class world.
+  (list :generics (build-generic-plans build)
+        :entries (loop for (name domains) in (getf (build-declaration build) :external-domains)
+                       collect (list name (mapcar (lambda (type) (rewrite-type build type :closed)) domains)))
+        :slots (build-slot-plans build)
+        :methods (build-method-functions build)
+        :slow-paths (mapcar (lambda (name) (record-helper-name build name))
+                            '(%record-invalid-slot %record-unbound))
+        :construction-functions (when (build-layouts build)
+                                  (cons (record-make-instance-name build :closed)
+                                        (mapcar #'class-description-constructor (build-layouts build))))
+        :layouts
+        (loop for layout in (build-layouts build)
+              collect (list :name (class-description-name layout)
+                            :type (class-description-type layout)
+                            :cpl (class-description-cpl layout)
+                            :allocator (class-description-allocator layout)
+                            :bound (class-description-bound-accessor layout)
+                            :slots (loop for slot in (class-description-slots layout) for index from 0
+                                         collect (list :name (slot-description-name slot)
+                                                       :field (slot-description-field slot)
+                                                       :index index))))))
+
 (defun discard-builder (build)
   (let ((package (build-open-package build)))
     (do-symbols (symbol package)
@@ -200,7 +227,8 @@
              (check-residual-source build forms)
              (dolist (form forms) (compile-definition build form))
              (let ((unit (%make-unit metadata forms
-                                    (mapcar (lambda (name) (cons name (fdefinition (closed-name build name)))) entries))))
+                                    (mapcar (lambda (name) (cons name (fdefinition (closed-name build name)))) entries)
+                                    (unit-compiler-data build))))
                (setf success t)
                unit)))
       (discard-builder build)

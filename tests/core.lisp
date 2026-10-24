@@ -622,6 +622,7 @@
     (bounded-call-tests)
     (slot-helper-tests)
     (literal-scale-tests)
+    (configuration-tests)
     (control-tests)
     (binding-tests)
     (native-partition-tests)

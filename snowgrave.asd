@@ -11,7 +11,8 @@
                (:file "src/metadata")
                (:file "src/observation")
                (:file "src/methods")
-               (:file "src/unit"))
+               (:file "src/unit")
+               (:file "src/configuration"))
   :in-order-to ((asdf:test-op (asdf:test-op "snowgrave/tests"))))
 
 (asdf:defsystem "snowgrave/sbcl" :depends-on ("snowgrave"))
@@ -19,7 +20,7 @@
 (asdf:defsystem "snowgrave/tests"
   :depends-on ("snowgrave")
   :serial t
-  :components ((:file "tests/core") (:file "tests/overhead"))
+  :components ((:file "tests/core") (:file "tests/overhead") (:file "tests/configuration"))
   :perform (asdf:test-op (operation component)
              (declare (ignore operation component))
              (uiop:symbol-call :snowgrave.tests :run-tests)))

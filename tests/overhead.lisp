@@ -17,19 +17,20 @@
             (values (list n a ap b bp) :secondary))
           (defmethod operation ((n integer) &optional (a :child ap) (b :child-b bp))
             (snowgrave.tests::note-event (list :child n a ap b bp))
-            (setq n 99 a :changed b :changed)
+            (setq n \"mutated\" a :changed b :changed)
             (values (multiple-value-list (call-next-method))
                     (multiple-value-list (call-next-method))))
           (defun entry (arguments)
             (handler-case (apply #'operation arguments)
               (error (condition) (type-of condition))))
+          (defun direct () (operation 7))
           (defgeneric add (n &optional amount))
           (defmethod add ((n number) &optional (amount 2)) (+ n amount))
           (defmethod add ((n integer) &optional (amount (call-next-method)))
             (declare (ignore amount)) (call-next-method))
           (defun omitted (n) (add n))
           (defun supplied (n) (add n 3)))"
-       "(entry omitted supplied)" "((entry (list)) (omitted (integer)) (supplied (integer)))"
+       "(entry direct omitted supplied)" "((entry (list)) (direct ()) (omitted (integer)) (supplied (integer)))"
        "(operation add)" :universe "(number integer)" :external '(note-event))
     ;; Defaults belong to each method. SETQ of method parameters must not
     ;; change either next invocation, including its optional supplied prefix.
@@ -38,6 +39,13 @@
       (compare-entry unit package "ENTRY" (list arguments)))
     (compare-entry unit package "OMITTED" '(7) '((9) nil))
     (compare-entry unit package "SUPPLIED" '(7) '((10) nil))
+    (let ((name (find-symbol "DIRECT" package)))
+      (check (equal (observed-call (fdefinition name) nil)
+                    (observed-call (snowgrave:bind-entry unit name nil) nil))
+             "Configured qualifier/default/next-method semantics differ"))
+    (let ((name (find-symbol "OMITTED" package)))
+      (check (= 9 (funcall (snowgrave:bind-entry unit name '(7))))
+             "Configured next-method call inside an optional default differs"))
     (dolist (name '("OMITTED" "SUPPLIED"))
       (check-zero-call-allocation
        (snowgrave:unit-function unit (find-symbol name package)) 7 name))))
