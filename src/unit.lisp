@@ -79,8 +79,9 @@
                      (t (unsupported build :builder-object "Non-source object remains: ~S." (type-of value))))))
       (visit forms))))
 
-(defun package-bootstrap-forms (forms)
+(defun package-bootstrap-forms (forms &optional required-packages)
   (let ((packages (make-hash-table :test #'equal)) (seen (make-hash-table :test #'eq)))
+    (dolist (name required-packages) (setf (gethash name packages) nil))
     (labels ((visit (value)
                (cond ((symbolp value)
                       (let ((package (symbol-package value)))
@@ -104,15 +105,28 @@
                     (export (intern ,name-variable ,package-variable) ,package-variable)))))))))
 
 (defun write-unit-source (unit stream)
-  (let ((*package* (find-package :cl)) (*print-readably* t) (*print-circle* t) (*print-pretty* t))
+  ;; PRINT-READABLY may select host reader extensions for specialized strings.
+  ;; The source domain is already checked; standard escaped syntax is portable.
+  (let ((source-package (find-package (getf (closed-unit-compiler-data unit) :package)))
+        (*package* (find-package :cl)) (*print-readably* nil) (*print-escape* t)
+        (*print-array* t) (*print-circle* t) (*print-pretty* t)
+        (*print-level* nil) (*print-length* nil) (*print-base* 10))
     (write '(in-package #:common-lisp) :stream stream)
     (terpri stream)
-    (dolist (form (package-bootstrap-forms (closed-unit-source unit)))
+    (dolist (form (package-bootstrap-forms (closed-unit-source unit) (list (package-name source-package))))
       (write form :stream stream) (terpri stream))
-    (dolist (form (closed-unit-source unit))
-      (write form :stream stream) (terpri stream))))
+    ;; DEFSTRUCT may intern implementation-generated helper names in the
+    ;; current package even when explicit constructor/accessor names are given.
+    ;; Keep those names owned, and match the printer to the reader's package so
+    ;; shadowed COMMON-LISP symbols retain their required qualification.
+    (write `(in-package ,(package-name source-package)) :stream stream)
+    (terpri stream)
+    (let ((*package* source-package))
+      (dolist (form (closed-unit-source unit))
+        (write form :stream stream) (terpri stream)))))
 (defun write-unit-metadata (unit stream)
-  (let ((*package* (find-package :cl)) (*print-readably* t) (*print-circle* t))
+  (let ((*package* (find-package :cl)) (*print-readably* nil) (*print-escape* t) (*print-array* t) (*print-circle* t)
+        (*print-level* nil) (*print-length* nil) (*print-base* 10))
     (write (closed-unit-metadata unit) :stream stream) (terpri stream)))
 
 (defun compile-definition (build form)
@@ -126,7 +140,11 @@
 (defun unit-compiler-data (build)
   ;; These are plain source descriptions, never open MOP objects. Keep enough
   ;; information for a configured entry without reopening the class world.
-  (list :generics (build-generic-plans build)
+  (list :package (package-name (build-output-package build))
+        :generics (build-generic-plans build)
+        :special-variables (loop for form in (build-forms build)
+                                 when (member (first form) '(defvar defparameter))
+                                   collect (closed-name build (second form)))
         :entries (loop for (name domains) in (getf (build-declaration build) :external-domains)
                        collect (list name (mapcar (lambda (type) (rewrite-type build type :closed)) domains)))
         :slots (build-slot-plans build)
@@ -160,15 +178,15 @@
 
 (defun close-source-unit (source &rest declaration
                           &key unit-name entries closed-classes closed-generics universe
-                            external-domains external-operations (domain-violation :signal) (adapter :sbcl)
+                            external-domains external-operations (domain-violation :signal) (adapter :portable)
                           &allow-other-keys)
   (declare (ignore closed-classes closed-generics universe external-domains external-operations))
   (loop for (key value) on declaration by #'cddr
         do (unless (member key '(:unit-name :entries :closed-classes :closed-generics :universe
                                  :external-domains :external-operations :domain-violation :adapter))
              (unsupported nil :declaration "Unsupported source-core option ~S = ~S." key value)))
-  (unless (and unit-name entries (eq adapter :sbcl) (eq domain-violation :signal))
-    (unsupported nil :declaration "A named unit, public entries, SBCL and :SIGNAL policy are required."))
+  (unless (and unit-name entries (member adapter '(:portable :sbcl)) (eq domain-violation :signal))
+    (unsupported nil :declaration "A named unit, public entries and :SIGNAL policy are required."))
   (let* ((number (incf *unit-sequence*))
          (open (make-package (format nil "SNOWGRAVE.BUILD.~D" number) :use '(:cl)))
          (output (make-package (format nil "SNOWGRAVE.CLOSED.~D" number) :use '(:cl)))
@@ -200,12 +218,16 @@
                                           shared-initialize reinitialize-instance slot-missing slot-unbound))
                (unsupported build :custom-record-protocol
                             "Authored ~S needs a closed initialization realization." (second form))))
+           (prepare-open-generics build)
            (let* ((open-forms (mapcar (lambda (form) (open-definition build form)) (build-forms build)))
                   (literals (literal-definition build :open)))
              (emit-open-record-helpers build)
              (when literals (compile-definition build literals))
              (dolist (form open-forms) (compile-definition build form)))
            (prepare-records build)
+           (emit-form build
+                      `(define-condition ,(record-helper-name build '%program-error)
+                           (simple-condition program-error) ()))
            (emit-records build)
            (emit-metadata build)
            (emit-observations build)

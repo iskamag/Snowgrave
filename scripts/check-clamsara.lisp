@@ -1,4 +1,4 @@
-;;; Optional whole-source Clamsara integration gate, run in a fresh SBCL:
+;;; Optional whole-source Clamsara integration gate, run in a fresh host process:
 ;;;   sbcl --dynamic-space-size 1024 --noinform --script scripts/check-clamsara.lisp \
 ;;;     /path/to/Clamsara/checkout /path/to/artifacts/
 ;;; Defaults: sibling Clamsara/.worktrees/sane-engine and .build/clamsara/.
@@ -14,9 +14,10 @@
    (uiop:pathname-directory-pathname *load-truename*)))
 (asdf:load-asd (merge-pathnames "snowgrave.asd" *snowgrave-root*))
 (asdf:load-system "snowgrave")
+(asdf:load-system "snowgrave/host-tools")
 (load (merge-pathnames "scripts/clamsara-source.lisp" *snowgrave-root*))
 
-(defpackage #:snowgrave.clamsara-check (:use #:cl #:snowgrave.clamsara-source))
+(defpackage #:snowgrave.clamsara-check (:use #:cl #:snowgrave.clamsara-source #:snowgrave.host-tools))
 (in-package #:snowgrave.clamsara-check)
 
 (defun git-output (checkout &rest arguments)
@@ -27,7 +28,7 @@
 (defun write-report (directory report)
   (with-open-file (stream (merge-pathnames "report.sexp" directory)
                           :direction :output :if-exists :supersede)
-    (let ((*package* (find-package :cl)) (*print-pretty* t) (*print-readably* t))
+    (let ((*package* (find-package :cl)) (*print-pretty* t) (*print-readably* nil))
       (write report :stream stream)
       (terpri stream))))
 
@@ -72,7 +73,7 @@
       ;; Poison the generic object itself as well as its global binding, so a
       ;; retained reference to the original generic cannot escape this check.
       (when (typep original 'generic-function)
-        (sb-mop:set-funcallable-instance-function original poison))
+        (closer-mop:set-funcallable-instance-function original poison))
       (setf (fdefinition name) poison)))
   (length names))
 
@@ -87,7 +88,7 @@
   (let ((symbol (if (consp name) (second name) name)))
     (list (package-name (symbol-package symbol)) (symbol-name symbol) (consp name))))
 
-(defun run-child (artifacts phase source fasl key expected original-keys)
+(defun run-child (artifacts phase source key expected original-keys)
   (let* ((stem (string-downcase (symbol-name phase)))
          (driver (merge-pathnames (concatenate 'string stem ".lisp") artifacts))
          (log (merge-pathnames (concatenate 'string stem ".log") artifacts))
@@ -95,7 +96,7 @@
          (warnings (gensym "WARNINGS")) (failure (gensym "FAILURE"))
          (original (gensym "ORIGINAL")) (symbol (gensym "SYMBOL")))
     (with-open-file (stream driver :direction :output :if-exists :supersede)
-      (let ((*package* (find-package :cl)) (*print-readably* t)
+      (let ((*package* (find-package :cl)) (*print-readably* nil)
             (*print-pretty* t) (*print-circle* t))
         (write
          `(progn
@@ -106,10 +107,10 @@
                (:fresh-source `(load ,(namestring source)))
                (:fresh-compile
                 `(multiple-value-bind (,compiled ,warnings ,failure)
-                     (compile-file ,(namestring source) :output-file ,(namestring fasl))
+                     (compile-file ,(namestring source))
                    (declare (ignore ,warnings))
                    (assert (and ,compiled (not ,failure)))))
-               (:fresh-fasl `(load ,(namestring fasl))))
+               (:fresh-fasl `(load (compile-file-pathname ,(namestring source)))))
             ,@(unless (eq phase :fresh-compile)
                 `((dolist (,original ',original-keys)
                     (let* ((,package (find-package (first ,original)))
@@ -124,17 +125,14 @@
         (terpri stream)))
     (multiple-value-bind (output errors status)
         (uiop:run-program
-         (list "timeout" "120" "sbcl" "--dynamic-space-size"
-               (write-to-string (ceiling (sb-ext:dynamic-space-size) 1048576))
-               "--noinform" "--no-sysinit" "--no-userinit"
-               "--disable-debugger" "--script" (namestring driver))
+         (append '("timeout" "120") (host-process-command driver))
          :output :string :error-output :output :ignore-error-status t)
       (declare (ignore errors))
       (with-open-file (stream log :direction :output :if-exists :supersede)
         (write-string output stream))
       (unless (and (zerop status) (search "CLAMSARA-CHILD-PASS" output))
         (error "~S failed with exit ~D; see ~A" phase status log))
-      (format t "~A: passed in fresh SBCL; log ~A~%" phase log)
+      (format t "~A: passed in fresh ~A; log ~A~%" phase (or (uiop:getenv "SNOWGRAVE_REPLAY_LISP") (lisp-implementation-type)) log)
       (list :exit-status status :log (namestring log)))))
 
 (defun test-symbol (name)
@@ -172,7 +170,7 @@
                       :dirty (git-output checkout "status" "--porcelain")
                       :snowgrave-commit (git-output cl-user::*snowgrave-root* "rev-parse" "HEAD")
                       :snowgrave-dirty (git-output cl-user::*snowgrave-root* "status" "--porcelain")
-                      :dynamic-space-mebibytes (ceiling (sb-ext:dynamic-space-size) 1048576)
+                      :dynamic-space-mebibytes (host-heap-mebibytes)
                       :implementation (lisp-implementation-version)))
         (stage :load))
     (handler-case
@@ -256,8 +254,7 @@
                        (metadata (snowgrave:unit-metadata unit))
                        (key (getf (find wrapper (getf metadata :entries)
                                        :key (lambda (row) (getf row :name))) :code-key))
-                       (source (merge-pathnames "unit.lisp" artifacts))
-                       (fasl (merge-pathnames "unit.fasl" artifacts)))
+                       (source (merge-pathnames "unit.lisp" artifacts)))
                   (phase-passed report artifacts :close)
                   (setf stage :closed-execution)
                   (check-closed-workload entry expected stage)
@@ -280,7 +277,7 @@
                   (phase-passed report artifacts stage)
                   (dolist (phase '(:fresh-source :fresh-compile :fresh-fasl))
                     (setf stage phase)
-                    (let ((result (run-child artifacts phase source fasl key expected
+                    (let ((result (run-child artifacts phase source key expected
                                              (mapcar #'function-name-key (getf report :poisoned-functions)))))
                       (apply #'phase-passed report artifacts phase result)))
                   (setf (getf report :status) :passed)
@@ -302,11 +299,11 @@
 
 (let* ((arguments (uiop:command-line-arguments))
        (checkout (truename (uiop:ensure-directory-pathname
-                            (or (first arguments)
+                            (or (uiop:getenv "SNOWGRAVE_CLAMSARA_ROOT") (first arguments)
                                 (merge-pathnames "../Clamsara/.worktrees/sane-engine/"
                                                  cl-user::*snowgrave-root*)))))
        (artifacts (uiop:ensure-directory-pathname
-                   (or (second arguments) (merge-pathnames ".build/clamsara/" cl-user::*snowgrave-root*)))))
+                   (or (uiop:getenv "SNOWGRAVE_ARTIFACTS") (second arguments) (merge-pathnames ".build/clamsara/" cl-user::*snowgrave-root*)))))
   (when (cddr arguments) (error "Usage: check-clamsara.lisp [checkout [artifacts]]"))
   (ensure-directories-exist (merge-pathnames "report.sexp" artifacts))
   (with-open-file (log (merge-pathnames "run.log" artifacts)

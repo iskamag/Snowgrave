@@ -7,10 +7,11 @@
    (uiop:pathname-directory-pathname *load-truename*)))
 (asdf:load-asd (merge-pathnames "snowgrave.asd" *probe-repository*))
 (asdf:load-system "snowgrave")
+(asdf:load-system "snowgrave/host-tools")
 
 (defparameter *probe-clamsara*
   (uiop:ensure-directory-pathname
-   (or (first (uiop:command-line-arguments))
+   (or (uiop:getenv "SNOWGRAVE_CLAMSARA_ROOT") (first (uiop:command-line-arguments))
        (merge-pathnames "../Clamsara/.worktrees/sane-engine/" *probe-repository*))))
 (defparameter *probe-source* (merge-pathnames "engine/index-set.lisp" *probe-clamsara*))
 (defparameter *probe-source-text* (uiop:read-file-string *probe-source*))
@@ -58,8 +59,7 @@
 (defun run-probe-child (path)
   (multiple-value-bind (output errors status)
       (uiop:run-program
-       (list "timeout" "45s" "sbcl" "--noinform" "--no-sysinit" "--no-userinit"
-             "--disable-debugger" "--script" (namestring path))
+       (append (list "timeout" "90s") (snowgrave.host-tools:host-process-command path))
        :output :string :error-output :output :ignore-error-status t)
     (declare (ignore errors))
     (unless (zerop status) (error "Fresh artifact probe exited ~D:~%~A" status output))
@@ -68,7 +68,7 @@
 
 (defun write-probe-driver (path forms)
   (with-open-file (stream path :direction :output :if-exists :supersede)
-    (let ((*package* (find-package "COMMON-LISP")) (*print-readably* t) (*print-circle* t))
+    (let ((*package* (find-package "COMMON-LISP")) (*print-readably* nil) (*print-escape* t) (*print-circle* t))
       (dolist (form forms) (write form :stream stream) (terpri stream)))))
 
 (let* ((forms (append *probe-forms* (list *probe-observation*)))
@@ -86,7 +86,6 @@
                      (format nil "snowgrave-clamsara-index-set-~D/" (get-universal-time))
                      (uiop:temporary-directory)))
          (source (merge-pathnames "unit.lisp" directory))
-         (fasl (merge-pathnames "unit.fasl" directory))
          (driver (merge-pathnames "run.lisp" directory)))
     (assert (equal original *probe-expected*))
     (assert (equal closed original))
@@ -102,7 +101,7 @@
          (progn
            (with-open-file (stream source :direction :output :if-exists :supersede)
              (snowgrave:write-unit-source unit stream))
-           ;; Compilation and each replay use distinct fresh SBCL processes.
+           ;; Compilation and each replay use distinct fresh host processes.
            (dolist (mode '(:source :compile :fasl))
              (write-probe-driver
               driver
@@ -110,10 +109,10 @@
                 (assert (null (find-package "CLAMSARA")))
                 ,(if (eq mode :compile)
                      `(multiple-value-bind (path warnings failure)
-                          (compile-file ,(namestring source) :output-file ,(namestring fasl))
+                          (compile-file ,(namestring source))
                         (declare (ignore path warnings)) (assert (not failure)))
                      `(progn
-                        (load ,(namestring (if (eq mode :source) source fasl)))
+                        (load ,(if (eq mode :source) (namestring source) `(compile-file-pathname ,(namestring source))))
                         (assert (equal ',original
                                        (funcall (fdefinition
                                                  (find-symbol ,(second key) ,(first key))))))))

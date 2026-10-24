@@ -55,9 +55,10 @@
     (let ((results (multiple-value-list (apply function arguments))))
       (list results (reverse *events*)))))
 
-(defun compare-entry (unit package name arguments &optional expected)
+(defun compare-entry (unit package name arguments &optional expected &key (native-p t))
   (let* ((symbol (find-symbol name package))
-         (open (observed-call (fdefinition symbol) arguments))
+         (open (if native-p (observed-call (fdefinition symbol) arguments)
+                   (or expected (error "A host-independent oracle is required."))))
          (closed (observed-call (snowgrave:unit-function unit symbol) arguments)))
     (when expected
       (check (equal open expected) "~A open observation: ~S, expected ~S" name open expected))
@@ -115,7 +116,7 @@
       ;; Poison both generic leaves and the intervening original helper.
       ;; A hidden open call now fails instead of accidentally matching output.
       (dolist (name '("START" "FINISH" "VALUE"))
-        (sb-mop:set-funcallable-instance-function
+        (closer-mop:set-funcallable-instance-function
          (fdefinition (find-symbol name package))
          (lambda (&rest arguments) (declare (ignore arguments)) (error "Original generic reached."))))
       (dolist (name '("RELAY" "MAP-RELAY"))
@@ -141,7 +142,7 @@
           (defun entry (n)
             (let ((a (make-instance 'both :x n)) (b (make-instance 'both)))
               (let ((initial (list (x a) (x b) (y a)
-                                   (typep a 'left) (typep a 'right)
+                                   (not (null (typep a 'left))) (not (null (typep a 'right)))
                                    (eq (y a) (y b)) (slot-boundp a 'empty))))
                 (setf (x a) (+ n 1) (slot-value a 'empty) 9)
                 (let ((written (list (x a) (slot-value a 'empty) (slot-boundp a 'empty))))
@@ -217,8 +218,10 @@
     (let* ((entry (find-symbol "BAD-CONDITION" package))
            (original (funcall entry))
            (closed (funcall (snowgrave:unit-function unit entry))))
-      (check (string= (princ-to-string original) (princ-to-string closed))
-             "Closed initarg condition exposes its physical class descriptor: ~A" closed))
+      (check (and (typep original 'program-error) (typep closed 'program-error)
+                  (search "ALPHA" (princ-to-string closed))
+                  (not (search "SNOWGRAVE.CLOSED" (princ-to-string closed))))
+             "Closed initarg condition lost its logical class or category: ~A" closed))
     (let* ((source (snowgrave:unit-source unit))
            (definition (find-if (lambda (form)
                                   (and (eq (first form) 'defun) (symbolp (second form))
@@ -247,7 +250,7 @@
        "((defclass cell () ((value :initarg :value :reader value)))
           (defgeneric combine (object &optional amount &rest rest &key offset))
           (defmethod combine ((object cell) &optional (amount 3 suppliedp) &rest rest &key (offset 5))
-            (values (+ (value object) (or amount 0) offset) suppliedp rest))
+            (values (+ (value object) (or amount 0) offset) (not (null suppliedp)) rest))
           (defun omitted (n) (combine (make-instance 'cell :value n)))
           (defun supplied-nil (n) (combine (make-instance 'cell :value n) nil :offset 7))
           (defun keyword-entry (n) (combine (make-instance 'cell :value n) 8 :offset 9))
@@ -264,7 +267,9 @@
     (compare-entry unit package "SUPPLIED-NIL" '(5) '((12 t (:offset 7)) nil))
     (compare-entry unit package "KEYWORD-ENTRY" '(5) '((22 t (:offset 9)) nil))
     (compare-entry unit package "INDIRECT" '(5) '((22 t (:offset 9)) nil))
-    (compare-entry unit package "DEFAULT-NEXT" '(5) '((16) nil))))
+    ;; CCL 1.13 compiles CALL-NEXT-METHOD outside its lexical scope in a native
+    ;; optional initform. Check the specified result independently on that host.
+    (compare-entry unit package "DEFAULT-NEXT" '(5) '((16) nil) :native-p #-ccl t #+ccl nil)))
 
 (defun control-tests ()
   (multiple-value-bind (unit package)
@@ -352,10 +357,10 @@
           (defmethod greeting ((x integer)) \"hello\")
           (defun missing ()
             (handler-case (only-integer \"outside\")
-              (error (condition) (values (type-of condition) t))))
+              (error (condition) (values (not (null (typep condition 'error))) t))))
           (defun no-next ()
             (handler-case (only-integer 3)
-              (error (condition) (values (type-of condition) t))))
+              (error (condition) (values (not (null (typep condition 'error))) t))))
           (defun text-result () (greeting 3)))"
        "(missing no-next text-result)" "((missing ()) (no-next ()) (text-result ()))"
        "(only-integer greeting)" :universe "(integer)")
@@ -423,13 +428,13 @@
           (defun admitted-p (object name)
             (let ((class (class-of object)))
               (and (eq (class-of class) (find-class 'standard-class))
-                   (progn (sb-mop:finalize-inheritance class) t)
-                   (let ((slot (find name (sb-mop:class-slots class)
-                                     :key #'sb-mop:slot-definition-name)))
+                   (progn (closer-mop:finalize-inheritance class) t)
+                   (let ((slot (find name (closer-mop:class-slots class)
+                                     :key #'closer-mop:slot-definition-name)))
                      (and slot
-                          (eq (class-of slot) (find-class 'sb-mop:standard-effective-slot-definition))
-                          (eq (sb-mop:slot-definition-allocation slot) :instance)
-                          (eq (sb-mop:slot-definition-type slot) t)
+                          (eq (class-of slot) (find-class 'closer-mop:standard-effective-slot-definition))
+                          (eq (closer-mop:slot-definition-allocation slot) :instance)
+                          (eq (closer-mop:slot-definition-type slot) t)
                           (slot-boundp object name))))))
           (defun entry ()
             (let ((object (make-instance 'child)))
@@ -489,10 +494,9 @@
            (literal-key (getf (find (find-symbol "LITERALS" package) (getf metadata :entries)
                                    :key (lambda (row) (getf row :name))) :code-key))
            (directory (merge-pathnames
-                       (format nil "snowgrave-core-artifact-~D-~D/" (get-universal-time) *fixture-sequence*)
+                       (format nil "snowgrave-core-artifact-~A-~D-~D/" (lisp-implementation-type) (get-universal-time) *fixture-sequence*)
                        (uiop:temporary-directory)))
            (source (merge-pathnames "unit.lisp" directory))
-           (fasl (merge-pathnames "unit.fasl" directory))
            (driver (merge-pathnames "run.lisp" directory)))
       (check (and (stringp (first key)) (stringp (second key))) "Missing artifact entry identity")
       (ensure-directories-exist source)
@@ -502,14 +506,14 @@
                (snowgrave:write-unit-source unit stream))
              (dolist (mode '(:source :fasl))
                (with-open-file (stream driver :direction :output :if-exists :supersede)
-                 (let ((*package* (find-package :cl)) (*print-readably* t) (*print-circle* t)
+                 (let ((*package* (find-package :cl)) (*print-readably* nil) (*print-circle* t)
                        (compiled-path (gensym "COMPILED-PATH"))
                        (warnings (gensym "WARNINGS")) (failure (gensym "FAILURE")))
                    (write `(progn
                              ,(if (eq mode :source)
                                   `(load ,(namestring source))
                                   `(multiple-value-bind (,compiled-path ,warnings ,failure)
-                                       (compile-file ,(namestring source) :output-file ,(namestring fasl))
+                                       (compile-file ,(namestring source))
                                      (declare (ignore ,warnings))
                                      (assert (not ,failure))
                                      (load ,compiled-path)))
@@ -523,8 +527,7 @@
                ;; Deliberately load neither ASDF nor Snowgrave in the child.
                (multiple-value-bind (output errors status)
                    (uiop:run-program
-                    (list "sbcl" "--noinform" "--no-sysinit" "--no-userinit"
-                          "--disable-debugger" "--script" (namestring driver))
+                    (test-process-command driver)
                     :output :string :error-output :output :ignore-error-status t)
                  (declare (ignore errors))
                  (check (and (zerop status) (search "FRESH-ARTIFACT-PASS" output))
@@ -547,11 +550,11 @@
   (dolist (observation
            '("(typep (find-class 'sample) 'class)"
              "(typep (find-class 'sample) 'standard-class)"
-             "(typep (find-class 'sample) 'sb-mop:metaobject)"
-             "(typep (first (sb-mop:class-slots (find-class 'sample)))
-                      'sb-mop:slot-definition)"
-             "(typep (first (sb-mop:class-slots (find-class 'sample)))
-                      'sb-mop:standard-effective-slot-definition)"
+             "(typep (find-class 'sample) 'closer-mop:metaobject)"
+             "(typep (first (closer-mop:class-slots (find-class 'sample)))
+                      'closer-mop:slot-definition)"
+             "(typep (first (closer-mop:class-slots (find-class 'sample)))
+                      'closer-mop:standard-effective-slot-definition)"
              "(typep (find-class 'sample) '(or null standard-class))"
              "(the standard-class (find-class 'sample))"
              "(let ((class (find-class 'sample)))
@@ -623,6 +626,7 @@
     (slot-helper-tests)
     (literal-scale-tests)
     (configuration-tests)
+    (portable-source-tests)
     (control-tests)
     (binding-tests)
     (native-partition-tests)

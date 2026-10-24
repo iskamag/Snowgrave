@@ -6,23 +6,23 @@
        :bounded-calls
        "((defgeneric operation (n &optional a b))
           (defmethod operation :around ((n number) &optional (a :around ap) (b :around-b bp))
-            (snowgrave.tests::note-event (list :enter n a ap b bp))
+            (snowgrave.tests::note-event (list :enter n a (not (null ap)) b (not (null bp))))
             (unwind-protect (call-next-method) (snowgrave.tests::note-event :exit)))
           (defmethod operation :before ((n number) &optional (a :before ap) (b :before-b bp))
-            (snowgrave.tests::note-event (list :before n a ap b bp)))
+            (snowgrave.tests::note-event (list :before n a (not (null ap)) b (not (null bp)))))
           (defmethod operation :after ((n number) &optional (a :after ap) (b :after-b bp))
-            (snowgrave.tests::note-event (list :after n a ap b bp)))
+            (snowgrave.tests::note-event (list :after n a (not (null ap)) b (not (null bp)))))
           (defmethod operation ((n number) &optional (a :base ap) (b :base-b bp))
             (snowgrave.tests::note-event :base)
-            (values (list n a ap b bp) :secondary))
+            (values (list n a (not (null ap)) b (not (null bp))) :secondary))
           (defmethod operation ((n integer) &optional (a :child ap) (b :child-b bp))
-            (snowgrave.tests::note-event (list :child n a ap b bp))
+            (snowgrave.tests::note-event (list :child n a (not (null ap)) b (not (null bp))))
             (setq n \"mutated\" a :changed b :changed)
             (values (multiple-value-list (call-next-method))
                     (multiple-value-list (call-next-method))))
           (defun entry (arguments)
             (handler-case (apply #'operation arguments)
-              (error (condition) (type-of condition))))
+              (error (condition) (not (null (typep condition 'error))))))
           (defun direct () (operation 7))
           (defgeneric add (n &optional amount))
           (defmethod add ((n number) &optional (amount 2)) (+ n amount))
@@ -37,7 +37,7 @@
     (dolist (arguments '((7) (7 nil) (7 nil :given) (1/2) ("miss")
                         (7 1 2 3) ("miss" 1 2 3)))
       (compare-entry unit package "ENTRY" (list arguments)))
-    (compare-entry unit package "OMITTED" '(7) '((9) nil))
+    (compare-entry unit package "OMITTED" '(7) '((9) nil) :native-p #-ccl t #+ccl nil)
     (compare-entry unit package "SUPPLIED" '(7) '((10) nil))
     (let ((name (find-symbol "DIRECT" package)))
       (check (equal (observed-call (fdefinition name) nil)
@@ -57,11 +57,12 @@
     (dotimes (i count result) (setf result (funcall function argument)))))
 
 (defun check-zero-call-allocation (function argument description)
-  (sb-ext:gc :full t)
+  (unless (test-bytes-consed) (return-from check-zero-call-allocation))
+  (test-gc)
   (call-loop function argument 1000)
-  (let ((before (sb-ext:get-bytes-consed)))
+  (let ((before (test-bytes-consed)))
     (call-loop function argument 100000)
-    (let ((bytes (- (sb-ext:get-bytes-consed) before)))
+    (let ((bytes (- (test-bytes-consed) before)))
       (check (zerop bytes) "~A allocates ~D bytes during warmed bounded calls" description bytes))))
 
 (defun slot-helper-tests ()
@@ -101,7 +102,7 @@
                 (x object))))
           (defun missing (name)
             (handler-case (slot-boundp (make-instance 'base) name)
-              (error (condition) (type-of condition))))
+              (error (condition) (not (null (typep condition 'error))))))
           (defun fields ()
             (let ((a (make-instance 'child)) (b (make-instance 'unrelated)))
               (setf (x a) 31 (x b) nil)
@@ -112,25 +113,28 @@
        "(read-restart reject-store use-untyped missing fields access)"
        "((read-restart (t)) (reject-store ()) (use-untyped ()) (missing (symbol)) (fields ()) (access (integer)))"
        "(x (setf x))")
-    (compare-entry unit package "READ-RESTART" '(nil) '((17 nil) nil))
-    (compare-entry unit package "READ-RESTART" '(t) '((17 t) nil))
+    (compare-entry unit package "READ-RESTART" '(nil) '((17 nil) nil) :native-p #-ecl t #+ecl nil)
+    ;; STORE-VALUE is Snowgrave's explicit restart contract; native CCL and ECL do
+    ;; not provide it for SLOT-UNBOUND. ECL also lacks USE-VALUE.
+    (compare-entry unit package "READ-RESTART" '(t) '((17 t) nil) :native-p #-(or ccl ecl) t #+(or ccl ecl) nil)
     ;; Writing outside a declared CLOS slot type has undefined consequences.
     ;; Check Snowgrave's checked-write contract without using that as a native
     ;; differential oracle (SBCL's STORE-VALUE need not enforce the type).
     (check (equal '((:rejected nil) nil)
                   (observed-call (snowgrave:unit-function unit (find-symbol "REJECT-STORE" package)) nil))
            "Failed restart store changed boundness")
-    (compare-entry unit package "USE-UNTYPED" nil '((:not-stored) nil))
+    (compare-entry unit package "USE-UNTYPED" nil '((:not-stored) nil) :native-p #-ecl t #+ecl nil)
     (compare-entry unit package "FIELDS" nil '((31 nil t t nil) nil))
     ;; Equal print names do not make slot symbols interchangeable.
     (dolist (name (list :x (make-symbol "X") :missing))
       (compare-entry unit package "MISSING" (list name)))
     (check-zero-call-allocation
      (snowgrave:unit-function unit (find-symbol "ACCESS" package)) 7 "reader and writer"))
-  (let ((before (sb-ext:get-bytes-consed)))
+  (when (test-bytes-consed)
+   (let ((before (test-bytes-consed)))
     (call-loop (lambda (n) (list n)) 7 100000)
-    (check (> (- (sb-ext:get-bytes-consed) before) 1000000)
-           "Allocation calibration failed")))
+    (check (> (- (test-bytes-consed) before) 1000000)
+           "Allocation calibration failed"))))
 
 (defun literal-scale-tests ()
   ;; A large literal graph is data, not thousands of branches in one compiled

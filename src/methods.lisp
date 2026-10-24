@@ -3,11 +3,15 @@
 ;; The MOP supplies applicability and composition. This file only enumerates
 ;; a finite partition and replaces its method leaves with owned ordinary code.
 (defparameter *stock-miss-methods*
-  (loop for (name specializers) in
-        '((no-applicable-method (t))
-          (no-next-method (standard-generic-function standard-method)))
-        for method = (find-method (fdefinition name) nil (mapcar #'find-class specializers))
-        collect (list name method (sb-mop:method-function method))))
+  (loop for name in '(no-applicable-method no-next-method)
+        collect (list name
+                      (loop for method in (closer-mop:generic-function-methods (fdefinition name))
+                            when (and (null (method-qualifiers method))
+                                      (every (lambda (class)
+                                               (member (class-name class)
+                                                       '(t generic-function standard-generic-function method standard-method)))
+                                             (closer-mop:method-specializers method)))
+                              collect (list method (closer-mop:method-function method))))))
 
 (defvar *method-source-cache* nil)
 
@@ -109,13 +113,13 @@
      (and (equal (second form) generic)
           (multiple-value-bind (qualifiers lambda-list body) (method-parts form)
             (declare (ignore body))
-            (and (equal qualifiers (sb-mop:method-qualifiers method))
+            (and (equal qualifiers (cl:method-qualifiers method))
                  (equal (loop for parameter in lambda-list
                               until (member parameter lambda-list-keywords)
                               for specializer = (if (consp parameter) (second parameter) t)
                               collect (and (symbolp specializer)
                                            (source-specializer-class build specializer)))
-                        (sb-mop:method-specializers method))))))
+                        (closer-mop:method-specializers method))))))
    (build-method-sources build)))
 
 (defun validate-method-next-syntax (build form)
@@ -139,46 +143,52 @@
     (let* ((name (first baseline))
            (arguments (if (eq name 'no-applicable-method) (list generic)
                           (list generic method)))
-           (applicable (sb-mop:compute-applicable-methods (fdefinition name) arguments)))
+           (applicable (cl:compute-applicable-methods (fdefinition name) arguments)))
       (unless (and (= (length applicable) 1)
-                   (eq (first applicable) (second baseline))
-                   (eq (sb-mop:method-function (first applicable)) (third baseline)))
+                   (let ((saved (assoc (first applicable) (second baseline))))
+                     (and saved (eq (closer-mop:method-function (first applicable)) (second saved)))))
         (unsupported build :miss-protocol "~S has a replaced or extended miss protocol." name))))))
 
 (defun validate-generic-methods (build generic gf)
-  (unless (eq (class-of gf) (find-class 'standard-generic-function))
+  (unless (member (class-of gf) (list (find-class 'standard-generic-function)
+                                    (find-class 'closer-mop:standard-generic-function)))
     (unsupported build :generic-metaclass "~S is not a standard generic function." generic))
-  (unless (eq (sb-mop:generic-function-method-combination gf)
-              (sb-mop:find-method-combination gf 'standard nil))
-    (unsupported build :method-combination "~S needs an unsupported custom method combination." generic))
+  ;; Method-combination metaobjects need not be EQ across MOP queries (ECL
+  ;; returns fresh objects). The disposable cohort is defined from this owned
+  ;; declaration, so validate its combination contract directly.
+  (let* ((definition (find-if (lambda (form) (and (eq (first form) 'defgeneric)
+                                                  (equal (second form) generic))) (build-forms build)))
+         (option (assoc :method-combination (cdddr definition))))
+    (when (and option (not (equal (rest option) '(standard))))
+      (unsupported build :method-combination "~S needs an unsupported custom method combination." generic)))
   (validate-stock-miss-protocol build gf nil)
-  (dolist (method (sb-mop:generic-function-methods gf))
-    (unless (member (sb-mop:method-qualifiers method) '(nil (:before) (:after) (:around)) :test #'equal)
+  (dolist (method (closer-mop:generic-function-methods gf))
+    (unless (member (cl:method-qualifiers method) '(nil (:before) (:after) (:around)) :test #'equal)
       (unsupported build :method-qualifiers "Unsupported qualifiers in ~S." generic))
-    (dolist (specializer (sb-mop:method-specializers method))
-      (when (typep specializer 'sb-mop:eql-specializer)
+    (dolist (specializer (closer-mop:method-specializers method))
+      (when (typep specializer 'closer-mop:eql-specializer)
         (unsupported build :eql-specializer "EQL-specialized ~S needs an identity partition." generic))
       (unless (or (eq specializer (find-class t))
                   (source-class-for-metaobject build specializer)
                   (and (typep specializer 'built-in-class)
-                       (member (sb-mop:class-name specializer)
+                       (member (cl:class-name specializer)
                                (getf (build-declaration build) :universe))))
         (unsupported build :specializer "~S has an undeclared or unsupported native specializer ~S."
-                     generic (sb-mop:class-name specializer))))
+                     generic (cl:class-name specializer))))
     (validate-stock-miss-protocol build gf method))
   gf)
 
 (defun native-cuts-disjoint-p (left right)
   (multiple-value-bind (answer certainp)
-      (subtypep `(and ,(sb-mop:class-name left) ,(sb-mop:class-name right)) nil)
+      (subtypep `(and ,(cl:class-name left) ,(cl:class-name right)) nil)
     (and certainp answer)))
 
 (defun native-class-subtype-p (left right)
-  (member right (sb-mop:class-precedence-list left)))
+  (member right (closer-mop:class-precedence-list left)))
 
 (defun generic-axis-cuts (build methods position)
   (let* ((specializers (remove-duplicates
-                       (mapcar (lambda (method) (nth position (sb-mop:method-specializers method))) methods)))
+                       (mapcar (lambda (method) (nth position (closer-mop:method-specializers method))) methods)))
          (native (remove-if (lambda (class) (or (eq class (find-class t))
                                                (source-class-for-metaobject build class))) specializers)))
     (when (every (lambda (class) (eq class (find-class t))) specializers)
@@ -191,14 +201,14 @@
                     (native-class-subtype-p other (first tail))
                     (native-cuts-disjoint-p (first tail) other))
           (unsupported build :native-partition "Overlapping native classes ~S and ~S need an explicit partition."
-                       (sb-mop:class-name (first tail)) (sb-mop:class-name other)))))
-    (setf native (stable-sort native #'> :key (lambda (class) (length (sb-mop:class-precedence-list class)))))
+                       (cl:class-name (first tail)) (cl:class-name other)))))
+    (setf native (stable-sort native #'> :key (lambda (class) (length (closer-mop:class-precedence-list class)))))
     (append (mapcar (lambda (name) (list :record name (source-specializer-class build name)))
                     (build-classes build))
             (loop for tail on native for index from 0
-                  collect (list :native (sb-mop:class-name (first tail)) (first tail)
-                                (mapcar #'sb-mop:class-name (subseq native 0 index))))
-            (list (list :other t (find-class t) (mapcar #'sb-mop:class-name native))))))
+                  collect (list :native (cl:class-name (first tail)) (first tail)
+                                (mapcar #'cl:class-name (subseq native 0 index))))
+            (list (list :other t (find-class t) (mapcar #'cl:class-name native))))))
 
 (defun axis-cut-test (build cut value)
   (case (first cut)
@@ -218,24 +228,23 @@
 
 (defun no-applicable-method-form (build generic arguments)
   `(restart-case
-       (error 'sb-pcl::no-applicable-method-error
-              :generic-function #',(closed-name build generic) :args ,arguments)
-     (sb-ext:retry () :report "Retry the closed generic function."
+       (error 'simple-error :format-control "No applicable method for ~S with arguments ~S."
+              :format-arguments (list ',generic ,arguments))
+     (retry () :report "Retry the closed generic function."
        (apply #',(closed-name build generic) ,arguments))))
 
 (defun no-next-method-form (build generic method arguments)
-  `(error 'sb-pcl::no-next-method-error
-          :generic-function #',(closed-name build generic) :args ,arguments
-          :method ',(list :method generic (sb-mop:method-qualifiers method)
-                          (mapcar (lambda (class) (or (source-class-for-metaobject build class)
-                                                     (sb-mop:class-name class)))
-                                  (sb-mop:method-specializers method)))))
+  (declare (ignore build method))
+  `(error 'simple-error :format-control "No next method for ~S with arguments ~S."
+          :format-arguments (list ',generic ,arguments)))
 
 (defun emitted-method-function (build generic method next-methods abi)
   (let* ((key (list method next-methods))
          (existing (gethash key *method-source-cache*)))
     (when existing (return-from emitted-method-function existing))
     (let* ((name (fresh-name build "METHOD"))
+           (next-name (gensym "CALL-NEXT-METHOD"))
+           (nextp-name (gensym "NEXT-METHOD-P"))
            (next (when next-methods
                    (emit-effective-source build generic
                                           `(call-method ,(first next-methods) ,(rest next-methods))
@@ -244,9 +253,9 @@
       (setf (gethash key *method-source-cache*) name)
       (push name (build-method-functions build))
       (cond
-        ((typep method 'sb-mop:standard-accessor-method)
-         (let* ((slot (sb-mop:slot-definition-name (sb-mop:accessor-method-slot-definition method)))
-                (readerp (typep method 'sb-mop:standard-reader-method)))
+        ((typep method 'closer-mop:standard-accessor-method)
+         (let* ((slot (closer-mop:slot-definition-name (closer-mop:accessor-method-slot-definition method)))
+                (readerp (typep method 'closer-mop:standard-reader-method)))
            (emit-form build
                       `(defun ,name ,(call-abi-parameters abi)
                          ,(if readerp (record-reader-form build (call-abi-argument abi 0) slot)
@@ -261,16 +270,22 @@
              (let* ((ordinary (permissive-method-lambda-list (ordinary-method-lambda-list lambda-list)))
                     (method-wrapper
                       `(lambda ,(call-abi-parameters abi)
-                         (declare (sb-ext:disable-package-locks call-next-method next-method-p))
-                         (flet ((call-next-method ()
+                         (flet ((,next-name ()
                                   ,(or next (no-next-method-form build generic method (call-abi-list abi))))
-                                (next-method-p () ,(not (null next-methods))))
+                                (,nextp-name () ,(not (null next-methods))))
                            ;; The continuation scope also surrounds optional
                            ;; and keyword initforms, as it does in DEFMETHOD.
                            ,(call-abi-lambda
-                             abi `(lambda ,ordinary ,@declarations
-                                    (block ,(if (consp generic) (second generic) generic)
-                                      ,@executable)))))))
+                             abi (walk-source-form
+                                  `(lambda ,ordinary ,@declarations
+                                     (block ,(if (consp generic) (second generic) generic) ,@executable))
+                                  nil
+                                  (lambda (node context environment)
+                                    (declare (ignore environment))
+                                    (if (and (eq context :eval) (consp node)
+                                             (member (first node) '(call-next-method next-method-p)))
+                                        (cons (if (eq (first node) 'call-next-method) next-name nextp-name) (rest node))
+                                        node))))))))
                (emit-form build `(defun ,name ,@(rest (rewrite-form build method-wrapper :closed))))))))
         (t (unsupported build :method-source "No owned body for a method of ~S." generic)))
       name)))
@@ -279,11 +294,11 @@
   "Replace MOP method leaves with ordinary calls; return emitted source."
   (labels ((walk (form)
              (cond ((atom form)
-                    (when (typep form 'sb-mop:metaobject)
+                    (when (typep form 'closer-mop:metaobject)
                       (unsupported build :effective-metaobject "A method combination embeds a builder object."))
                     form)
                    ((eq (first form) 'quote)
-                    (when (typep (second form) 'sb-mop:metaobject)
+                    (when (typep (second form) 'closer-mop:metaobject)
                       (unsupported build :effective-metaobject "A method combination quotes a builder object."))
                     form)
                    ((eq (first form) 'call-method)
@@ -298,8 +313,8 @@
     (rewrite-form build (walk effective) :closed)))
 
 (defun generic-validator-form (build gf applicable arguments)
-  (let* ((shape (method-lambda-shape (sb-mop:generic-function-lambda-list gf)))
-         (method-shapes (mapcar (lambda (method) (method-lambda-shape (sb-mop:method-lambda-list method))) applicable))
+  (let* ((shape (method-lambda-shape (closer-mop:generic-function-lambda-list gf)))
+         (method-shapes (mapcar (lambda (method) (method-lambda-shape (closer-mop:method-lambda-list method))) applicable))
          (keys (remove-duplicates (append (getf shape :keys)
                                          (loop for item in method-shapes append (getf item :keys)))))
          (allow (or (getf shape :allow) (some (lambda (item) (getf item :allow)) method-shapes)))
@@ -328,8 +343,8 @@
 
 (defun emit-one-generic (build generic)
   (let* ((gf (validate-generic-methods build generic (generic-open-function build generic)))
-         (methods (sb-mop:generic-function-methods gf))
-         (shape (method-lambda-shape (sb-mop:generic-function-lambda-list gf)))
+         (methods (closer-mop:generic-function-methods gf))
+         (shape (method-lambda-shape (closer-mop:generic-function-lambda-list gf)))
          (required (length (getf shape :required)))
          (axes (loop for position below required collect (generic-axis-cuts build methods position)))
          (abi (make-generic-call-abi shape))
@@ -340,7 +355,7 @@
          (rows
            (loop for cell in (method-cartesian-product axes) collect
              (multiple-value-bind (applicable certainp)
-                 (sb-mop:compute-applicable-methods-using-classes gf (mapcar #'third cell))
+                 (closer-mop:compute-applicable-methods-using-classes gf (mapcar #'third cell))
                (unless certainp
                  (unsupported build :method-applicability "The MOP cannot establish class-only applicability for ~S." generic))
                (list cell applicable))))
@@ -359,15 +374,14 @@
     (dolist (group (nreverse groups))
       (let ((applicable (car group)))
         (multiple-value-bind (effective options)
-            (sb-mop:compute-effective-method
-             gf (sb-mop:generic-function-method-combination gf) applicable)
+            (effective-method-source gf applicable)
           (when options
             (unsupported build :effective-options "~S returned unsupported effective-method options." generic))
           (push `(,(nreverse (cdr group))
                   ,(if arguments
                        (generic-validator-form build gf applicable arguments)
                        `(when ,overflow
-                          (error 'sb-int:simple-program-error
+                          (error ',(record-helper-name build '%program-error)
                                  :format-control "Too many arguments for closed generic ~S."
                                  :format-arguments (list ',generic))))
                   ,(emit-effective-source build generic effective abi))
@@ -398,7 +412,7 @@
                                  `(&rest ,overflow)))
                   ,@(when (and arguments (plusp required))
                       `((when (< (length ,arguments) ,required)
-                          (error 'sb-int:simple-program-error
+                          (error ',(record-helper-name build '%program-error)
                                  :format-control "Too few arguments for closed generic ~S: ~S."
                                  :format-arguments (list ',generic ,arguments)))))
                   (let ((,cell-index 0)

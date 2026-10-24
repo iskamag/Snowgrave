@@ -5,15 +5,16 @@
              (uiop:pathname-directory-pathname *load-truename*))))
   (asdf:load-asd (merge-pathnames "snowgrave.asd" root))
   (asdf:load-system "snowgrave")
+  (asdf:load-system "snowgrave/host-tools")
   (load (merge-pathnames "scripts/clamsara-source.lisp" root))
   (asdf:load-asd (merge-pathnames "clamsara.asd"
                   (uiop:ensure-directory-pathname
-                   (or (first (uiop:command-line-arguments))
+                   (or (uiop:getenv "SNOWGRAVE_CLAMSARA_ROOT") (first (uiop:command-line-arguments))
                        (merge-pathnames "../Clamsara/.worktrees/sane-engine/" root))))))
 (asdf:load-system "clamsara/word-memory")
 
 (defpackage #:snowgrave.clamsara-configuration
-  (:use #:cl #:snowgrave.clamsara-source #:clamsara #:clamsara.word-memory))
+  (:use #:cl #:snowgrave.clamsara-source #:snowgrave.host-tools #:clamsara #:clamsara.word-memory))
 (in-package #:snowgrave.clamsara-configuration)
 
 (defparameter *workload*
@@ -63,14 +64,14 @@
 
 (defun measure (label family format function)
   (dotimes (i 30) (funcall function))
-  (sb-ext:gc :full t)
+  (host-gc)
   (dotimes (i 30) (funcall function))
-  (let ((before (sb-ext:get-bytes-consed)) (start (get-internal-real-time)))
+  (let ((before (host-bytes-consed)) (start (get-internal-real-time)))
     (dotimes (i 100) (funcall function))
-    (let ((bytes (- (sb-ext:get-bytes-consed) before))
+    (let ((bytes (and before (- (host-bytes-consed) before)))
           (ms (* 10d0 (/ (- (get-internal-real-time) start) internal-time-units-per-second))))
-      (format t "~&~A ~S ~S n=8192 bytes=~D ms/collection=~,3F~%" label family format bytes ms)
-      (assert (zerop bytes)))))
+      (format t "~&~A ~S ~S n=8192 bytes=~A ms/collection=~,3F~%" label family format bytes ms)
+      (when bytes (assert (zerop bytes))))))
 
 (mapc #'eval *workload*)
 (defparameter *unit*
@@ -109,7 +110,7 @@
   (let ((poison (lambda (&rest args) (declare (ignore args)) (error "Base selector reached.")))
         (original (fdefinition (getf plan :source))))
     (when (typep original 'generic-function)
-      (sb-mop:set-funcallable-instance-function original poison))
+      (closer-mop:set-funcallable-instance-function original poison))
     (setf (fdefinition (getf plan :source)) poison
           (fdefinition (getf plan :name)) poison)))
 (let ((checks 0))

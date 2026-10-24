@@ -172,12 +172,17 @@
                                       append (list key (rewrite-form build value :open))))
                           option)) options))))
     (defgeneric
-     (list* 'defgeneric (open-name build (second form)) (cddr form)))
+     `(closer-mop:defgeneric ,(open-name build (second form)) ,(third form)
+        ,@(cdddr form)
+        ,@(unless (assoc :generic-function-class (cdddr form))
+            '((:generic-function-class closer-mop:standard-generic-function)))
+        ,@(unless (assoc :method-class (cdddr form))
+            '((:method-class closer-mop:standard-method)))))
     (defmethod
      (multiple-value-bind (qualifiers lambda-list body) (method-parts form)
        (let ((name (second form)))
          (multiple-value-bind (prefix executable) (body-parts body)
-           `(defmethod ,(if (member name '(initialize-instance shared-initialize)) name (open-name build name))
+           `(closer-mop:defmethod ,(if (member name '(initialize-instance shared-initialize)) name (open-name build name))
                 ,@qualifiers
                 ,(mapcar (lambda (item)
                            (if (and (consp item) (source-class-p build (second item)))

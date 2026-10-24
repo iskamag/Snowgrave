@@ -1,5 +1,3 @@
-(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-cltl2))
-
 (defpackage #:snowgrave
   (:use #:common-lisp)
   (:export #:close-source-unit #:closed-unit #:closed-unit-p

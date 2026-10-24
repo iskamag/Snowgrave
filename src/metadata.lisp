@@ -3,14 +3,13 @@
 ;; A sealed class table is ordinary emitted data. These queries expose the
 ;; logical source layout, never the implementation's DEFSTRUCT metaobjects.
 (defparameter *metadata-operations*
-  '(class-of find-class class-name sb-mop:finalize-inheritance sb-mop:class-slots
-    sb-mop:slot-definition-name sb-mop:slot-definition-allocation
-    sb-mop:slot-definition-type))
+  '(class-of find-class class-name closer-mop:finalize-inheritance closer-mop:class-slots
+    closer-mop:slot-definition-name closer-mop:slot-definition-allocation
+    closer-mop:slot-definition-type))
 
 (defun metadata-operation-name (symbol)
   (when (symbolp symbol)
-    ;; On SBCL Closer-MOP reexports these same symbols. Do not recognize an
-    ;; unrelated function merely because its printed name matches a MOP name.
+    ;; Match actual MOP symbol identities, never unrelated namesakes.
     (find symbol *metadata-operations* :test #'eq)))
 
 (defun metadata-function-name (build operation phase)
@@ -27,11 +26,11 @@
                        (class-of '%metadata-class-of)
                        (find-class '%metadata-find-class)
                        (class-name '%metadata-class-name)
-                       (sb-mop:finalize-inheritance '%metadata-finalize-inheritance)
-                       (sb-mop:class-slots '%metadata-class-slots)
-                       (sb-mop:slot-definition-name '%metadata-slot-name)
-                       (sb-mop:slot-definition-allocation '%metadata-slot-allocation)
-                       (sb-mop:slot-definition-type '%metadata-slot-type))))))
+                       (closer-mop:finalize-inheritance '%metadata-finalize-inheritance)
+                       (closer-mop:class-slots '%metadata-class-slots)
+                       (closer-mop:slot-definition-name '%metadata-slot-name)
+                       (closer-mop:slot-definition-allocation '%metadata-slot-allocation)
+                       (closer-mop:slot-definition-type '%metadata-slot-type))))))
 
 (defun metadata-operation-form (build form phase)
   (let ((operation (metadata-operation-name (first form))))
@@ -52,9 +51,8 @@
 (defun metadata-class-aliases (canonical)
   ;; Resolve host aliases now. Only source symbols are emitted into the table.
   (let ((class (find-class canonical)) (aliases (list canonical)))
-    (dolist (package-name '("COMMON-LISP" "SB-MOP" "CLOSER-MOP"))
-      (let* ((package (find-package package-name))
-             (symbol (and package (find-symbol (symbol-name canonical) package))))
+    (dolist (package (list-all-packages))
+      (let ((symbol (find-symbol (symbol-name canonical) package)))
         (when (and symbol (eq (find-class symbol nil) class))
           (pushnew symbol aliases))))
     aliases))
@@ -99,11 +97,11 @@
     ;; A custom effective slot definition can change the very facts being
     ;; checked. Refuse it instead of falsely labeling it a stock descriptor.
     (dolist (description (build-layouts build))
-      (dolist (slot (sb-mop:class-slots (class-description-open-class description)))
-        (unless (eq (class-of slot) (find-class 'sb-mop:standard-effective-slot-definition))
+      (dolist (slot (closer-mop:class-slots (class-description-open-class description)))
+        (unless (eq (class-of slot) (find-class 'closer-mop:standard-effective-slot-definition))
           (unsupported build :slot-metaclass
                        "Slot ~S of ~S requires a stock effective slot definition."
-                       (sb-mop:slot-definition-name slot) (class-description-name description)))))
+                       (closer-mop:slot-definition-name slot) (class-description-name description)))))
     (emit-form build
                `(defstruct (,class-type (:constructor ,class-maker
                                             (,class-name ,class-slots ,class-owned-p ,class-constructor))
@@ -128,11 +126,11 @@
     (emit-form build
                `(defparameter ,table
                   (let ((,standard (,class-maker 'standard-class nil nil nil))
-                        (,effective (,class-maker 'sb-mop:standard-effective-slot-definition nil nil nil)))
+                        (,effective (,class-maker 'closer-mop:standard-effective-slot-definition nil nil nil)))
                     (list
                      ,@(loop for alias in (metadata-class-aliases 'standard-class)
                              collect `(cons ',alias ,standard))
-                     ,@(loop for alias in (metadata-class-aliases 'sb-mop:standard-effective-slot-definition)
+                     ,@(loop for alias in (metadata-class-aliases 'closer-mop:standard-effective-slot-definition)
                              collect `(cons ',alias ,effective))
                      ,@(loop for description in (build-layouts build)
                              collect
@@ -158,7 +156,7 @@
                `(defun ,(metadata-function-name build 'class-of :closed) (,object)
                   (cond
                     ((,class-p ,object) (,lookup 'standard-class))
-                    ((,slot-p ,object) (,lookup 'sb-mop:standard-effective-slot-definition))
+                    ((,slot-p ,object) (,lookup 'closer-mop:standard-effective-slot-definition))
                     ,@(loop for description in (build-layouts build)
                             collect `((,(class-description-predicate description) ,object)
                                       (,lookup ',(class-description-name description))))
@@ -168,18 +166,18 @@
     (emit-form build
                `(defun ,(metadata-function-name build 'class-name :closed) (,object)
                   (,class-name ,object)))
-    (dolist (operation '(sb-mop:class-slots sb-mop:finalize-inheritance))
+    (dolist (operation '(closer-mop:class-slots closer-mop:finalize-inheritance))
       (emit-form build
                  `(defun ,(metadata-function-name build operation :closed) (,object)
                     (unless (and (,class-p ,object) (,class-owned-p ,object))
                       (error "Only owned classes have closed effective layouts."))
-                    ,(if (eq operation 'sb-mop:class-slots)
+                    ,(if (eq operation 'closer-mop:class-slots)
                          `(,class-slots ,object)
                          nil))))
     (loop for (operation accessor) in
-          `((sb-mop:slot-definition-name ,slot-name)
-            (sb-mop:slot-definition-allocation ,slot-allocation)
-            (sb-mop:slot-definition-type ,slot-value-type))
+          `((closer-mop:slot-definition-name ,slot-name)
+            (closer-mop:slot-definition-allocation ,slot-allocation)
+            (closer-mop:slot-definition-type ,slot-value-type))
           do (emit-form build
                         `(defun ,(metadata-function-name build operation :closed) (,object)
                            (,accessor ,object)))))

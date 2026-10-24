@@ -80,7 +80,7 @@
     (if changed (cons (first form) arguments) form)))
 
 (defun local-function-p (name environment)
-  (nth-value 1 (sb-cltl2:function-information name environment)))
+  (source-local-function-p name environment))
 
 (defun allowed-function-p (build name phase)
   (let ((symbol (if (consp name) (second name) name)))
@@ -90,12 +90,7 @@
              (or (eq (symbol-package symbol) (find-package :cl))
                  (eq (symbol-package symbol) (build-output-package build))
                  (and (eq phase :open) (eq (symbol-package symbol) (build-open-package build)))
-                 ;; The host lexical walker expands standard control/binders
-                 ;; into implementation primitives. PCL calls remain excluded.
-                 (and (symbol-package symbol)
-                      (member (package-name (symbol-package symbol))
-                              '("SB-INT" "SB-KERNEL" "SB-C" "SB-IMPL" "SB-EXT")
-                              :test #'string=)))))))
+)))))
 
 
 (defun representation-sensitive-type-p (type)
@@ -103,7 +98,7 @@
         ;; Logical metadata are ordinary structures, not host metaobjects.
         ;; Refuse these physical assertions until logical TYPEP is provided.
         ((and (symbolp type) (find-class type nil)
-              (subtypep type 'sb-mop:metaobject)) t)
+              (subtypep type 'closer-mop:metaobject)) t)
         ((consp type) (some #'representation-sensitive-type-p type))))
 
 (defun rewrite-variable-name (build name phase)
@@ -146,7 +141,8 @@
                            (type (list* 'type (rewrite-type build (second spec) phase)
                                         (mapcar (lambda (name) (rewrite-variable-name build name phase)) (cddr spec))))
                            (otherwise spec)))
-                       (rest form)))
+                       (remove nil (mapcar (lambda (spec) (normalize-host-declaration (first spec) spec))
+                                           (rest form)))))
          form))
    body))
 
@@ -164,152 +160,156 @@
         (t type)))
 
 (defun rewrite-form (build form phase &key environment)
-  (let ((sb-walker::*walk-form-expand-macros-p* t))
-    (labels
-        ((function-reference (name env)
-           (cond ((local-function-p name env) name)
-                 ((eq name 'make-instance)
-                  (unless (build-classes build)
-                    (unsupported build :external-construction "MAKE-INSTANCE needs an owned class universe."))
-                  (record-make-instance-name build phase))
-                 ((metadata-operation-name name)
-                  (metadata-function-name build name phase))
-                 ((observation-function-name build name phase))
-                 ((and (eq phase :closed)
-                       (or (member name *indirect-record-operations* :test #'equal)
-                           (member name *unsupported-operations*)
-                           (and (build-classes build)
-                                (member name *representation-observers*))))
-                  (unsupported build :indirect-open-operation
-                               "Function reference ~S needs an explicit closed operation." name))
-                 ((source-function-p build name) (mapped-name build name phase))
-                 ((allowed-function-p build name phase) name)
-                 (t (error 'unclosed-call :feature :external-call
-                           :detail (format nil "Function ~S is neither source-owned nor declared external." name)))))
-         (walk (expression env)
-           (sb-walker:walk-form
-            expression env
-            (lambda (node context lexical)
-              (cond
-                ((and (eq context :set) (symbolp node)) (rewrite-variable-name build node phase))
-                ((not (eq context :eval)) node)
-                ((symbolp node)
-                 (if (and (member node (build-globals build))
-                          (not (sb-walker:var-lexical-p node lexical)))
-                     (if (member node (build-constants build))
-                         ;; Generated methods/constructors can be compiled
-                         ;; before the source constant is initialized. An
-                         ;; explicit cell read preserves initialization order
-                         ;; without falsely declaring the constant SPECIAL.
-                         (values (list 'symbol-value (list 'quote (mapped-name build node phase))) t)
-                         (mapped-name build node phase))
-                     node))
-                ((or (stringp node) (simple-vector-p node))
-                 (values (literal-reference build node phase) t))
-                ((atom node) node)
-                ((eq (first node) 'quote)
-                 (let ((value (second node)))
-                   (values (if (or (consp value) (arrayp value))
-                               (literal-reference build value phase) node) t)))
-                ((eq (first node) 'function)
-                 (let ((target (second node)))
-                   (if (function-name-p target)
-                       (values (list 'function (function-reference target lexical)) t)
-                       node)))
-                ((member (first node) '(lambda let let* flet labels locally))
-                 (let ((replacement
-                         (case (first node)
-                           (lambda
-                            (list* 'lambda (rewrite-lambda-bindings build (second node) phase)
-                                   (rewrite-body-declarations build (cddr node) phase)))
-                           ((let let*)
-                            (list* (first node)
-                                   (mapcar (lambda (binding)
-                                             (if (symbolp binding) (rewrite-variable-name build binding phase)
-                                                 (cons (rewrite-variable-name build (first binding) phase) (rest binding))))
-                                           (second node))
-                                   (rewrite-body-declarations build (cddr node) phase)))
-                           ((flet labels)
-                            (list* (first node)
-                                   (mapcar (lambda (definition)
-                                             (list* (first definition)
-                                                    (rewrite-lambda-bindings build (second definition) phase)
-                                                    (rewrite-body-declarations build (cddr definition) phase)))
-                                           (second node))
-                                   (rewrite-body-declarations build (cddr node) phase)))
-                           (locally
-                            (cons 'locally (rewrite-body-declarations build (rest node) phase))))))
-                   (if (equal replacement node) node replacement)))
-                ((and (symbolp (first node)) (local-function-p (first node) lexical)) node)
-                ((or (assoc (first node) *callback-arguments*)
-                     (assoc (first node) *callback-keywords*))
-                 (let ((replacement (rewrite-callback-designators node #'function-reference)))
-                   (if (eq replacement node) node
-                       (values (walk replacement lexical) t))))
-                ((metadata-operation-name (first node))
-                 (multiple-value-bind (replacement handled)
-                     (metadata-operation-form build node phase)
-                   (if handled
-                       (values
-                        (if (eq (first replacement) (first node))
-                            (cons (first replacement)
-                                  (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
-                            (walk replacement lexical))
-                        t)
-                       node)))
-                ((and (eq phase :closed) (build-classes build) (eq (first node) 'equalp))
-                 (values (cons (observation-function-name build 'equalp phase)
-                               (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
-                ((and (eq phase :closed) (member (first node) *unsupported-operations*))
-                 (unsupported build :open-operation "Operation ~S has no closed source realization." (first node)))
-                ((and (eq phase :closed) (build-classes build)
-                      (member (first node) *representation-observers*))
-                 (unsupported build :representation-observation
-                              "~S needs a logical record observation implementation." (first node)))
-                ((eq (first node) 'the)
-                 (values (list 'the (rewrite-type build (second node) phase)
-                               (walk (third node) lexical)) t))
-                ((and (eq (first node) 'typep) (eq phase :closed)
-                      (quoted (third node))
-                      (representation-sensitive-type-p (second (third node))))
-                 (unsupported build :physical-type "Physical record types are not logical source types."))
-                ((member (first node) '(make-instance slot-value slot-boundp slot-makunbound typep))
-                 (multiple-value-bind (replacement handled)
-                     (record-operation-form build node phase)
-                   (if handled
-                       ;; An open primitive can retain its operator. Other
-                       ;; replacements may introduce binders or dispatch calls.
-                       (values (if (and (eq phase :open)
-                                        (eq (first replacement) (first node)))
-                                   (cons (first replacement)
-                                         (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
-                                   (walk replacement lexical)) t)
-                       node)))
-                ((eq (first node) 'sb-pcl::set-slot-value)
-                 (if (eq phase :open) node
-                     (let* ((reader (record-operation-form build
-                                      (list 'slot-value (second node) (third node)) :closed))
-                            (object (gensym "OBJECT")) (slot (gensym "SLOT")) (value (gensym "VALUE")))
-                       (values
-                        (walk (list 'let* (list (list object (second node)) (list slot (third node))
-                                               (list value (fourth node)))
-                                    (append (list 'funcall (list 'function (list 'setf (first reader)))
-                                                  value object)
-                                            (when (cddr reader) (list slot))))
-                              lexical)
-                        t))))
-                ((and (symbolp (first node)) (source-function-p build (first node)))
-                 (values (cons (mapped-name build (first node) phase)
-                               (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
-                ((and (symbolp (first node))
-                      (not (special-operator-p (first node)))
-                      (not (macro-function (first node) lexical)))
-                 (unless (allowed-function-p build (first node) phase)
-                   (error 'unclosed-call :feature :external-call
-                          :detail (format nil "Call to undeclared function ~S." (first node))))
-                 node)
-                (t node))))))
-      (walk form environment))))
+  (labels
+      ((function-reference (name env)
+         (cond ((local-function-p name env) name)
+               ((eq name 'make-instance)
+                (unless (build-classes build)
+                  (unsupported build :external-construction "MAKE-INSTANCE needs an owned class universe."))
+                (record-make-instance-name build phase))
+               ((metadata-operation-name name)
+                (metadata-function-name build name phase))
+               ((observation-function-name build name phase))
+               ((and (eq phase :closed)
+                     (or (member name *indirect-record-operations* :test #'equal)
+                         (member name *unsupported-operations*)
+                         (and (build-classes build)
+                              (member name *representation-observers*))))
+                (unsupported build :indirect-open-operation
+                             "Function reference ~S needs an explicit closed operation." name))
+               ((source-function-p build name) (mapped-name build name phase))
+               ((allowed-function-p build name phase) name)
+               (t (error 'unclosed-call :feature :external-call
+                         :detail (format nil "Function ~S is neither source-owned nor declared external." name)))))
+       (walk (expression env)
+         (walk-source-form
+          expression env
+          (lambda (node context lexical)
+            (cond
+              ((and (eq context :set) (symbolp node)) (rewrite-variable-name build node phase))
+              ((not (eq context :eval)) node)
+              ((symbolp node)
+               (if (and (member node (build-globals build))
+                        (not (source-lexical-variable-p node lexical)))
+                   (if (member node (build-constants build))
+                       ;; Generated methods/constructors can be compiled
+                       ;; before the source constant is initialized. An
+                       ;; explicit cell read preserves initialization order
+                       ;; without falsely declaring the constant SPECIAL.
+                       (values (list 'symbol-value (list 'quote (mapped-name build node phase))) t)
+                       (mapped-name build node phase))
+                   node))
+              ((or (stringp node) (simple-vector-p node))
+               (values (literal-reference build node phase) t))
+              ((atom node) node)
+              ((eq (first node) 'quote)
+               (let ((value (second node)))
+                 (values (if (or (consp value) (arrayp value))
+                             (literal-reference build value phase) node) t)))
+              ((eq (first node) 'function)
+               (let ((target (second node)))
+                 (if (function-name-p target)
+                     (values (list 'function (function-reference target lexical)) t)
+                     node)))
+              ((member (first node) '(lambda let let* flet labels locally))
+               (let ((replacement
+                       (case (first node)
+                         (lambda
+                          (list* 'lambda (rewrite-lambda-bindings build (second node) phase)
+                                 (rewrite-body-declarations build (cddr node) phase)))
+                         ((let let*)
+                          (list* (first node)
+                                 (mapcar (lambda (binding)
+                                           (if (symbolp binding) (rewrite-variable-name build binding phase)
+                                               (cons (rewrite-variable-name build (first binding) phase) (rest binding))))
+                                         (second node))
+                                 (rewrite-body-declarations build (cddr node) phase)))
+                         ((flet labels)
+                          (list* (first node)
+                                 (mapcar (lambda (definition)
+                                           (list* (first definition)
+                                                  (rewrite-lambda-bindings build (second definition) phase)
+                                                  (rewrite-body-declarations build (cddr definition) phase)))
+                                         (second node))
+                                 (rewrite-body-declarations build (cddr node) phase)))
+                         (locally
+                          (cons 'locally (rewrite-body-declarations build (rest node) phase))))))
+                 (if (equal replacement node) node replacement)))
+              ((and (symbolp (first node)) (local-function-p (first node) lexical)) node)
+              ((or (assoc (first node) *callback-arguments*)
+                   (assoc (first node) *callback-keywords*))
+               (let ((replacement (rewrite-callback-designators node #'function-reference)))
+                 (if (eq replacement node) node
+                     (values (walk replacement lexical) t))))
+              ((metadata-operation-name (first node))
+               (multiple-value-bind (replacement handled)
+                   (metadata-operation-form build node phase)
+                 (if handled
+                     (values
+                      (if (eq (first replacement) (first node))
+                          (cons (first replacement)
+                                (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
+                          (walk replacement lexical))
+                      t)
+                     node)))
+              ((and (eq phase :closed) (build-classes build) (eq (first node) 'equalp))
+               (values (cons (observation-function-name build 'equalp phase)
+                             (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
+              ((and (eq phase :closed) (member (first node) *unsupported-operations*))
+               (unsupported build :open-operation "Operation ~S has no closed source realization." (first node)))
+              ((and (eq phase :closed) (build-classes build)
+                    (member (first node) *representation-observers*))
+               (unsupported build :representation-observation
+                            "~S needs a logical record observation implementation." (first node)))
+              ((eq (first node) 'the)
+               (values (list 'the (rewrite-type build (second node) phase)
+                             (walk (third node) lexical)) t))
+              ((and (eq (first node) 'typep) (eq phase :closed)
+                    (quoted (third node))
+                    (representation-sensitive-type-p (second (third node))))
+               (unsupported build :physical-type "Physical record types are not logical source types."))
+              ((and (eq (first node) 'setf)
+                    (loop for (place value) on (rest node) by #'cddr
+                          thereis (and (consp place) (eq (first place) 'slot-value))))
+               ;; Handle the standard place before a host SETF expander can
+               ;; turn it into a private CLOS primitive. Evaluate its operands
+               ;; exactly once, in the standard place-then-value order.
+               (values
+                (walk `(progn
+                         ,@(loop for (place value) on (rest node) by #'cddr
+                                 collect
+                                 (if (and (consp place) (eq (first place) 'slot-value))
+                                     (let* ((object (gensym "OBJECT")) (slot (gensym "SLOT"))
+                                            (new (gensym "VALUE"))
+                                            (reader (record-operation-form build place phase)))
+                                       `(let* ((,object ,(second place)) (,slot ,(third place)) (,new ,value))
+                                          (funcall #'(setf ,(first reader)) ,new ,object
+                                                   ,@(when (cddr reader) (list slot)))))
+                                     `(setf ,place ,value)))) lexical) t))
+              ((member (first node) '(make-instance slot-value slot-boundp slot-makunbound typep))
+               (multiple-value-bind (replacement handled)
+                   (record-operation-form build node phase)
+                 (if handled
+                     ;; An open primitive can retain its operator. Other
+                     ;; replacements may introduce binders or dispatch calls.
+                     (values (if (and (eq phase :open)
+                                      (eq (first replacement) (first node)))
+                                 (cons (first replacement)
+                                       (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
+                                 (walk replacement lexical)) t)
+                     node)))
+              ((and (symbolp (first node)) (source-function-p build (first node)))
+               (values (cons (mapped-name build (first node) phase)
+                             (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
+              ((and (symbolp (first node))
+                    (not (special-operator-p (first node)))
+                    (not (cl-environments:macro-function (first node) lexical)))
+               (unless (allowed-function-p build (first node) phase)
+                 (error 'unclosed-call :feature :external-call
+                        :detail (format nil "Call to undeclared function ~S." (first node))))
+               node)
+              (t node))))))
+    (walk form environment)))
 
 (defun ordinary-method-lambda-list (lambda-list)
   (let ((requiredp t))

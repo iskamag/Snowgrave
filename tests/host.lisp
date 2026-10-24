@@ -1,0 +1,6 @@
+(defpackage #:snowgrave.tests (:use #:cl)
+  (:import-from #:snowgrave.host-tools #:host-gc #:host-bytes-consed #:host-process-command))
+(in-package #:snowgrave.tests)
+(defun test-gc () (host-gc))
+(defun test-bytes-consed () (host-bytes-consed))
+(defun test-process-command (driver) (host-process-command driver))

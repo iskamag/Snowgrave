@@ -123,12 +123,12 @@
               (progn
                 (unless (eq (class-of class) (find-class 'standard-class))
                   (unsupported build :metaclass "Class ~S needs a standard-class layout." name))
-                (sb-mop:finalize-inheritance class)
+                (closer-mop:finalize-inheritance class)
                 (let ((precedence
-                        (loop for ancestor in (sb-mop:class-precedence-list class)
+                        (loop for ancestor in (closer-mop:class-precedence-list class)
                               for source = (source-class-for-metaobject build ancestor)
                               when source collect source)))
-                  (dolist (parent (sb-mop:class-direct-superclasses class))
+                  (dolist (parent (closer-mop:class-direct-superclasses class))
                     (unless (or (source-class-for-metaobject build parent)
                                 (eq parent (find-class 'standard-object)))
                       (unsupported build :external-superclass
@@ -141,26 +141,26 @@
                    :predicate (fresh-name build "RECORD-P")
                    :bound-accessor (fresh-name build "RECORD-BOUND")
                    :cpl precedence
-                   :defaults (loop for (key) in (sb-mop:class-default-initargs class)
+                   :defaults (loop for (key) in (closer-mop:class-default-initargs class)
                                    collect (list key (source-default-initarg build precedence key)))
                    :slots
-                   (loop for slot in (sb-mop:class-slots class)
-                         for slot-name = (sb-mop:slot-definition-name slot)
+                   (loop for slot in (closer-mop:class-slots class)
+                         for slot-name = (closer-mop:slot-definition-name slot)
                          collect
                          (progn
-                           (unless (eq (sb-mop:slot-definition-allocation slot) :instance)
+                           (unless (eq (closer-mop:slot-definition-allocation slot) :instance)
                              (unsupported build :class-slot "Class slot ~S in ~S needs shared storage."
                                           slot-name name))
                            (multiple-value-bind (initform presentp)
                                (source-slot-initform build precedence slot-name)
-                             (let ((type (restore-record-type build (sb-mop:slot-definition-type slot))))
+                             (let ((type (restore-record-type build (closer-mop:slot-definition-type slot))))
                               (unless (record-slot-type-supported-p build type)
                                 (unsupported build :slot-type "Slot ~S in ~S has unsupported type ~S."
                                              slot-name name type))
                               (make-slot-description
                               :name slot-name :field (fresh-name build "RECORD-FIELD")
                               :type type
-                              :initargs (copy-list (sb-mop:slot-definition-initargs slot))
+                              :initargs (copy-list (closer-mop:slot-definition-initargs slot))
                               :initform initform :initform-p presentp))))))))))
   (build-layouts build))
 
@@ -240,7 +240,7 @@
                             collect `(,(class-description-predicate description) ,object)))
            (error 'type-error :datum ,object
                   :expected-type '(or ,@(mapcar #'class-description-type (build-layouts build)))))
-         (error 'sb-pcl::missing-slot :name ,slot
+         (error 'simple-error
                 :format-control "The slot ~S is missing from the object ~S."
                 :format-arguments (list ,slot ,object))))
     (emit-form build
@@ -295,7 +295,7 @@
      build
      `(defun ,(class-description-constructor description) (&rest ,args)
         (unless (evenp (length ,args))
-          (error 'sb-int:simple-program-error
+          (error ',(record-helper-name build '%program-error)
                  :format-control "Odd number of initialization arguments."))
         ,@(loop for (key form) in (class-description-defaults description)
                 collect
@@ -357,7 +357,8 @@
                   (loop for (,key) on ,args by #'cddr
                         unless (member ,key ,allowed :test #'eq) collect ,key)))
             (when ,invalid
-              (error 'sb-pcl::initarg-error :class ,class :initargs (nreverse ,invalid))))))))
+              (error ',(record-helper-name build '%program-error) :format-control "Invalid initialization arguments ~S for ~S."
+                     :format-arguments (list (nreverse ,invalid) ,class))))))))
   (emit-record-slot-errors build)
   (dolist (operation '(:read :write :boundp :unbind))
     (emit-record-slot-dispatch build operation))
