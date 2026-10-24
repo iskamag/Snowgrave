@@ -1,0 +1,149 @@
+(in-package #:snowgrave.tests)
+
+(defun bounded-call-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :bounded-calls
+       "((defgeneric operation (n &optional a b))
+          (defmethod operation :around ((n number) &optional (a :around ap) (b :around-b bp))
+            (snowgrave.tests::note-event (list :enter n a ap b bp))
+            (unwind-protect (call-next-method) (snowgrave.tests::note-event :exit)))
+          (defmethod operation :before ((n number) &optional (a :before ap) (b :before-b bp))
+            (snowgrave.tests::note-event (list :before n a ap b bp)))
+          (defmethod operation :after ((n number) &optional (a :after ap) (b :after-b bp))
+            (snowgrave.tests::note-event (list :after n a ap b bp)))
+          (defmethod operation ((n number) &optional (a :base ap) (b :base-b bp))
+            (snowgrave.tests::note-event :base)
+            (values (list n a ap b bp) :secondary))
+          (defmethod operation ((n integer) &optional (a :child ap) (b :child-b bp))
+            (snowgrave.tests::note-event (list :child n a ap b bp))
+            (setq n 99 a :changed b :changed)
+            (values (multiple-value-list (call-next-method))
+                    (multiple-value-list (call-next-method))))
+          (defun entry (arguments)
+            (handler-case (apply #'operation arguments)
+              (error (condition) (type-of condition))))
+          (defgeneric add (n &optional amount))
+          (defmethod add ((n number) &optional (amount 2)) (+ n amount))
+          (defmethod add ((n integer) &optional (amount (call-next-method)))
+            (declare (ignore amount)) (call-next-method))
+          (defun omitted (n) (add n))
+          (defun supplied (n) (add n 3)))"
+       "(entry omitted supplied)" "((entry (list)) (omitted (integer)) (supplied (integer)))"
+       "(operation add)" :universe "(number integer)" :external '(note-event))
+    ;; Defaults belong to each method. SETQ of method parameters must not
+    ;; change either next invocation, including its optional supplied prefix.
+    (dolist (arguments '((7) (7 nil) (7 nil :given) (1/2) ("miss")
+                        (7 1 2 3) ("miss" 1 2 3)))
+      (compare-entry unit package "ENTRY" (list arguments)))
+    (compare-entry unit package "OMITTED" '(7) '((9) nil))
+    (compare-entry unit package "SUPPLIED" '(7) '((10) nil))
+    (dolist (name '("OMITTED" "SUPPLIED"))
+      (check-zero-call-allocation
+       (snowgrave:unit-function unit (find-symbol name package)) 7 name))))
+
+(defun call-loop (function argument count)
+  ;; Kept outside the generated program; do not let a compiler discard or
+  ;; fold the measured call. The allocating calibration checks the counter.
+  (let ((result nil))
+    (dotimes (i count result) (setf result (funcall function argument)))))
+
+(defun check-zero-call-allocation (function argument description)
+  (sb-ext:gc :full t)
+  (call-loop function argument 1000)
+  (let ((before (sb-ext:get-bytes-consed)))
+    (call-loop function argument 100000)
+    (let ((bytes (- (sb-ext:get-bytes-consed) before)))
+      (check (zerop bytes) "~A allocates ~D bytes during warmed bounded calls" description bytes))))
+
+(defun slot-helper-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :slot-helpers
+       "((defclass base () ((x :type integer :accessor x)))
+          (defclass prefix () ((padding :initform :padding)))
+          (defclass child (prefix base) ())
+          (defclass unrelated () ((x :type symbol :initform :symbol :accessor x)))
+          (defun read-restart (store)
+            (let ((object (make-instance 'child)))
+              (values
+               (handler-bind ((unbound-slot
+                               (lambda (condition)
+                                 (declare (ignore condition))
+                                 (invoke-restart (if store 'store-value 'use-value) 17))))
+                 (slot-value object 'x))
+               (slot-boundp object 'x))))
+          (defun reject-store ()
+            (let ((object (make-instance 'child)))
+              (values
+               (handler-case
+                   (handler-bind ((unbound-slot
+                                   (lambda (condition)
+                                     (declare (ignore condition))
+                                     (invoke-restart 'store-value :wrong))))
+                     (x object))
+                 (type-error () :rejected))
+               (slot-boundp object 'x))))
+          (defun use-untyped ()
+            (let ((object (make-instance 'base)))
+              (handler-bind ((unbound-slot
+                              (lambda (condition)
+                                (declare (ignore condition))
+                                (invoke-restart 'use-value :not-stored))))
+                (x object))))
+          (defun missing (name)
+            (handler-case (slot-boundp (make-instance 'base) name)
+              (error (condition) (type-of condition))))
+          (defun fields ()
+            (let ((a (make-instance 'child)) (b (make-instance 'unrelated)))
+              (setf (x a) 31 (x b) nil)
+              (values (x a) (x b) (slot-boundp b 'x)
+                      (eq a (slot-makunbound a 'x)) (slot-boundp a 'x))))
+          (defparameter *cell* (make-instance 'child))
+          (defun access (n) (setf (x *cell*) n) (x *cell*)))"
+       "(read-restart reject-store use-untyped missing fields access)"
+       "((read-restart (t)) (reject-store ()) (use-untyped ()) (missing (symbol)) (fields ()) (access (integer)))"
+       "(x (setf x))")
+    (compare-entry unit package "READ-RESTART" '(nil) '((17 nil) nil))
+    (compare-entry unit package "READ-RESTART" '(t) '((17 t) nil))
+    ;; Writing outside a declared CLOS slot type has undefined consequences.
+    ;; Check Snowgrave's checked-write contract without using that as a native
+    ;; differential oracle (SBCL's STORE-VALUE need not enforce the type).
+    (check (equal '((:rejected nil) nil)
+                  (observed-call (snowgrave:unit-function unit (find-symbol "REJECT-STORE" package)) nil))
+           "Failed restart store changed boundness")
+    (compare-entry unit package "USE-UNTYPED" nil '((:not-stored) nil))
+    (compare-entry unit package "FIELDS" nil '((31 nil t t nil) nil))
+    ;; Equal print names do not make slot symbols interchangeable.
+    (dolist (name (list :x (make-symbol "X") :missing))
+      (compare-entry unit package "MISSING" (list name)))
+    (check-zero-call-allocation
+     (snowgrave:unit-function unit (find-symbol "ACCESS" package)) 7 "reader and writer"))
+  (let ((before (sb-ext:get-bytes-consed)))
+    (call-loop (lambda (n) (list n)) 7 100000)
+    (check (> (- (sb-ext:get-bytes-consed) before) 1000000)
+           "Allocation calibration failed")))
+
+(defun literal-scale-tests ()
+  ;; A large literal graph is data, not thousands of branches in one compiled
+  ;; initializer. Include distinct equal strings and both cons/vector cycles.
+  (let* ((number (incf *fixture-sequence*))
+         (package (make-package (format nil "SNOWGRAVE.CORE.FIXTURE.~D" number) :use '("COMMON-LISP")))
+         (entry (intern "ENTRY" package))
+         (graph (make-array 6000))
+         (cycle (cons :cycle nil)))
+    (setf (cdr cycle) cycle)
+    (dotimes (i (length graph)) (setf (aref graph i) (list i (copy-seq "equal"))))
+    (setf (aref graph 0) graph (aref graph 1) cycle)
+    (let* ((unit (snowgrave:close-source-unit
+                  (list :forms `((defun ,entry () ',graph)))
+                  :unit-name (list :literal-scale number)
+                  :entries (list entry) :external-domains (list (list entry nil))))
+           (result (funcall (snowgrave:unit-function unit entry))))
+      (check (and (eq result (aref result 0))
+                  (eq (aref result 1) (cdr (aref result 1))))
+             "Literal reconstruction lost a cycle")
+      (check (= 5999 (first (aref result 5999))) "Literal reconstruction lost the final node")
+      (check (and (equal (second (aref result 2)) (second (aref result 3)))
+                  (not (eq (second (aref result 2)) (second (aref result 3)))))
+             "Literal reconstruction coalesced distinct strings"))))

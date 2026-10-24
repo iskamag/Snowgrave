@@ -105,28 +105,47 @@
   (let* ((objects (if (eq phase :open) (build-open-literals build) (build-closed-literals build)))
          (name (if (eq phase :open) (build-open-literal-name build) (build-closed-literal-name build)))
          (index (if (eq phase :open) (build-open-literal-index build) (build-closed-literal-index build)))
-         (nodes (gensym "LITERALS")))
+         (nodes (gensym "LITERALS")) (recipes (gensym "RECIPES"))
+         (recipe (gensym "RECIPE")) (position (gensym "POSITION"))
+         (value (gensym "VALUE")) (decode (gensym "DECODE")) (element (gensym "ELEMENT")))
     (when (plusp (length objects))
       (labels ((reference (value)
                  (multiple-value-bind (i present) (gethash value index)
-                   (if present `(aref ,nodes ,i) `',value))))
+                   ;; Every compound literal is a pool node. A one-element
+                   ;; list in this immutable recipe is therefore an index;
+                   ;; scalar literals (including integer indices) stay scalar.
+                   (if present (list i) value))))
         `(defparameter ,name
-            (let ((,nodes (vector
-                          ,@(loop for value across objects
-                                  collect (cond ((consp value) '(cons nil nil))
-                                                ;; COPY-SEQ gives each owned string a
-                                                ;; distinct allocation even if the
-                                                ;; compiler coalesces equal literals.
-                                                ((stringp value) `(copy-seq ,value))
-                                                (t `(make-array ,(length value))))))))
-              ,@(loop for value across objects for i from 0
-                      append (cond
-                               ((consp value)
-                                (list `(setf (car (aref ,nodes ,i)) ,(reference (car value))
-                                              (cdr (aref ,nodes ,i)) ,(reference (cdr value)))))
-                               ((stringp value) nil)
-                               (t (loop for item across value for j from 0
-                                        collect `(setf (aref (aref ,nodes ,i) ,j) ,(reference item))))))
+            (let* ((,recipes
+                     ',(map 'vector
+                            (lambda (value)
+                              (cond ((consp value)
+                                     (vector :cons (reference (car value)) (reference (cdr value))))
+                                    ((stringp value) (vector :string value))
+                                    (t (vector :vector (map 'vector #'reference value)))))
+                            objects))
+                   (,nodes (make-array (length ,recipes))))
+              ;; Allocate every node before installing any edge. The compiled
+              ;; initializer is constant-size; graph size belongs to data.
+              (dotimes (,position (length ,recipes))
+                (let ((,recipe (aref ,recipes ,position)))
+                  (setf (aref ,nodes ,position)
+                        (ecase (aref ,recipe 0)
+                          (:cons (cons nil nil))
+                          (:string (copy-seq (aref ,recipe 1)))
+                          (:vector (make-array (length (aref ,recipe 1))))))))
+              (flet ((,decode (,value)
+                       (if (consp ,value) (aref ,nodes (car ,value)) ,value)))
+                (dotimes (,position (length ,recipes))
+                  (let ((,recipe (aref ,recipes ,position)))
+                    (case (aref ,recipe 0)
+                      (:cons
+                       (setf (car (aref ,nodes ,position)) (,decode (aref ,recipe 1))
+                             (cdr (aref ,nodes ,position)) (,decode (aref ,recipe 2))))
+                      (:vector
+                       (dotimes (,element (length (aref ,recipe 1)))
+                         (setf (aref (aref ,nodes ,position) ,element)
+                               (,decode (aref (aref ,recipe 1) ,element)))))))))
               ,nodes))))))
 
 (defun open-definition (build form)

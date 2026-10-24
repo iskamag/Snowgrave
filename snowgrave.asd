@@ -19,7 +19,7 @@
 (asdf:defsystem "snowgrave/tests"
   :depends-on ("snowgrave")
   :serial t
-  :components ((:file "tests/core"))
+  :components ((:file "tests/core") (:file "tests/overhead"))
   :perform (asdf:test-op (operation component)
              (declare (ignore operation component))
              (uiop:symbol-call :snowgrave.tests :run-tests)))

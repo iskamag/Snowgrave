@@ -293,8 +293,9 @@
                        (values
                         (walk (list 'let* (list (list object (second node)) (list slot (third node))
                                                (list value (fourth node)))
-                                    (list 'funcall (list 'function (list 'setf (first reader)))
-                                          value object slot))
+                                    (append (list 'funcall (list 'function (list 'setf (first reader)))
+                                                  value object)
+                                            (when (cddr reader) (list slot))))
                               lexical)
                         t))))
                 ((and (symbolp (first node)) (source-function-p build (first node)))

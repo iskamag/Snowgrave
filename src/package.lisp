@@ -32,6 +32,7 @@
   (closed-literals (make-array 0 :adjustable t :fill-pointer 0))
   (open-literal-index (make-hash-table :test #'eq))
   (closed-literal-index (make-hash-table :test #'eq))
+  (slot-functions (make-hash-table :test #'equal))
   open-literal-name closed-literal-name
   (temporary-methods nil))
 

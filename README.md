@@ -22,6 +22,6 @@ functions, and replay generated source and FASLs in fresh SBCL processes.
 The whole-engine gate closes all engine and word-memory definitions and runs
 selected unchanged collector workloads. The other gate exercises the complete
 index-set component. Set `SBCL_TEST_HEAP_MB` to change the compiler heap
-(default: 2048 MiB).
+(default: 1024 MiB).
 
 The [paper](paper/README.md) describes the design and current implementation scope.

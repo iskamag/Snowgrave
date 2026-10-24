@@ -11,6 +11,57 @@
 
 (defvar *method-source-cache* nil)
 
+;; Bounded generic calls carry scalars and an optional supplied-prefix count.
+;; A genuinely variable argument tail retains the ordinary list convention.
+;; Both conventions preserve the original arguments across method bindings.
+(defstruct method-call-abi arguments required optional-count list-parameter)
+
+(defun make-generic-call-abi (shape)
+  (if (or (getf shape :rest) (getf shape :keyp))
+      (make-method-call-abi :list-parameter (gensym "ARGUMENTS"))
+      (make-method-call-abi
+       :required (length (getf shape :required))
+       :arguments (loop repeat (+ (length (getf shape :required))
+                                  (length (getf shape :optional))) collect (gensym "ARGUMENT"))
+       :optional-count (when (getf shape :optional) (gensym "OPTIONAL-COUNT")))))
+
+(defun call-abi-parameters (abi)
+  (if (method-call-abi-list-parameter abi)
+      (list (method-call-abi-list-parameter abi))
+      (append (when (method-call-abi-optional-count abi)
+                (list (method-call-abi-optional-count abi)))
+              (method-call-abi-arguments abi))))
+
+(defun call-abi-argument (abi index)
+  (if (method-call-abi-list-parameter abi)
+      `(nth ,index ,(method-call-abi-list-parameter abi))
+      (nth index (method-call-abi-arguments abi))))
+
+(defun call-abi-list (abi)
+  "Materialize original arguments only for variable calls or exceptional paths."
+  (or (method-call-abi-list-parameter abi)
+      (let ((arguments (method-call-abi-arguments abi))
+            (count (method-call-abi-optional-count abi)))
+        (if count
+            `(case ,count
+               ,@(loop for supplied from 0 to (- (length arguments) (method-call-abi-required abi))
+                       collect `(,supplied (list ,@(subseq arguments 0 (+ (method-call-abi-required abi) supplied))))))
+            `(list ,@arguments)))))
+
+(defun call-abi-lambda (abi lambda-form)
+  (cond ((method-call-abi-list-parameter abi)
+         `(apply (function ,lambda-form) ,(method-call-abi-list-parameter abi)))
+        ((method-call-abi-optional-count abi)
+         (let ((body (gensym "METHOD-BODY")) (arguments (method-call-abi-arguments abi)))
+           ;; Define the method body once. Each arm supplies exactly the
+           ;; original prefix, so defaults and supplied-p variables stay local
+           ;; to each method, including repeated CALL-NEXT-METHOD invocations.
+           `(flet ((,body ,@(rest lambda-form)))
+              (case ,(method-call-abi-optional-count abi)
+                ,@(loop for supplied from 0 to (- (length arguments) (method-call-abi-required abi))
+                        collect `(,supplied (,body ,@(subseq arguments 0 (+ (method-call-abi-required abi) supplied)))))))))
+        (t `(funcall (function ,lambda-form) ,@(method-call-abi-arguments abi)))))
+
 (defun generic-open-function (build name)
   (fdefinition (if (member name '(initialize-instance shared-initialize))
                    name (open-name build name))))
@@ -180,15 +231,15 @@
                                                      (sb-mop:class-name class)))
                                   (sb-mop:method-specializers method)))))
 
-(defun emitted-method-function (build generic method next-methods)
+(defun emitted-method-function (build generic method next-methods abi)
   (let* ((key (list method next-methods))
          (existing (gethash key *method-source-cache*)))
     (when existing (return-from emitted-method-function existing))
-    (let* ((name (fresh-name build "METHOD")) (arguments (gensym "ARGUMENTS"))
+    (let* ((name (fresh-name build "METHOD"))
            (next (when next-methods
                    (emit-effective-source build generic
                                           `(call-method ,(first next-methods) ,(rest next-methods))
-                                          arguments)))
+                                          abi)))
            (source (owned-method-source build generic method)))
       (setf (gethash key *method-source-cache*) name)
       (cond
@@ -196,9 +247,10 @@
          (let* ((slot (sb-mop:slot-definition-name (sb-mop:accessor-method-slot-definition method)))
                 (readerp (typep method 'sb-mop:standard-reader-method)))
            (emit-form build
-                      `(defun ,name (,arguments)
-                         ,(if readerp (record-reader-form build `(first ,arguments) slot)
-                              (record-writer-form build `(second ,arguments) slot `(first ,arguments)))))))
+                      `(defun ,name ,(call-abi-parameters abi)
+                         ,(if readerp (record-reader-form build (call-abi-argument abi 0) slot)
+                              (record-writer-form build (call-abi-argument abi 1) slot
+                                                  (call-abi-argument abi 0)))))))
         (source
          (validate-method-next-syntax build (cddr source))
          (multiple-value-bind (qualifiers lambda-list body) (method-parts source)
@@ -207,22 +259,22 @@
              (declare (ignore documentation))
              (let* ((ordinary (permissive-method-lambda-list (ordinary-method-lambda-list lambda-list)))
                     (method-wrapper
-                      `(lambda (,arguments)
+                      `(lambda ,(call-abi-parameters abi)
                          (declare (sb-ext:disable-package-locks call-next-method next-method-p))
                          (flet ((call-next-method ()
-                                  ,(or next (no-next-method-form build generic method arguments)))
+                                  ,(or next (no-next-method-form build generic method (call-abi-list abi))))
                                 (next-method-p () ,(not (null next-methods))))
                            ;; The continuation scope also surrounds optional
                            ;; and keyword initforms, as it does in DEFMETHOD.
-                           (apply (function (lambda ,ordinary ,@declarations
-                                              (block ,(if (consp generic) (second generic) generic)
-                                                ,@executable)))
-                                  ,arguments)))))
+                           ,(call-abi-lambda
+                             abi `(lambda ,ordinary ,@declarations
+                                    (block ,(if (consp generic) (second generic) generic)
+                                      ,@executable)))))))
                (emit-form build `(defun ,name ,@(rest (rewrite-form build method-wrapper :closed))))))))
         (t (unsupported build :method-source "No owned body for a method of ~S." generic)))
       name)))
 
-(defun emit-effective-source (build generic effective arguments-form)
+(defun emit-effective-source (build generic effective abi)
   "Replace MOP method leaves with ordinary calls; return emitted source."
   (labels ((walk (form)
              (cond ((atom form)
@@ -237,7 +289,8 @@
                     (let ((method (second form)) (next (third form)))
                       (if (and (consp method) (eq (first method) 'make-method))
                           (walk (second method))
-                          `(,(emitted-method-function build generic method next) ,arguments-form))))
+                          `(,(emitted-method-function build generic method next abi)
+                            ,@(call-abi-parameters abi)))))
                    (t (mapcar #'walk form)))))
     ;; Composition code and method bodies use the same closed binding rules.
     ;; Generated leaf calls already name ordinary output functions.
@@ -275,9 +328,13 @@
 (defun emit-one-generic (build generic)
   (let* ((gf (validate-generic-methods build generic (generic-open-function build generic)))
          (methods (sb-mop:generic-function-methods gf))
-         (required (length (getf (method-lambda-shape (sb-mop:generic-function-lambda-list gf)) :required)))
+         (shape (method-lambda-shape (sb-mop:generic-function-lambda-list gf)))
+         (required (length (getf shape :required)))
          (axes (loop for position below required collect (generic-axis-cuts build methods position)))
-         (arguments (gensym "ARGUMENTS"))
+         (abi (make-generic-call-abi shape))
+         (arguments (method-call-abi-list-parameter abi))
+         (overflow (unless arguments (gensym "EXCESS-ARGUMENTS")))
+         (supplied (loop repeat (length (getf shape :optional)) collect (gensym "SUPPLIED")))
          (cell-index (gensym "CELL"))
          (rows
            (loop for cell in (method-cartesian-product axes) collect
@@ -306,35 +363,44 @@
           (when options
             (unsupported build :effective-options "~S returned unsupported effective-method options." generic))
           (push `(,(nreverse (cdr group))
-                  ,(generic-validator-form build gf applicable arguments)
-                  ,(emit-effective-source build generic effective arguments))
+                  ,(if arguments
+                       (generic-validator-form build gf applicable arguments)
+                       `(when ,overflow
+                          (error 'sb-int:simple-program-error
+                                 :format-control "Too many arguments for closed generic ~S."
+                                 :format-arguments (list ',generic))))
+                  ,(emit-effective-source build generic effective abi))
                 clauses))))
     (emit-form build
-               `(defun ,(closed-name build generic) (&rest ,arguments)
-                  ,@(when (plusp required)
+               `(defun ,(closed-name build generic)
+                    ,(if arguments `(&rest ,arguments)
+                         (append (subseq (method-call-abi-arguments abi) 0 required)
+                                 (when supplied
+                                   `(&optional ,@(loop for variable in (nthcdr required (method-call-abi-arguments abi))
+                                                       for present in supplied collect `(,variable nil ,present))))
+                                 ;; Preserve applicability-before-excess-arity.
+                                 ;; Valid bounded calls have an empty tail.
+                                 `(&rest ,overflow)))
+                  ,@(when (and arguments (plusp required))
                       `((when (< (length ,arguments) ,required)
                           (error 'sb-int:simple-program-error
                                  :format-control "Too few arguments for closed generic ~S: ~S."
                                  :format-arguments (list ',generic ,arguments)))))
-                  (let ((,cell-index 0))
+                  (let ((,cell-index 0)
+                        ,@(when (method-call-abi-optional-count abi)
+                            `((,(method-call-abi-optional-count abi)
+                               (cond ,@(loop for present in (reverse supplied)
+                                             for count downfrom (length supplied) collect `(,present ,count))
+                                     (t 0))))))
                     ,@(loop for axis in axes for index from 0
                             collect `(setf ,cell-index
                                            (+ (* ,cell-index ,(length axis))
-                                              ,(method-axis-index-form build axis `(nth ,index ,arguments)))))
+                                              ,(method-axis-index-form build axis (call-abi-argument abi index)))))
                     (case ,cell-index
                       ,@(nreverse clauses)
-                      (otherwise ,(no-applicable-method-form build generic arguments))))))
-    (list :name generic :code-name (closed-name build generic)
-          :lambda-list (sb-mop:generic-function-lambda-list gf)
-          :cells (loop for row in rows
-                       collect (list :classes (mapcar #'second (first row))
-                                     :methods (mapcar (lambda (method)
-                                                       (list :qualifiers (sb-mop:method-qualifiers method)
-                                                             :specializers (mapcar (lambda (class)
-                                                                                     (or (source-class-for-metaobject build class)
-                                                                                         (sb-mop:class-name class)))
-                                                                                   (sb-mop:method-specializers method))))
-                                                     (second row)))))))
+                      (otherwise ,(no-applicable-method-form
+                                   build generic (if arguments arguments
+                                                     `(append ,(call-abi-list abi) ,overflow))))))))))
 
 (defun emit-generics (build)
-  (mapcar (lambda (generic) (emit-one-generic build generic)) (build-generics build)))
+  (dolist (generic (build-generics build)) (emit-one-generic build generic)))

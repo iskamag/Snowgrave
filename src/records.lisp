@@ -185,59 +185,98 @@
          `(not ,(closed-slot-type-test build (second type) value)))
         (t `(typep ,value ',type))))
 
+(defun record-operation-helper (build operation)
+  (let ((reader (record-helper-name build '%record-read)))
+    (ecase operation
+      (:read reader) (:write `(setf ,reader))
+      (:boundp (record-helper-name build '%record-boundp))
+      (:unbind (record-helper-name build '%record-unbind)))))
+
+(defun record-slot-function (build operation slot)
+  (if (eq operation :write)
+      `(setf ,(record-slot-function build :read slot))
+      (let ((key (list operation slot)))
+        (or (gethash key (build-slot-functions build))
+            (setf (gethash key (build-slot-functions build))
+                  (fresh-name build (format nil "SLOT-~A" operation)))))))
+
+(defun known-record-slot-p (build slot)
+  (some (lambda (description)
+          (find slot (class-description-slots description) :key #'slot-description-name))
+        (build-layouts build)))
+
 (defun record-reader-form (build object-form slot)
-  `(,(record-helper-name build '%record-read) ,object-form ',slot))
+  `(,(record-slot-function build :read slot) ,object-form))
 
 (defun record-writer-form (build object-form slot value-form)
   (let ((object (gensym "RECORD")) (value (gensym "VALUE")))
     `(let* ((,object ,object-form) (,value ,value-form))
-       (setf (,(record-helper-name build '%record-read) ,object ',slot) ,value))))
+       (setf (,(record-slot-function build :read slot) ,object) ,value))))
+
+(defun record-slot-body (build description slot operation object value)
+  (let* ((index (position slot (class-description-slots description)))
+         (bound `(,(class-description-bound-accessor description) ,object))
+         (access `(,(slot-description-field slot) ,object)))
+    (ecase operation
+      (:read `(if (logbitp ,index ,bound) ,access
+                  (,(record-helper-name build '%record-unbound)
+                   ,object ',(slot-description-name slot))))
+      (:write
+       `(progn
+          (unless ,(closed-slot-type-test build (slot-description-type slot) value)
+            (error 'type-error :datum ,value :expected-type ',(slot-description-type slot)))
+          (setf ,access ,value ,bound (logior ,bound ,(ash 1 index)))
+          ,value))
+      (:boundp `(logbitp ,index ,bound))
+      (:unbind `(progn (setf ,access nil ,bound (logandc2 ,bound ,(ash 1 index))) ,object)))))
+
+(defun emit-record-slot-errors (build)
+  ;; One slow path retains the complete condition/restart behavior. Repeating
+  ;; RESTART-CASE in every class/slot branch bloats the host control-flow graph.
+  (let ((object (gensym "RECORD")) (slot (gensym "SLOT")) (value (gensym "VALUE")))
+    (emit-form build
+      `(defun ,(record-helper-name build '%record-invalid-slot) (,object ,slot)
+         (unless (or ,@(loop for description in (build-layouts build)
+                            collect `(,(class-description-predicate description) ,object)))
+           (error 'type-error :datum ,object
+                  :expected-type '(or ,@(mapcar #'class-description-type (build-layouts build)))))
+         (error 'sb-pcl::missing-slot :name ,slot
+                :format-control "The slot ~S is missing from the object ~S."
+                :format-arguments (list ,slot ,object))))
+    (emit-form build
+      `(defun ,(record-helper-name build '%record-unbound) (,object ,slot)
+         (restart-case (error 'unbound-slot :instance ,object :name ,slot)
+           (use-value (,value) ,value)
+           (store-value (,value)
+             (setf (,(record-helper-name build '%record-read) ,object ,slot) ,value)))))))
 
 (defun emit-record-slot-dispatch (build operation)
-  (let* ((reader (record-helper-name build '%record-read))
-         (name (case operation
-                 (:read reader) (:write `(setf ,reader))
-                 (:boundp (record-helper-name build '%record-boundp))
-                 (:unbind (record-helper-name build '%record-unbind))))
-         (object (gensym "RECORD")) (slot-name (gensym "SLOT")) (value (gensym "VALUE")))
+  (let* ((name (record-operation-helper build operation))
+         (object (gensym "RECORD")) (slot-name (gensym "SLOT")) (value (gensym "VALUE"))
+         (slots (remove-duplicates
+                 (loop for description in (build-layouts build)
+                       append (mapcar #'slot-description-name (class-description-slots description)))))
+         (arguments (if (eq operation :write) (list value object) (list object))))
+    (dolist (slot slots)
+      (emit-form build
+        `(defun ,(record-slot-function build operation slot) ,arguments
+           (cond
+             ,@(loop for description in (build-layouts build)
+                     for field = (find slot (class-description-slots description)
+                                       :key #'slot-description-name)
+                     when field collect
+                       `((,(class-description-predicate description) ,object)
+                         ,(record-slot-body build description field operation object value)))
+             (t (,(record-helper-name build '%record-invalid-slot) ,object ',slot))))))
     (emit-form
      build
      `(defun ,name ,(if (eq operation :write) (list value object slot-name) (list object slot-name))
         (unless (symbolp ,slot-name)
           (error 'type-error :datum ,slot-name :expected-type 'symbol))
-        (cond
-          ,@(loop for description in (build-layouts build)
-                  collect
-                  `((,(class-description-predicate description) ,object)
-                    (case ,slot-name
-                      ,@(loop for slot in (class-description-slots description) for index from 0
-                              for field = (slot-description-field slot)
-                              for bound = `(,(class-description-bound-accessor description) ,object)
-                              for access = `(,field ,object)
-                              collect
-                              `((,(slot-description-name slot))
-                                ,(case operation
-                                   (:read
-                                    `(if (logbitp ,index ,bound) ,access
-                                         (restart-case
-                                             (error 'unbound-slot :instance ,object :name ,slot-name)
-                                           (use-value (,value) ,value)
-                                           (store-value (,value) (setf (,reader ,object ,slot-name) ,value)))))
-                                   (:write
-                                    `(progn
-                                       (unless ,(closed-slot-type-test build (slot-description-type slot) value)
-                                         (error 'type-error :datum ,value :expected-type ',(slot-description-type slot)))
-                                       (setf ,access ,value ,bound (logior ,bound ,(ash 1 index)))
-                                       ,value))
-                                   (:boundp `(logbitp ,index ,bound))
-                                   (:unbind `(progn (setf ,access nil ,bound (logandc2 ,bound ,(ash 1 index)))
-                                                    ,object)))))
-                      (otherwise
-                       (error 'sb-pcl::missing-slot :name ,slot-name
-                              :format-control "The slot ~S is missing from the object ~S."
-                              :format-arguments (list ,slot-name ,object))))))
-          (t (error 'type-error :datum ,object
-                    :expected-type '(or ,@(mapcar #'class-description-type (build-layouts build))))))))))
+        (case ,slot-name
+          ,@(loop for slot in slots collect
+                  `((,slot) (funcall #',(record-slot-function build operation slot) ,@arguments)))
+          (otherwise (,(record-helper-name build '%record-invalid-slot) ,object ,slot-name)))))))
 
 (defun emit-record-constructor (build description)
   (let ((args (gensym "INITARGS")) (object (gensym "RECORD"))
@@ -310,6 +349,7 @@
                         unless (member ,key ,allowed :test #'eq) collect ,key)))
             (when ,invalid
               (error 'sb-pcl::initarg-error :class ,class :initargs (nreverse ,invalid))))))))
+  (emit-record-slot-errors build)
   (dolist (operation '(:read :write :boundp :unbind))
     (emit-record-slot-dispatch build operation))
   (dolist (description (build-layouts build))
@@ -339,10 +379,13 @@ Operands remain source forms for the shared lexical rewriter."
        (values `(,(record-make-instance-name build phase) ,@(rest form)) t))
       ((slot-value slot-boundp slot-makunbound)
        (if (eq phase :open) (values form t)
-           (values `(,(record-helper-name build
-                                         (ecase operator (slot-value '%record-read)
-                                                 (slot-boundp '%record-boundp) (slot-makunbound '%record-unbind)))
-                     ,@(rest form)) t)))
+           (let* ((operation (ecase operator (slot-value :read) (slot-boundp :boundp)
+                                                   (slot-makunbound :unbind)))
+                  (slot (third form)))
+             (values (if (and (quoted slot) (symbolp (second slot))
+                              (known-record-slot-p build (second slot)))
+                         `(,(record-slot-function build operation (second slot)) ,(second form))
+                         `(,(record-operation-helper build operation) ,@(rest form))) t))))
       (typep
        (let ((type-form (third form)))
          (when (and (consp type-form) (eq (first type-form) 'quote)
