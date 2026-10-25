@@ -232,10 +232,10 @@ keeps the driver's own locals readable."
 A printed marker is not enough: a failing child echoes its own source in the
 backtrace, so a search would find the literal marker text in the failure."
   (ignore-errors (delete-file sentinel))
-  (uiop:run-program
-   (list "sbcl" "--noinform" "--no-sysinit" "--no-userinit"
-         "--disable-debugger" "--script" (namestring driver))
-   :output :string :error-output :output :ignore-error-status t)
+  ;; Same adapter the suite uses elsewhere, so a replay runs under the host
+  ;; that is actually executing the tests instead of always under SBCL.
+  (uiop:run-program (test-process-command driver)
+                    :output :string :error-output :output :ignore-error-status t)
   (probe-file sentinel))
 
 (defun package-replay-test ()
