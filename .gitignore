@@ -1,6 +1,7 @@
 # Local builds and research evidence
 .build/
 agent-board/
+spec-next/
 .nobs/
 .qlot/
 qlfile
@@ -17,6 +18,8 @@ qlfile.lock
 paper/
 
 # Editor recovery files
+*.orig
+*.rej
 *~
 \#*\#
 .\#*
