@@ -30,6 +30,18 @@
   (unless truth
     (error "Snowgrave check failed: ~?" description arguments)))
 
+(defmacro check-signals ((type &optional features) form description &rest arguments)
+  (let ((caught (gensym "CONDITION")) (expected (gensym "FEATURES")))
+    `(let ((,caught (handler-case (progn ,form nil) (,type (condition) condition)))
+           (,expected ,features))
+       (check (and ,caught
+                   ,(if features
+                        `(member (snowgrave:error-feature ,caught)
+                                 (if (listp ,expected) ,expected (list ,expected)))
+                        t))
+              "~? (expected ~S~@[ with feature ~S~], got ~S)"
+              ,description (list ,@arguments) ',type ,expected ,caught))))
+
 (defun fixture-read (package text)
   (let ((*package* package) (*read-eval* nil))
     (read-from-string text)))

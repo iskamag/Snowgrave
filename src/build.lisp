@@ -41,5 +41,8 @@
   (or (member name (build-functions build) :test #'equal)
       (member name (build-generics build) :test #'equal)))
 (defun source-class-p (build name) (member name (build-classes build)))
+(defun find-source-definition (build operator name)
+  (find-if (lambda (form) (and (eq (first form) operator) (equal (second form) name)))
+           (build-forms build)))
 (defun quoted (form)
   (and (consp form) (eq (first form) 'quote) (consp (rest form)) (null (cddr form))))

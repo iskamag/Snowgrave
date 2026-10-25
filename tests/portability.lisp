@@ -57,11 +57,9 @@
                               (list (snowgrave::class-description-allocator
                                      (first (snowgrave::unit-plan-layouts (snowgrave::closed-unit-plan unit))))))
                         (list "ESCAPED-CHOICE" (list root))))
-        (check (eq :configuration-indirect-call
-                   (handler-case
-                       (progn (snowgrave:bind-entry unit (find-symbol (first row) package) (second row)) nil)
-                     (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-               "Escaping callable was relocated or published: ~A" (first row)))))
+        (check-signals (snowgrave:snowgrave-error :configuration-indirect-call)
+          (snowgrave:bind-entry unit (find-symbol (first row) package) (second row))
+          "Escaping callable was relocated or published: ~A" (first row)))))
   (portable-transfer-tests))
 
 (defun portable-transfer-tests ()
@@ -110,16 +108,12 @@
                       (list "ESCAPE-ASSIGNMENT" nil) (list "ESCAPE-INITIALIZER" nil)
                       (list "ESCAPE-SPECIAL" nil) (list "ESCAPE-MULTIPLE-NATIVE" nil)
                       (list "ESCAPE-MULTIPLE-LAMBDA" nil) (list "ESCAPE-PLACE" (list (vector nil)))))
-      (check (eq :configuration-indirect-call
-                 (handler-case
-                     (progn (snowgrave:bind-entry unit (find-symbol (first row) package) (second row)) nil)
-                   (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-             "Owned callable escaped a value transfer: ~A" (first row)))
-    (check (eq :configuration-form
-               (handler-case
-                   (progn (snowgrave:bind-entry unit (find-symbol "ESCAPE-LOAD-TIME" package) nil) nil)
-                 (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-           "Authored LOAD-TIME-VALUE bypassed configured call auditing")
+      (check-signals (snowgrave:snowgrave-error :configuration-indirect-call)
+        (snowgrave:bind-entry unit (find-symbol (first row) package) (second row))
+        "Owned callable escaped a value transfer: ~A" (first row)))
+    (check-signals (snowgrave:snowgrave-error :configuration-form)
+      (snowgrave:bind-entry unit (find-symbol "ESCAPE-LOAD-TIME" package) nil)
+      "Authored LOAD-TIME-VALUE bypassed configured call auditing")
     (let ((array (vector 0)) (bits (make-array 2 :element-type 'bit :initial-element 0))
           (table (make-hash-table)))
       (dolist (row (list (list "NATIVE-PLACE" (list array) '((11) (:place :index :value)))

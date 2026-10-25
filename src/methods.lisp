@@ -99,8 +99,7 @@
   ;; Method-combination metaobjects need not be EQ across MOP queries (ECL
   ;; returns fresh objects). The disposable cohort is defined from this owned
   ;; declaration, so validate its combination contract directly.
-  (let* ((definition (find-if (lambda (form) (and (eq (first form) 'defgeneric)
-                                                  (equal (second form) generic))) (build-forms build)))
+  (let* ((definition (find-source-definition build 'defgeneric generic))
          (option (assoc :method-combination (cdddr definition))))
     (when (and option (not (equal (rest option) '(standard))))
       (unsupported :method-combination "~S needs an unsupported custom method combination." generic)))

@@ -77,28 +77,7 @@ so use trusted source with deliberate initialization effects.
 The test files follow the same responsibilities. `tests/framework.lisp`
 provides differential fixtures, `tests/run.lisp` selects the suites, and
 `support/host.lisp` contains process, GC, and allocation-counter adapters used
-only by tests and integration tools.
-
-## Optional Clamsara checks
-
-These gates target Clamsara's engine rewrite, including its `engine/` sources
-and `clamsara/word-memory` ASDF system. They are not part of the standalone
-suite. Supply that checkout explicitly and register its dependencies:
-
-```sh
-export SNOWGRAVE_CLAMSARA_ROOT=/path/to/engine-rewrite
-sbcl --dynamic-space-size 1024 --load ~/quicklisp/setup.lisp --script scripts/check-clamsara.lisp
-sbcl --dynamic-space-size 1024 --load ~/quicklisp/setup.lisp --script scripts/check-clamsara-index-set.lisp
-sbcl --dynamic-space-size 1024 --load ~/quicklisp/setup.lisp --script scripts/check-clamsara-configuration.lisp
-```
-
-The whole-engine gate compares original, closed, and poisoned-original runs,
-then replays emitted source and compiled files in fresh processes. Set
-`SNOWGRAVE_REPLAY_LISP=ccl` while closing on SBCL, or the reverse, to check
-cross-host source transfer. Compiled files are specific to their host.
-The configuration gate binds four collectors simultaneously and poisons the
-general closed selectors. These workloads do not prove arbitrary collector
-programs or native target admission.
+only by tests.
 
 ## Supported fragment
 

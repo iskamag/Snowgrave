@@ -30,6 +30,24 @@
     (loop while (and tail (not (listp (first tail)))) do (push (pop tail) qualifiers))
     (values (nreverse qualifiers) (first tail) (rest tail))))
 
+(defun map-class-definition (form name-function slot-option-function)
+  "Map class bindings and slot options, treating defaults as initforms."
+  (destructuring-bind (operator name supers slots &rest options) form
+    `(,operator ,(funcall name-function name) ,(mapcar name-function supers)
+       ,(mapcar (lambda (slot)
+                  (if (symbolp slot) slot
+                      (cons (first slot)
+                            (loop for (key value) on (rest slot) by #'cddr
+                                  append (list key (funcall slot-option-function key value))))))
+                slots)
+       ,@(mapcar (lambda (option)
+                   (if (eq (first option) :default-initargs)
+                       (cons :default-initargs
+                             (loop for (key value) on (rest option) by #'cddr
+                                   append (list key (funcall slot-option-function :initform value))))
+                       option))
+                 options))))
+
 (defun index-source (build)
   (let ((forms (build-forms build)))
     (unless (and forms (ignore-errors (list-length forms)))
@@ -73,26 +91,14 @@
 (defun open-definition (build form)
   (case (first form)
     (defclass
-     (destructuring-bind (operator name supers slots &rest options) form
-       (declare (ignore operator))
-       `(defclass ,(open-name build name)
-            ,(mapcar (lambda (super) (if (source-class-p build super) (open-name build super) super)) supers)
-          ,(mapcar
-            (lambda (slot)
-              (if (symbolp slot) slot
-                  (cons (first slot)
-                        (loop for (key value) on (rest slot) by #'cddr
-                              append (list key (case key
-                                                 ((:reader :writer :accessor) (open-name build value))
-                                                 (:initform (rewrite-form build value :open))
-                                                 (:type (rewrite-type build value :open))
-                                                 (otherwise value))))))) slots)
-          ,@(mapcar (lambda (option)
-                      (if (eq (first option) :default-initargs)
-                          (cons :default-initargs
-                                (loop for (key value) on (rest option) by #'cddr
-                                      append (list key (rewrite-form build value :open))))
-                          option)) options))))
+     (map-class-definition
+      form (lambda (name) (if (source-class-p build name) (open-name build name) name))
+      (lambda (key value)
+        (case key
+          ((:reader :writer :accessor) (open-name build value))
+          (:initform (rewrite-form build value :open))
+          (:type (rewrite-type build value :open))
+          (otherwise value)))))
     (defgeneric
      `(closer-mop:defgeneric ,(open-name build (second form)) ,(third form)
         ,@(cdddr form)

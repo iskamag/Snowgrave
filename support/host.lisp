@@ -1,6 +1,6 @@
 ;;; Measurement and fresh-process adapters belong to tests, not the library.
 (defpackage #:snowgrave.host-tools (:use #:cl)
-  (:export #:host-gc #:host-bytes-consed #:host-process-command #:host-heap-mebibytes))
+  (:export #:host-gc #:host-bytes-consed #:host-process-command))
 (in-package #:snowgrave.host-tools)
 
 (defun host-gc ()

@@ -83,17 +83,11 @@
     (compare-entry unit package "ENTRY" nil '((34) nil)))
   ;; The builder installs this constant before closed rewriting refuses the
   ;; EVAL call. Cleanup must preserve the original condition.
-  (let ((feature nil))
-    (handler-case
-        (make-fixture
-         :constant-cleanup
-         "((defconstant +base+ 17)
-            (defun entry () (eval '+base+)))"
-         "(entry)" "((entry ()))" "()")
-      (snowgrave:snowgrave-error (condition)
-        (setf feature (snowgrave:error-feature condition))))
-    (check (eq :open-operation feature)
-           "Constant cleanup lost the original EVAL refusal: ~S" feature)))
+  (check-signals (snowgrave:snowgrave-error :open-operation)
+    (make-fixture :constant-cleanup
+                  "((defconstant +base+ 17) (defun entry () (eval '+base+)))"
+                  "(entry)" "((entry ()))" "()")
+    "Constant cleanup lost the original EVAL refusal"))
 
 (defun frozen-macro-tests ()
   ;; Do not evaluate an independent open fixture first: that would expand the

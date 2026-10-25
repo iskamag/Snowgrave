@@ -38,18 +38,13 @@
                       ,class)))
             (apply #'make-instance ,target ,initargs)))))))
 
-(defun source-class-form (build name)
-  (find-if (lambda (form) (and (consp form) (eq (first form) 'defclass)
-                              (eq (second form) name)))
-           (build-forms build)))
-
 (defun source-class-for-metaobject (build class)
   (find-if (lambda (name) (eq class (find-class (open-name build name) nil)))
            (build-classes build)))
 
 (defun source-slot-initform (build precedence slot-name)
   (dolist (name precedence (values nil nil))
-    (let* ((form (source-class-form build name))
+    (let* ((form (find-source-definition build 'defclass name))
            (slot (find slot-name (fourth form)
                        :key (lambda (slot) (if (consp slot) (first slot) slot)))))
       (when (and (consp slot)
@@ -58,7 +53,7 @@
 
 (defun source-default-initarg (build precedence key)
   (dolist (name precedence)
-    (let ((options (rest (assoc :default-initargs (cddddr (source-class-form build name))))))
+    (let ((options (rest (assoc :default-initargs (cddddr (find-source-definition build 'defclass name))))))
       (when (loop for tail on options by #'cddr thereis (eq (first tail) key))
         (return-from source-default-initarg (getf options key)))))
   (unsupported :default-initarg-source "No owned initializer for default initarg ~S." key))

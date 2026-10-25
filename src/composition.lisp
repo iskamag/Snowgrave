@@ -9,8 +9,7 @@
   ;; Create accessor generics through the compatibility layer too. On some
   ;; hosts the native accessor GF lacks class-only MOP applicability queries.
   (dolist (name (build-generics build))
-    (let* ((declaration (find-if (lambda (form) (and (eq (first form) 'defgeneric)
-                                                     (equal (second form) name))) (build-forms build)))
+    (let* ((declaration (find-source-definition build 'defgeneric name))
            (method (find name (build-method-sources build) :key #'second :test #'equal))
            (lambda-list
              (cond (declaration (third declaration))

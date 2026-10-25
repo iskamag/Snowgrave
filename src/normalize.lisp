@@ -20,25 +20,10 @@
      environment)))
 
 (defun normalize-source-class (form environment)
-  (destructuring-bind (operator name supers slots &rest options) form
-    `(,operator ,name ,supers
-       ,(mapcar
-         (lambda (slot)
-           (if (symbolp slot) slot
-               (cons (first slot)
-                     (loop for (key value) on (rest slot) by #'cddr
-                           append (list key (if (eq key :initform)
-                                                (normalize-source-expression value environment)
-                                                value))))))
-         slots)
-       ,@(mapcar
-          (lambda (option)
-            (if (eq (first option) :default-initargs)
-                (cons :default-initargs
-                      (loop for (key value) on (rest option) by #'cddr
-                            append (list key (normalize-source-expression value environment))))
-                option))
-          options))))
+  (map-class-definition
+   form #'identity
+   (lambda (key value)
+     (if (eq key :initform) (normalize-source-expression value environment) value))))
 
 (defun normalize-source-method (form environment)
   (multiple-value-bind (qualifiers lambda-list body) (method-parts form)

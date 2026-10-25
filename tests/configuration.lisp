@@ -40,44 +40,33 @@
         (check (= 4 (funcall two)) "Second configured method was not selected")
         (check (= 5 (funcall one)) "Later configuration changed an earlier entry")
         (check (= 7 (funcall two)) "Native data did not remain mutable")
-        (check (eq :configuration-dispatch
-                   (handler-case
-                       (progn (snowgrave:bind-entry unit (find-symbol "RUN" package) (list first)) nil)
-                     (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-               "Missing configuration facts did not reject residual dispatch")
-        (check (eq :configuration-indirect-call
-                   (handler-case
-                       (progn (snowgrave:bind-entry unit (find-symbol "CALLBACK" package)
-                                                   (list (funcall (entry "MAKE-CALLBACK") (lambda () 17)))) nil)
-                     (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-               "Unknown function-valued call passed the directness audit")
-        (check (eq :configuration-indirect-call
-                   (handler-case
-                       (progn (snowgrave:bind-entry unit (find-symbol "REDUCE-CALLBACK" package)
-                                                   (list (funcall (entry "MAKE-CALLBACK") #'+) '(1 2 3))) nil)
-                     (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-               "Unknown native callback passed the directness audit")
-        (check (eq :configuration-indirect-call
-                   (handler-case
-                       (progn (snowgrave:bind-entry unit (find-symbol "REDUCE-OPTION" package)
-                                                   (list (funcall (entry "MAKE-CALLBACK") #'1+))) nil)
-                     (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-               "Computed callback keyword passed the directness audit")
-        (check (eq :configuration-arguments
-                   (handler-case (progn (snowgrave:bind-entry unit (find-symbol "RUN" package) '(7) :roles roles) nil)
-                     (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-               "Binder did not validate the entry's declared root domain")
-        (check (handler-case
-                   (progn (funcall (entry "REPLACE-COMPONENT") first (funcall (entry "COMPONENT") second)) nil)
-                 (error () t))
-               "Exposed setter reconfigured a bound collector")
-        (check (handler-case (progn (funcall (entry "CLEAR-COMPONENT") first) nil) (error () t))
-               "Exposed slot-makunbound unbound a component role")
-        (check (handler-case
-                   (progn (funcall (entry "REPLACE-COMPONENT") first
-                                   (funcall (entry "COMPONENT") (funcall (entry "CONSTRUCT") t))) nil)
-                 (error () t))
-               "Same-class replacement escaped the sealed component graph")
+        (check-signals (snowgrave:snowgrave-error :configuration-dispatch)
+          (snowgrave:bind-entry unit (find-symbol "RUN" package) (list first))
+          "Missing configuration facts did not reject residual dispatch")
+        (check-signals (snowgrave:snowgrave-error :configuration-indirect-call)
+          (snowgrave:bind-entry unit (find-symbol "CALLBACK" package)
+                                (list (funcall (entry "MAKE-CALLBACK") (lambda () 17))))
+          "Unknown function-valued call passed the directness audit")
+        (check-signals (snowgrave:snowgrave-error :configuration-indirect-call)
+          (snowgrave:bind-entry unit (find-symbol "REDUCE-CALLBACK" package)
+                                (list (funcall (entry "MAKE-CALLBACK") #'+) '(1 2 3)))
+          "Unknown native callback passed the directness audit")
+        (check-signals (snowgrave:snowgrave-error :configuration-indirect-call)
+          (snowgrave:bind-entry unit (find-symbol "REDUCE-OPTION" package)
+                                (list (funcall (entry "MAKE-CALLBACK") #'1+)))
+          "Computed callback keyword passed the directness audit")
+        (check-signals (snowgrave:snowgrave-error :configuration-arguments)
+          (snowgrave:bind-entry unit (find-symbol "RUN" package) '(7) :roles roles)
+          "Binder did not validate the entry's declared root domain")
+        (check-signals (error)
+          (funcall (entry "REPLACE-COMPONENT") first (funcall (entry "COMPONENT") second))
+          "Exposed setter reconfigured a bound collector")
+        (check-signals (error) (funcall (entry "CLEAR-COMPONENT") first)
+          "Exposed slot-makunbound unbound a component role")
+        (check-signals (error)
+          (funcall (entry "REPLACE-COMPONENT") first
+                   (funcall (entry "COMPONENT") (funcall (entry "CONSTRUCT") t)))
+          "Same-class replacement escaped the sealed component graph")
         (check (= 7 (funcall one)) "Failed reconfiguration damaged the original binding"))))
   (configuration-callback-tests)
   (configuration-slot-error-tests))
@@ -95,11 +84,9 @@
        "(direct indirect quoted)" "((direct (list)) (indirect (list)) (quoted (list)))"
        "(add)" :universe "(integer)")
     (dolist (name '("DIRECT" "INDIRECT" "QUOTED"))
-      (let ((feature
-              (handler-case (progn (snowgrave:bind-entry unit (find-symbol name package) '((1 2 3))) nil)
-                (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition)))))
-        (check (member feature '(:configuration-dispatch :configuration-indirect-call))
-               "Escaping ~A callback passed the directness audit: ~S" name feature)))))
+      (check-signals (snowgrave:snowgrave-error '(:configuration-dispatch :configuration-indirect-call))
+        (snowgrave:bind-entry unit (find-symbol name package) '((1 2 3)))
+        "Escaping ~A callback passed the directness audit" name))))
 
 (defun configuration-slot-error-tests ()
   (multiple-value-bind (unit package)
@@ -122,11 +109,9 @@
       (check (eq (handler-case (funcall base root) (error (condition) (type-of condition)))
                  (handler-case (funcall bound) (error (condition) (type-of condition))))
              "Configured slot failure changed the condition type")
-      (check (eq :configuration-allocation
-                 (handler-case
-                     (progn (snowgrave:bind-entry unit (find-symbol "CONSTRUCT" package) nil) nil)
-                   (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-             "Configured entry admitted new components")
+      (check-signals (snowgrave:snowgrave-error :configuration-allocation)
+        (snowgrave:bind-entry unit (find-symbol "CONSTRUCT" package) nil)
+        "Configured entry admitted new components")
       (check (eq make-instance (fdefinition 'make-instance)) "Binding changed CL:MAKE-INSTANCE"))))
 
 (defun configuration-contour-tests ()
@@ -149,9 +134,6 @@
            "Known owned callable lost its specialization identity")
     ;; The local declaration cannot justify specializing the later call. DATA is
     ;; borrowed mutable storage, so its sampled element supplies no lasting fact.
-    (check (eq :configuration-dispatch
-               (handler-case
-                   (progn (snowgrave:bind-entry unit (find-symbol "ENTRY" package)
-                                               (list (vector 7))) nil)
-                 (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
-           "Local type declarations escaped their lexical contour")))
+    (check-signals (snowgrave:snowgrave-error :configuration-dispatch)
+      (snowgrave:bind-entry unit (find-symbol "ENTRY" package) (list (vector 7)))
+      "Local type declarations escaped their lexical contour")))
