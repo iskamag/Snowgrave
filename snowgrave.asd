@@ -5,6 +5,7 @@
   :depends-on ("closer-mop" "cl-form-types")
   :serial t
   :components ((:file "src/package")
+               (:file "src/plans")
                (:file "src/build")
                (:file "src/host-normalization")
                (:file "src/hosts/sbcl" :if-feature :sbcl)
@@ -12,6 +13,7 @@
                (:file "src/walker")
                (:file "src/literals")
                (:file "src/source")
+               (:file "src/admission")
                (:file "src/rewrite")
                (:file "src/normalize")
                (:file "src/records")

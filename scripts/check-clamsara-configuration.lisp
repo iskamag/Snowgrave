@@ -104,13 +104,13 @@
 
 ;; A direct entry must not call either the original CLOS generic or its
 ;; general closed selector. Keep both poisoned while all bindings coexist.
-(dolist (plan (getf (snowgrave::closed-unit-compiler-data *unit*) :generics))
+(dolist (plan (snowgrave::unit-plan-generics (snowgrave::closed-unit-plan *unit*)))
   (let ((poison (lambda (&rest args) (declare (ignore args)) (error "Base selector reached.")))
-        (original (fdefinition (getf plan :source))))
+        (original (fdefinition (snowgrave::generic-plan-source plan))))
     (when (typep original 'generic-function)
       (closer-mop:set-funcallable-instance-function original poison))
-    (setf (fdefinition (getf plan :source)) poison
-          (fdefinition (getf plan :name)) poison)))
+    (setf (fdefinition (snowgrave::generic-plan-source plan)) poison
+          (fdefinition (snowgrave::generic-plan-name plan)) poison)))
 (let ((checks 0))
   (dolist (case (nreverse *cases*))
     (destructuring-bind (family format cycle verify) case

@@ -3,7 +3,7 @@
 ;;; The MOP supplies effective slots and precedence. Runtime instances are
 ;;; ordinary structures; the compiler descriptions below never enter them.
 
-(defstruct slot-description name field type initargs initform initform-p)
+(defstruct slot-description name field index type initargs initform initform-p)
 (defstruct class-description
   name type allocator constructor predicate bound-accessor slots cpl defaults)
 
@@ -107,7 +107,7 @@
       (unsupported :custom-record-protocol
                    "The initial record implementation requires stock ~S behavior." (second form)))))
 
-(defun prepare-slot-description (build class-name precedence slot)
+(defun prepare-slot-description (build class-name precedence slot index)
   (let ((name (closer-mop:slot-definition-name slot))
         (type (restore-record-type build (closer-mop:slot-definition-type slot))))
     (unless (eq (class-of slot) (find-class 'closer-mop:standard-effective-slot-definition))
@@ -119,7 +119,7 @@
       (unsupported :slot-type "Slot ~S in ~S has unsupported type ~S." name class-name type))
     (multiple-value-bind (initform presentp) (source-slot-initform build precedence name)
       (make-slot-description
-       :name name :field (fresh-name build "RECORD-FIELD") :type type
+       :name name :field (fresh-name build "RECORD-FIELD") :index index :type type
        :initargs (copy-list (closer-mop:slot-definition-initargs slot))
        :initform initform :initform-p presentp))))
 
@@ -146,8 +146,8 @@
        :cpl precedence
        :defaults (loop for (key) in (closer-mop:class-default-initargs class)
                        collect (list key (source-default-initarg build precedence key)))
-       :slots (mapcar (lambda (slot) (prepare-slot-description build name precedence slot))
-                      (closer-mop:class-slots class))))))
+       :slots (loop for slot in (closer-mop:class-slots class) for index from 0
+                    collect (prepare-slot-description build name precedence slot index))))))
 
 (defun prepare-records (build)
   (setf (build-layouts build)
@@ -203,7 +203,7 @@
        (setf (,(record-slot-function build :read slot) ,object) ,value))))
 
 (defun record-slot-body (build description slot operation object value)
-  (let* ((index (position slot (class-description-slots description)))
+  (let* ((index (slot-description-index slot))
          (bound `(,(class-description-bound-accessor description) ,object))
          (access `(,(slot-description-field slot) ,object)))
     (ecase operation
@@ -251,11 +251,12 @@
                          for field = (find slot (class-description-slots description)
                                            :key #'slot-description-name)
                          when field collect
-                           (list (class-description-type description)
-                                 (class-description-predicate description)
-                                 (slot-description-field field)
-                                 (record-slot-body build description field operation object value)))))
-        (push (list :name (record-slot-function build operation slot)
+                           (make-slot-case
+                            :type (class-description-type description)
+                            :predicate (class-description-predicate description)
+                            :field (slot-description-field field)
+                            :body (record-slot-body build description field operation object value)))))
+        (push (make-slot-plan :name (record-slot-function build operation slot)
                     :operation operation :slot slot :arguments arguments
                     :invalid (closed-name build '%record-invalid-slot)
                     :object object :value value :cases cases)
@@ -263,8 +264,8 @@
         (emit-form build
           `(defun ,(record-slot-function build operation slot) ,arguments
              (cond
-               ,@(loop for (type predicate field body) in cases
-                       collect `((,predicate ,object) ,body))
+               ,@(loop for case in cases
+                       collect `((,(slot-case-predicate case) ,object) ,(slot-case-body case)))
                (t (,(closed-name build '%record-invalid-slot) ,object ',slot)))))))
     (emit-form
      build

@@ -16,7 +16,7 @@
          (native (remove-if (lambda (class) (or (eq class (find-class t))
                                                (source-class-for-metaobject build class))) specializers)))
     (when (every (lambda (class) (eq class (find-class t))) specializers)
-      (return-from generic-axis-cuts (list (list :any t (find-class t)))))
+      (return-from generic-axis-cuts (list (make-dispatch-cut :kind :any :type t :class (find-class t)))))
     ;; Nested or disjoint native cuts have an exact nominal representative.
     ;; An unresolved intersection would need another cell, never a sample.
     (loop for tail on native do
@@ -27,23 +27,24 @@
           (unsupported :native-partition "Overlapping native classes ~S and ~S need an explicit partition."
                        (cl:class-name (first tail)) (cl:class-name other)))))
     (setf native (stable-sort native #'> :key (lambda (class) (length (closer-mop:class-precedence-list class)))))
-    (append (mapcar (lambda (name) (list :record name (source-specializer-class build name)))
+    (append (mapcar (lambda (name) (make-dispatch-cut :kind :record :type name :class (source-specializer-class build name)))
                     (build-classes build))
             (loop for tail on native for index from 0
-                  collect (list :native (cl:class-name (first tail)) (first tail)
-                                (mapcar #'cl:class-name (subseq native 0 index))))
-            (list (list :other t (find-class t) (mapcar #'cl:class-name native))))))
+                  collect (make-dispatch-cut :kind :native :type (cl:class-name (first tail)) :class (first tail)
+                                     :excluded (mapcar #'cl:class-name (subseq native 0 index))))
+            (list (make-dispatch-cut :kind :other :type t :class (find-class t)
+                                     :excluded (mapcar #'cl:class-name native))))))
 
 (defun axis-cut-test (build cut value)
-  (case (first cut)
+  (case (dispatch-cut-kind cut)
     (:any t)
-    (:record (closed-exact-class-test build (second cut) value))
+    (:record (closed-exact-class-test build (dispatch-cut-type cut) value))
     (otherwise
      `(and (not (or ,@(mapcar (lambda (name) (closed-exact-class-test build name value))
                               (build-classes build))))
-           ,@(when (eq (first cut) :native) `((typep ,value ',(second cut))))
-           ,@(when (fourth cut) `((not (or ,@(mapcar (lambda (name) `(typep ,value ',name))
-                                                    (fourth cut))))))))))
+           ,@(when (eq (dispatch-cut-kind cut) :native) `((typep ,value ',(dispatch-cut-type cut))))
+           ,@(when (dispatch-cut-excluded cut) `((not (or ,@(mapcar (lambda (name) `(typep ,value ',name))
+                                                    (dispatch-cut-excluded cut))))))))))
 
 (defun method-cartesian-product (axes)
   (if (null axes) (list nil)
@@ -64,22 +65,22 @@
 (defun generic-validator-form (build gf applicable arguments)
   (let* ((shape (method-lambda-shape (closer-mop:generic-function-lambda-list gf)))
          (method-shapes (mapcar (lambda (method) (method-lambda-shape (closer-mop:method-lambda-list method))) applicable))
-         (keys (remove-duplicates (append (getf shape :keys)
-                                          (loop for item in method-shapes append (getf item :keys)))))
-         (allow (or (getf shape :allow) (some (lambda (item) (getf item :allow)) method-shapes)))
-         (required (loop repeat (length (getf shape :required)) collect (gensym "REQUIRED")))
-         (optional (loop repeat (length (getf shape :optional)) collect (gensym "OPTIONAL")))
-         (rest (when (or (getf shape :rest) (getf shape :keyp)) (gensym "REST")))
+         (keys (remove-duplicates (append (lambda-shape-keys shape)
+                                          (loop for item in method-shapes append (lambda-shape-keys item)))))
+         (allow (or (lambda-shape-allow shape) (some #'lambda-shape-allow method-shapes)))
+         (required (loop repeat (length (lambda-shape-required shape)) collect (gensym "REQUIRED")))
+         (optional (loop repeat (length (lambda-shape-optional shape)) collect (gensym "OPTIONAL")))
+         (rest (when (or (lambda-shape-rest shape) (lambda-shape-keyp shape)) (gensym "REST")))
          (key-variables (mapcar (lambda (key) (list (list key (gensym "KEY")))) keys))
          (variables (append required optional (when rest (list rest))
-                            (when (getf shape :keyp) (mapcar #'cadar key-variables))))
+                            (when (lambda-shape-keyp shape) (mapcar #'cadar key-variables))))
          (name (fresh-name build "ARGUMENTS")))
     (emit-form build
                `(defun ,name (,@required
                              ,@(when optional (cons '&optional optional))
                              ,@(when rest (list '&rest rest))
-                             ,@(when (getf shape :keyp) (cons '&key key-variables))
-                             ,@(when (and (getf shape :keyp) allow) '(&allow-other-keys)))
+                             ,@(when (lambda-shape-keyp shape) (cons '&key key-variables))
+                             ,@(when (and (lambda-shape-keyp shape) allow) '(&allow-other-keys)))
                   ,@(when variables `((declare (ignore ,@variables))))
                   (values)))
     `(apply #',name ,arguments)))
@@ -97,7 +98,7 @@
     (loop for cell in (method-cartesian-product axes)
           for index from 0
           do (multiple-value-bind (applicable certainp)
-                 (closer-mop:compute-applicable-methods-using-classes gf (mapcar #'third cell))
+                 (closer-mop:compute-applicable-methods-using-classes gf (mapcar #'dispatch-cut-class cell))
                (unless certainp
                  (unsupported :method-applicability
                               "The MOP cannot establish class-only applicability for ~S." generic))
@@ -117,23 +118,26 @@
           (when options
             (unsupported :effective-options
                          "~S returned unsupported effective-method options." generic))
-          `(,(nreverse indices)
-            ,(if (method-call-abi-list-parameter abi)
-                 (generic-validator-form build gf applicable (method-call-abi-list-parameter abi))
-                 `(when ,overflow
-                    (error ',(closed-name build '%program-error)
-                           :format-control "Too many arguments for closed generic ~S."
-                           :format-arguments (list ',generic))))
-            ,(emit-effective-source build generic effective abi)))))
+          (make-generic-clause
+           :indices (nreverse indices)
+           :body (list
+                  (if (method-call-abi-list-parameter abi)
+                      (generic-validator-form build gf applicable (method-call-abi-list-parameter abi))
+                      `(when ,overflow
+                         (error ',(closed-name build '%program-error)
+                                :format-control "Too many arguments for closed generic ~S."
+                                :format-arguments (list ',generic))))
+                  (emit-effective-source build generic effective abi))))))
 
-(defun generic-plan-axes (build axes)
-  ;; Retained specialization recipes contain source types, never MOP objects.
+(defun project-dispatch-domains (build axes)
+  ;; Projection is explicit: class metaobjects stay in builder-only cuts.
   (mapcar (lambda (axis)
             (mapcar (lambda (cut)
-                      (list (first cut)
-                            (if (eq (first cut) :record)
-                                (class-description-type (find-record-class build (second cut)))
-                                (second cut))))
+                      (make-dispatch-domain
+                       :kind (dispatch-cut-kind cut)
+                       :type (if (eq (dispatch-cut-kind cut) :record)
+                                 (class-description-type (find-record-class build (dispatch-cut-type cut)))
+                                 (dispatch-cut-type cut))))
                     axis))
           axes))
 
@@ -152,8 +156,8 @@
 
 (defun generic-entry-form (build generic shape axes abi overflow clauses)
   (let ((arguments (method-call-abi-list-parameter abi))
-        (required (length (getf shape :required)))
-        (supplied (loop repeat (length (getf shape :optional)) collect (gensym "SUPPLIED")))
+        (required (length (lambda-shape-required shape)))
+        (supplied (loop repeat (length (lambda-shape-optional shape)) collect (gensym "SUPPLIED")))
         (cell-index (gensym "CELL")))
     `(defun ,(closed-name build generic) ,(generic-entry-lambda-list abi supplied overflow)
        ,@(when (and arguments (plusp required))
@@ -172,7 +176,9 @@
                                 (+ (* ,cell-index ,(length axis))
                                    ,(method-axis-index-form build axis (call-abi-argument abi index)))))
          (case ,cell-index
-           ,@clauses
+           ,@(mapcar (lambda (clause)
+                       (cons (generic-clause-indices clause) (generic-clause-body clause)))
+                     clauses)
            (otherwise ,(no-applicable-method-form
                         build generic (if arguments arguments
                                           `(append ,(call-abi-list abi) ,overflow)))))))))
@@ -181,18 +187,18 @@
   (let* ((gf (validate-generic-methods build generic (generic-open-function build generic)))
          (methods (closer-mop:generic-function-methods gf))
          (shape (method-lambda-shape (closer-mop:generic-function-lambda-list gf)))
-         (required (length (getf shape :required)))
+         (required (length (lambda-shape-required shape)))
          (axes (loop for position below required collect (generic-axis-cuts build methods position)))
          (abi (make-generic-call-abi shape))
          (overflow (unless (method-call-abi-list-parameter abi) (gensym "EXCESS-ARGUMENTS")))
          (*method-source-cache* (make-hash-table :test #'equal))
          (clauses (generic-dispatch-clauses build generic gf axes abi overflow)))
-    (push (list :name (closed-name build generic) :source generic
-                :required required :optional (length (getf shape :optional))
+    (push (make-generic-plan :name (closed-name build generic) :source generic
+                :required required :optional (length (lambda-shape-optional shape))
                 :variable-tail (not (null (method-call-abi-list-parameter abi)))
                 :arguments (method-call-abi-arguments abi)
                 :optional-count (method-call-abi-optional-count abi)
-                :overflow overflow :axes (generic-plan-axes build axes) :clauses clauses)
+                :overflow overflow :axes (project-dispatch-domains build axes) :clauses clauses)
           (build-generic-plans build))
     (emit-form build (generic-entry-form build generic shape axes abi overflow clauses))))
 

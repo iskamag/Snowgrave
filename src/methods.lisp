@@ -35,7 +35,7 @@
              (let ((binding (if (consp item) (first item) item)))
                (push (if (consp binding) (first binding)
                          (intern (symbol-name binding) :keyword)) keys)))))
-    (list :required (nreverse required) :optional (nreverse optional)
+    (make-lambda-shape :required (nreverse required) :optional (nreverse optional)
           :rest rest :keyp keyp :keys (nreverse keys) :allow allow)))
 
 (defun permissive-method-lambda-list (lambda-list)

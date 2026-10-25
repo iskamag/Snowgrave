@@ -34,11 +34,11 @@
   (let ((*package* package) (*read-eval* nil))
     (read-from-string text)))
 
-(defun make-fixture (tag source entries domains generics &key (universe "()") external)
+(defun make-fixture (tag source entries domains generics &key (universe "()") external shadows)
   "Load the original CLOS program and close exactly those owned source forms."
   (let* ((number (incf *fixture-sequence*))
          (package (make-package (format nil "SNOWGRAVE.CORE.FIXTURE.~D" number) :use '("COMMON-LISP")))
-         (forms (fixture-read package source))
+         (forms (progn (shadow shadows package) (fixture-read package source)))
          (classes (loop for form in forms when (eq (first form) 'defclass) collect (second form))))
     (mapc #'eval forms)
     (values

@@ -45,17 +45,28 @@ ordinary entry calls, and configured binding.
 
 | Files | Responsibility |
 | --- | --- |
-| `package.lisp`, `build.lisp` | Public symbols, conditions, disposable build state, and owned names |
+| `package.lisp`, `build.lisp`, `plans.lisp` | Public symbols, conditions, disposable build state, and explicit retained compiler contracts |
 | `source.lisp`, `literals.lisp` | Definition indexing, open source, literal identity and cycles |
 | `walker.lisp`, `normalize.lisp`, `hosts/` | Lexical traversal and portable macro-expansion snapshots |
-| `rewrite.lisp`, `functions.lisp` | Closed bindings, entry domains, and ordinary definitions |
+| `admission.lisp`, `rewrite.lisp`, `functions.lisp` | Admission and name resolution, source rebuilding, entry domains, and ordinary definitions |
 | `records.lisp`, `metadata.lisp`, `observation.lisp` | Physical records, logical metadata, and admitted comparisons |
 | `composition.lisp`, `methods.lisp`, `method-abi.lisp`, `dispatch.lisp` | MOP composition, continuations, argument transport, and finite method partitions |
 | `artifact.lisp` | Residual source audit and independent source/metadata serialization |
 | `configuration.lisp`, `configuration-entry.lisp` | Validate component graphs, compile bound entries, and publish role seals |
 | `specialization/` | Conservative facts, lexical bindings, call selection, and form handlers |
 
-Paths in the table are relative to `src/`. A successful closed unit retains
+Paths in the table are relative to `src/`. Private unit, dispatch, slot, and
+lambda-shape recipes use records with named fields. Retained plans reuse the
+class and slot descriptions, including each slot's fixed index. Builder-only
+dispatch cuts carry MOP classes; retained dispatch domains carry source types.
+Public metadata remains serialized Lisp data.
+
+Admission policies select bindings and reject unsupported operations. The
+rewriter rebuilds expressions during the existing lexical traversal; it does
+not run another macro-expansion pass. Configured specialization uses explicit
+lexical fact contours and lambda sources, separate from host walker environments.
+
+A successful closed unit retains
 ordinary source, functions, metadata, and specialization recipes. Open MOP
 objects belong to the disposable build. Configured entries borrow live
 closed values and seal only declared component roles; ordinary mutable fields

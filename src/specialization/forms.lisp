@@ -16,21 +16,23 @@
 
 (defun specialize-function-reference-form (configuration form environment)
   (let* ((target (second form))
-         (namedp (function-name-p target)))
-    (when (and namedp (assoc target (getf environment :functions) :test #'equal))
+         (namedp (function-name-p target))
+         (plan (closed-unit-plan (configuration-unit configuration))))
+    (when (and namedp (assoc target (env-functions environment) :test #'equal))
       (unsupported :configuration-indirect-call
                    "A lexical function value needs explicit capture conversion outside a direct FUNCALL."))
-    (values form (make-fact :type 'function
-                           :owned-callable (or (not namedp)
-                                               (gethash target (configuration-functions configuration))
-                                               (find target (configuration-data configuration :layouts)
-                                                     :key (lambda (layout) (getf layout :allocator))))
-                           :callable (if namedp target (list :lambda target environment))))))
+    (values form
+            (make-fact :type 'function
+                       :owned-callable (not (null (or (not namedp)
+                                                     (gethash target (configuration-functions configuration))
+                                                     (member target (unit-plan-construction-functions plan)
+                                                             :test #'equal))))
+                       :callable (if namedp target
+                                     (make-lambda-source :form target :environment environment))))))
 
 (defun specialize-let-form (configuration form environment)
-  (let ((inner (copy-list environment)) (bindings nil)
+  (let ((inner (copy-lexical-facts environment)) (bindings nil)
         (assigned (unstable-source-variables configuration form (cddr form))))
-    (setf (getf inner :variables) (copy-list (getf environment :variables)))
     (dolist (binding (second form))
       (let ((name (if (consp binding) (first binding) binding))
             (init (and (consp binding) (second binding))))
@@ -38,16 +40,16 @@
           (when (member name assigned)
             (audit-callable-transfer configuration fact 'mutable-binding))
           (push (list name new) bindings)
-          (push (cons name (if (member name assigned) (make-fact) fact)) (getf inner :variables)))))
+          (push (cons name (if (member name assigned) (make-fact) fact)) (env-variables inner)))))
     (multiple-value-bind (body fact) (specialize-body configuration (cddr form) inner)
       (values `(,(first form) ,(nreverse bindings) ,@body) fact))))
 
 (defun specialize-local-functions-form (configuration form environment)
-  (let* ((scope (make-local-scope)) (inner (copy-list environment))
+  (let* ((scope (make-local-scope)) (inner (copy-lexical-facts environment))
          (locals (loop for definition in (second form)
                        collect (cons (first definition)
                                      (make-local-source :name (first definition) :definition (rest definition) :scope scope)))))
-    (setf (getf inner :functions) (append locals (getf environment :functions)))
+    (setf (env-functions inner) (append locals (env-functions environment)))
     (dolist (local locals)
       (setf (local-source-environment (cdr local)) (if (eq (first form) 'labels) inner environment)))
     (multiple-value-bind (body fact) (specialize-body configuration (cddr form) inner)
@@ -74,16 +76,16 @@
   ;; start unknown; a sampled result must never become a type fact.
   (multiple-value-bind (value fact) (specialize-form configuration (third form) environment)
     (audit-callable-transfer configuration fact 'multiple-value-bind)
-    (let ((inner (copy-list environment)))
-      (setf (getf inner :variables)
+    (let ((inner (copy-lexical-facts environment)))
+      (setf (env-variables inner)
             (append (mapcar (lambda (name) (cons name (make-fact))) (second form))
-                    (getf environment :variables)))
+                    (env-variables environment)))
       (multiple-value-bind (body result) (specialize-body configuration (cdddr form) inner)
         (values `(multiple-value-bind ,(second form) ,value ,@body) result)))))
 
 (defun direct-lambda-reference-p (callee operand)
   ;; A lexical closure may be substituted only at its original direct call.
-  (and (consp callee) (eq (first callee) :lambda)
+  (and (lambda-source-p callee)
        (consp operand) (eq (first operand) 'function)
        (consp (second operand)) (eq (first (second operand)) 'lambda)))
 
@@ -102,14 +104,14 @@
                (values `(multiple-value-call (progn ,function (function ,callee)) ,@new) (make-fact)))
               ((direct-lambda-reference-p callee (second form))
                (multiple-value-bind (lambda-form result)
-                   (specialize-lambda-source configuration (second callee) (third callee))
+                   (specialize-lambda-source configuration (lambda-source-form callee) (lambda-source-environment callee))
                  (values `(multiple-value-call (function ,lambda-form) ,@new) result)))
               (t (unsupported :configuration-indirect-call "Unresolved multiple-value call: ~S." form)))))))
 
 (defun specialize-funcall-form (configuration form environment)
   (let* ((operand (second form))
          (local (and (consp operand) (eq (first operand) 'function)
-                     (cdr (assoc (second operand) (getf environment :functions) :test #'equal)))))
+                     (cdr (assoc (second operand) (env-functions environment) :test #'equal)))))
     (when local
       (return-from specialize-funcall-form
         (multiple-value-bind (arguments facts)
@@ -123,7 +125,8 @@
                      (specialize-known-call configuration callee arguments facts
                                             (and (fact-callable fact) environment)))
                     ((direct-lambda-reference-p callee operand)
-                     (specialize-lambda-call configuration (rest (second callee)) arguments facts (third callee)))
+                     (specialize-lambda-call configuration (rest (lambda-source-form callee)) arguments facts
+                                             (lambda-source-environment callee)))
                     (t (unsupported :configuration-indirect-call "Unresolved or escaping lexical function value.")))
             ;; Preserve effects in the function operand before argument evaluation.
             (values (if (or (symbolp operand) (and (consp operand) (eq (first operand) 'function)))
@@ -133,7 +136,7 @@
   (when (atom form)
     (return-from specialize-form
       (values form (if (symbolp form)
-                       (or (cdr (assoc form (getf environment :variables)))
+                       (or (cdr (assoc form (env-variables environment)))
                            (and (constantp form) (literal-fact (symbol-value form))) (make-fact))
                        (literal-fact form)))))
   (case (first form)
@@ -156,7 +159,7 @@
              (values `(progn ,test ,body) result))
            (multiple-value-bind (yes left) (specialize-form configuration (third form) environment)
              (multiple-value-bind (no right) (specialize-form configuration (fourth form) environment)
-               (values `(if ,test ,yes ,no) (fact-union left right)))))))
+               (values `(if ,test ,yes ,no) (fact-union configuration left right)))))))
     (setq
      (let ((forms nil) (result (literal-fact nil)))
        (loop for (name value) on (rest form) by #'cddr
@@ -203,7 +206,7 @@
             (multiple-value-bind (arguments facts) (specialize-arguments configuration (rest form) environment)
               (specialize-lambda-call configuration (rest (first form)) arguments facts environment)))
            ((and (symbolp (first form)) (macro-function (first form))
-                 (not (assoc (first form) (getf environment :functions) :test #'equal)))
+                 (not (assoc (first form) (env-functions environment) :test #'equal)))
             (unsupported :configuration-form "Unexpanded configured macro ~S." form))
            (t (multiple-value-bind (arguments facts) (specialize-arguments configuration (rest form) environment)
                 (specialize-known-call configuration (first form) arguments facts environment)))))))

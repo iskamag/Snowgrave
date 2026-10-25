@@ -81,3 +81,28 @@
                                      :native-bindings nil)
       (snowgrave:snowgrave-error () (setf rejected t)))
     (check rejected "Removed configuration declaration was silently accepted")))
+
+(defun admission-boundary-tests ()
+  (dolist (case '(("(eval '(+ 1 2))" :open-operation)
+                  ("(funcall #'eval '(+ 1 2))" :indirect-open-operation)
+                  ("(mapcar 'eval '((+ 1 2)))" :indirect-open-operation)))
+    (let ((feature
+            (handler-case
+                (progn
+                  (make-fixture :admission-boundary
+                                (format nil "((defun entry () ~A))" (first case))
+                                "(entry)" "((entry ()))" "()")
+                  nil)
+              (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition)))))
+      (check (eq (second case) feature) "Wrong admission feature for ~A: ~S" (first case) feature)))
+  ;; Operation policies match symbol identity, including the source package's shadows.
+  (multiple-value-bind (unit package)
+      (make-fixture :owned-namesakes
+                    "((defun eval (n) (+ n 1))
+                       (defun print (n) (+ n 2))
+                       (defun entry (n) (values (eval n) (funcall #'print n))))"
+                    "(entry)" "((entry (integer)))" "()" :shadows '("EVAL" "PRINT"))
+    (compare-entry unit package "ENTRY" '(7) '((8 9) nil))
+    (check (equal '(8 9) (multiple-value-list
+                         (funcall (snowgrave:bind-entry unit (find-symbol "ENTRY" package) '(7)))))
+           "Owned namesakes were mistaken for ambient operations")))

@@ -1,7 +1,7 @@
 (in-package #:snowgrave)
 
-(defstruct (closed-unit (:constructor %make-unit (metadata source bindings compiler-data)))
-  metadata source bindings compiler-data
+(defstruct (closed-unit (:constructor %make-unit (metadata source bindings plan)))
+  metadata source bindings plan
   (seals (make-hash-table :test #'eq))
   (sealed-writers (make-hash-table :test #'equal)))
 
@@ -29,33 +29,26 @@
 (defun compile-definition (form)
   (funcall (compile-function nil (list 'lambda nil form))))
 
-(defun unit-compiler-data (build)
+(defun make-unit-plan-from-build (build)
   ;; These are plain source descriptions, never open MOP objects. Keep enough
   ;; information for a configured entry without reopening the class world.
-  (list :package (package-name (build-output-package build))
-        :generics (build-generic-plans build)
-        :special-variables (loop for form in (build-forms build)
-                                 when (member (first form) '(defvar defparameter))
-                                 collect (closed-name build (second form)))
-        :entries (loop for (name domains) in (getf (build-declaration build) :external-domains)
-                       collect (list name (mapcar (lambda (type) (rewrite-type build type :closed)) domains)))
-        :slots (build-slot-plans build)
-        :slow-paths (mapcar (lambda (name) (closed-name build name))
-                            '(%record-invalid-slot %record-unbound))
-        :construction-functions (when (build-layouts build)
-                                  (cons (record-make-instance-name build :closed)
-                                        (mapcar #'class-description-constructor (build-layouts build))))
-        :layouts
-        (loop for layout in (build-layouts build)
-              collect (list :name (class-description-name layout)
-                            :type (class-description-type layout)
-                            :cpl (class-description-cpl layout)
-                            :allocator (class-description-allocator layout)
-                            :bound (class-description-bound-accessor layout)
-                            :slots (loop for slot in (class-description-slots layout) for index from 0
-                                         collect (list :name (slot-description-name slot)
-                                                       :field (slot-description-field slot)
-                                                       :index index))))))
+  (make-unit-plan
+   :package (package-name (build-output-package build))
+   :generics (build-generic-plans build)
+   :special-variables (loop for form in (build-forms build)
+                           when (member (first form) '(defvar defparameter))
+                             collect (closed-name build (second form)))
+   :entries (loop for (name domains) in (getf (build-declaration build) :external-domains)
+                  collect (list name (mapcar (lambda (type) (rewrite-type build type :closed)) domains)))
+   :slots (build-slot-plans build)
+   :slow-paths (mapcar (lambda (name) (closed-name build name))
+                       '(%record-invalid-slot %record-unbound))
+   :construction-functions (when (build-layouts build)
+                             (cons (record-make-instance-name build :closed)
+                                   (loop for layout in (build-layouts build)
+                                         append (list (class-description-constructor layout)
+                                                      (class-description-allocator layout)))))
+   :layouts (build-layouts build)))
 
 (defun discard-builder (build)
   (let ((package (build-open-package build)))
@@ -134,7 +127,7 @@
     (%make-unit (make-unit-metadata build) forms
                 (loop for name in (getf (build-declaration build) :entries)
                       collect (cons name (fdefinition (closed-name build name))))
-                (unit-compiler-data build))))
+                (make-unit-plan-from-build build))))
 
 (defun close-source-unit (source &rest declaration
                           &key unit-name entries closed-classes closed-generics universe

@@ -5,13 +5,13 @@
 (defstruct method-call-abi arguments required optional-count list-parameter)
 
 (defun make-generic-call-abi (shape)
-  (if (or (getf shape :rest) (getf shape :keyp))
+  (if (or (lambda-shape-rest shape) (lambda-shape-keyp shape))
       (make-method-call-abi :list-parameter (gensym "ARGUMENTS"))
       (make-method-call-abi
-       :required (length (getf shape :required))
-       :arguments (loop repeat (+ (length (getf shape :required))
-                                  (length (getf shape :optional))) collect (gensym "ARGUMENT"))
-       :optional-count (when (getf shape :optional) (gensym "OPTIONAL-COUNT")))))
+       :required (length (lambda-shape-required shape))
+       :arguments (loop repeat (+ (length (lambda-shape-required shape))
+                                  (length (lambda-shape-optional shape))) collect (gensym "ARGUMENT"))
+       :optional-count (when (lambda-shape-optional shape) (gensym "OPTIONAL-COUNT")))))
 
 (defun call-abi-parameters (abi)
   (if (method-call-abi-list-parameter abi)

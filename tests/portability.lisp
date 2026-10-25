@@ -54,7 +54,8 @@
                         (list "LOCAL-EFFECTS" '(7)) (list "LOCAL-ALIAS" '(7))
                         (list "FUNCTION-ROOT" (list #'+))
                         (list "CALL-VALUES"
-                              (list (getf (first (getf (snowgrave::closed-unit-compiler-data unit) :layouts)) :allocator)))
+                              (list (snowgrave::class-description-allocator
+                                     (first (snowgrave::unit-plan-layouts (snowgrave::closed-unit-plan unit))))))
                         (list "ESCAPED-CHOICE" (list root))))
         (check (eq :configuration-indirect-call
                    (handler-case

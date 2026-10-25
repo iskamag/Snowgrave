@@ -45,7 +45,7 @@
 (defun write-unit-source (unit stream)
   ;; PRINT-READABLY may select host reader extensions for specialized strings.
   ;; The source domain is already checked; standard escaped syntax is portable.
-  (let ((source-package (find-package (getf (closed-unit-compiler-data unit) :package)))
+  (let ((source-package (find-package (unit-plan-package (closed-unit-plan unit))))
         (*package* (find-package :cl)) (*print-readably* nil) (*print-escape* t)
         (*print-array* t) (*print-circle* t) (*print-pretty* t)
         (*print-level* nil) (*print-length* nil) (*print-base* 10))

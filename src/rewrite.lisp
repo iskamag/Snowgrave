@@ -1,62 +1,7 @@
 (in-package #:snowgrave)
 
-;;; This is a binding transformation over the host lexical walker. It does
-;;; not infer values, call effects, or fields, and never emits scratch code.
-
-(defparameter *unsupported-operations*
-  '(eval compile compile-file load fdefinition symbol-function
-    find-class class-of class-name change-class make-instances-obsolete
-    update-instance-for-redefined-class update-instance-for-different-class
-    ensure-generic-function add-method remove-method find-method
-    compute-applicable-methods function-lambda-expression
-    make-load-form progv))
-
-(defparameter *indirect-record-operations*
-  '(make-instance slot-value slot-boundp slot-makunbound typep
-    (setf slot-value)))
-
-(defparameter *representation-observers*
-  '(equalp sxhash describe inspect print-object print prin1 princ write
-    write-to-string prin1-to-string princ-to-string format))
-
-;; These are argument positions, not inferred values. A literal symbol in a
-;; standard callback position denotes a global function, even inside FLET.
-(defparameter *callback-arguments*
-  '((funcall 0) (apply 0) (multiple-value-call 0)
-    (mapcar 0) (mapc 0) (mapcan 0) (maplist 0) (mapl 0) (mapcon 0)
-    (map 1) (map-into 1) (maphash 0)
-    (every 0) (some 0) (notevery 0) (notany 0) (complement 0)
-    (reduce 0) (sort 1) (stable-sort 1) (merge 3)
-    (find-if 0) (find-if-not 0) (position-if 0) (position-if-not 0)
-    (count-if 0) (count-if-not 0) (remove-if 0) (remove-if-not 0)
-    (delete-if 0) (delete-if-not 0)
-    (substitute-if 1) (substitute-if-not 1)
-    (nsubstitute-if 1) (nsubstitute-if-not 1)
-    (member-if 0) (member-if-not 0) (assoc-if 0) (assoc-if-not 0)
-    (rassoc-if 0) (rassoc-if-not 0)
-    (subst-if 1) (subst-if-not 1) (nsubst-if 1) (nsubst-if-not 1)))
-
-;; The value is the first keyword argument position for the standard operator.
-(defparameter *callback-keywords*
-  '((find . 2) (find-if . 2) (find-if-not . 2)
-    (position . 2) (position-if . 2) (position-if-not . 2)
-    (count . 2) (count-if . 2) (count-if-not . 2)
-    (remove . 2) (remove-if . 2) (remove-if-not . 2)
-    (delete . 2) (delete-if . 2) (delete-if-not . 2)
-    (substitute . 3) (substitute-if . 3) (substitute-if-not . 3)
-    (nsubstitute . 3) (nsubstitute-if . 3) (nsubstitute-if-not . 3)
-    (remove-duplicates . 1) (delete-duplicates . 1)
-    (reduce . 2) (sort . 2) (stable-sort . 2) (merge . 4)
-    (search . 2) (mismatch . 2)
-    (member . 2) (member-if . 2) (member-if-not . 2)
-    (assoc . 2) (assoc-if . 2) (assoc-if-not . 2)
-    (rassoc . 2) (rassoc-if . 2) (rassoc-if-not . 2)
-    (adjoin . 2) (union . 2) (nunion . 2)
-    (intersection . 2) (nintersection . 2) (subsetp . 2)
-    (set-difference . 2) (nset-difference . 2)
-    (set-exclusive-or . 2) (nset-exclusive-or . 2)
-    (tree-equal . 2) (subst . 3) (nsubst . 3)
-    (subst-if . 3) (subst-if-not . 3) (nsubst-if . 3) (nsubst-if-not . 3)))
+;;; Rebuild owned source using the admitted bindings. Lexical traversal stays
+;;; in WALK-SOURCE-FORM; policy and name resolution stay in admission.lisp.
 
 (defun rewrite-callback-designators (form resolve)
   (let ((arguments (copy-list (rest form))) (changed nil))
@@ -78,24 +23,6 @@
                 when (member (nth position arguments) '(:key :test :test-not))
                   do (replace-at (1+ position))))))
     (if changed (cons (first form) arguments) form)))
-
-(defun allowed-function-p (build name phase)
-  (let ((symbol (if (consp name) (second name) name)))
-    (or (source-function-p build name)
-        (member name (getf (build-declaration build) :external-operations) :test #'equal)
-        (and (symbolp symbol)
-             (or (eq (symbol-package symbol) (find-package :cl))
-                 (eq (symbol-package symbol) (build-output-package build))
-                 (and (eq phase :open)
-                      (eq (symbol-package symbol) (build-open-package build))))))))
-
-(defun representation-sensitive-type-p (type)
-  (cond ((member type '(structure-object standard-object generic-function compiled-function)) t)
-        ;; Logical metadata are ordinary structures, not host metaobjects.
-        ;; Refuse these physical assertions until logical TYPEP is provided.
-        ((and (symbolp type) (find-class type nil)
-              (subtypep type 'closer-mop:metaobject)) t)
-        ((consp type) (some #'representation-sensitive-type-p type))))
 
 (defun rewrite-variable-name (build name phase)
   (if (member name (build-globals build)) (mapped-name build name phase) name))
@@ -143,8 +70,7 @@
    body))
 
 (defun rewrite-type (build type phase)
-  (when (and (eq phase :closed) (representation-sensitive-type-p type))
-    (unsupported :physical-type "Physical type ~S needs a logical representation check." type))
+  (check-source-type type phase)
   (cond ((source-class-p build type)
          (if (eq phase :open) (open-name build type)
              ;; DECLARE/THE class assertions are not logical TYPEP operations.
@@ -154,25 +80,6 @@
                               collect (class-description-type description)))))
         ((consp type) (cons (first type) (mapcar (lambda (x) (rewrite-type build x phase)) (rest type))))
         (t type)))
-
-(defun rewrite-function-reference (build name phase environment)
-  (cond ((source-local-function-p name environment) name)
-        ((eq name 'make-instance)
-         (unless (build-classes build)
-           (unsupported :external-construction "MAKE-INSTANCE needs an owned class universe."))
-         (record-make-instance-name build phase))
-        ((metadata-operation-name name) (metadata-function-name build name phase))
-        ((observation-function-name build name phase))
-        ((and (eq phase :closed)
-              (or (member name *indirect-record-operations* :test #'equal)
-                  (member name *unsupported-operations*)
-                  (and (build-classes build) (member name *representation-observers*))))
-         (unsupported :indirect-open-operation
-                      "Function reference ~S needs an explicit closed operation." name))
-        ((source-function-p build name) (mapped-name build name phase))
-        ((allowed-function-p build name phase) name)
-        (t (error 'unclosed-call :feature :external-call
-                  :detail (format nil "Function ~S is neither source-owned nor declared external." name)))))
 
 (defun rewrite-binding-form (build node phase)
   (case (first node)
@@ -199,10 +106,19 @@
 
 (defun rewrite-form (build form phase &key environment)
   (labels
-      ((walk (expression env)
+      ((call (name arguments lexical)
+         (cons name (mapcar (lambda (part) (walk part lexical)) arguments)))
+       (replacement (original new lexical)
+         (if (eq (first original) (first new))
+             (call (first new) (rest new) lexical)
+             (walk new lexical)))
+       (walk (expression env)
          (walk-source-form
           expression env
           (lambda (node context lexical)
+            (when (and (eq context :eval) (consp node)
+                       (not (source-local-function-p (first node) lexical)))
+              (check-source-operation build (first node) phase))
             (cond
               ((and (eq context :set) (symbolp node)) (rewrite-variable-name build node phase))
               ((not (eq context :eval)) node)
@@ -227,7 +143,7 @@
               ((eq (first node) 'function)
                (let ((target (second node)))
                  (if (function-name-p target)
-                     (values (list 'function (rewrite-function-reference build target phase lexical)) t)
+                     (values (list 'function (resolve-function-reference build target phase lexical)) t)
                      node)))
               ((member (first node) '(lambda let let* flet labels locally))
                (let ((replacement (rewrite-binding-form build node phase)))
@@ -237,36 +153,19 @@
                    (assoc (first node) *callback-keywords*))
                (let ((replacement (rewrite-callback-designators
                                    node (lambda (name environment)
-                                          (rewrite-function-reference build name phase environment)))))
+                                          (resolve-function-reference build name phase environment)))))
                  (if (eq replacement node) node
                      (values (walk replacement lexical) t))))
               ((metadata-operation-name (first node))
                (multiple-value-bind (replacement handled)
                    (metadata-operation-form build node phase)
-                 (if handled
-                     (values
-                      (if (eq (first replacement) (first node))
-                          (cons (first replacement)
-                                (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
-                          (walk replacement lexical))
-                      t)
-                     node)))
+                 (if handled (values (replacement node replacement lexical) t) node)))
               ((and (eq phase :closed) (build-classes build) (eq (first node) 'equalp))
-               (values (cons (observation-function-name build 'equalp phase)
-                             (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
-              ((and (eq phase :closed) (member (first node) *unsupported-operations*))
-               (unsupported :open-operation "Operation ~S has no closed source realization." (first node)))
-              ((and (eq phase :closed) (build-classes build)
-                    (member (first node) *representation-observers*))
-               (unsupported :representation-observation
-                            "~S needs a logical record observation implementation." (first node)))
+               (values (call (observation-function-name build 'equalp phase) (rest node) lexical) t))
               ((eq (first node) 'the)
                (values (list 'the (rewrite-type build (second node) phase)
                              (walk (third node) lexical)) t))
-              ((and (eq (first node) 'typep) (eq phase :closed)
-                    (quoted (third node))
-                    (representation-sensitive-type-p (second (third node))))
-               (unsupported :physical-type "Physical record types are not logical source types."))
+
               ((and (eq (first node) 'setf)
                     (loop for (place value) on (rest node) by #'cddr
                           thereis (and (consp place) (eq (first place) 'slot-value))))
@@ -286,27 +185,18 @@
                                                    ,@(when (cddr reader) (list slot)))))
                                      `(setf ,place ,value)))) lexical) t))
               ((member (first node) '(make-instance slot-value slot-boundp slot-makunbound typep))
+               (when (and (eq (first node) 'typep) (quoted (third node)))
+                 (check-source-type (second (third node)) phase))
                (multiple-value-bind (replacement handled)
                    (record-operation-form build node phase)
-                 (if handled
-                     ;; An open primitive can retain its operator. Other
-                     ;; replacements may introduce binders or dispatch calls.
-                     (values (if (and (eq phase :open)
-                                      (eq (first replacement) (first node)))
-                                 (cons (first replacement)
-                                       (mapcar (lambda (part) (walk part lexical)) (rest replacement)))
-                                 (walk replacement lexical)) t)
-                     node)))
-              ((and (symbolp (first node)) (source-function-p build (first node)))
-               (values (cons (mapped-name build (first node) phase)
-                             (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
+                 (if handled (values (replacement node replacement lexical) t) node)))
               ((and (symbolp (first node))
-                    (not (special-operator-p (first node)))
-                    (not (cl-environments:macro-function (first node) lexical)))
-               (unless (allowed-function-p build (first node) phase)
-                 (error 'unclosed-call :feature :external-call
-                        :detail (format nil "Call to undeclared function ~S." (first node))))
-               node)
+                    (or (source-function-p build (first node))
+                        (and (not (special-operator-p (first node)))
+                             (not (cl-environments:macro-function (first node) lexical)))))
+               (let ((name (resolve-ordinary-function build (first node) phase lexical)))
+                 (if (eq name (first node)) node
+                     (values (call name (rest node) lexical) t))))
               (t node))))))
     (walk form environment)))
 

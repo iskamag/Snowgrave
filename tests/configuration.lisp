@@ -128,3 +128,30 @@
                    (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
              "Configured entry admitted new components")
       (check (eq make-instance (fdefinition 'make-instance)) "Binding changed CL:MAKE-INSTANCE"))))
+
+(defun configuration-contour-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture :configuration-contours
+                    "((defgeneric classify (value))
+                       (defmethod classify ((value integer)) :integer)
+                       (defmethod classify ((value symbol)) :symbol)
+                       (defun add-one (n) (+ n 1))
+                       (defun apply-one (function n) (funcall function n))
+                       (defun named-call (n) (apply-one #'add-one n))
+                       (defun entry (data)
+                         (let ((value (aref data 0)))
+                           (values (locally (declare (type integer value)) (classify value))
+                                   (classify value)))))"
+                    "(entry named-call)" "((entry (vector)) (named-call (integer)))" "(classify)" :universe "(integer symbol)")
+    (compare-entry unit package "ENTRY" (list (vector 7)) '((:integer :integer) nil))
+    (compare-entry unit package "NAMED-CALL" '(7) '((8) nil))
+    (check (= 8 (funcall (snowgrave:bind-entry unit (find-symbol "NAMED-CALL" package) '(7))))
+           "Known owned callable lost its specialization identity")
+    ;; The local declaration cannot justify specializing the later call. DATA is
+    ;; borrowed mutable storage, so its sampled element supplies no lasting fact.
+    (check (eq :configuration-dispatch
+               (handler-case
+                   (progn (snowgrave:bind-entry unit (find-symbol "ENTRY" package)
+                                               (list (vector 7))) nil)
+                 (snowgrave:snowgrave-error (condition) (snowgrave:error-feature condition))))
+           "Local type declarations escaped their lexical contour")))
