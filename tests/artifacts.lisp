@@ -215,3 +215,54 @@ SBCL announces these as STYLE-WARNINGs, so a plain WARNING handler misses them."
                     (observed-call (snowgrave:unit-function unit (find-symbol "ENTRY" package))
                                    (list made)))
              "Logical EQUALP or literal slot read changed behaviour"))))
+
+(defun package-replay-test ()
+  "A unit printed with single-colon qualifiers must still read back in a fresh
+image where the original source package is gone: that is how the fresh-source
+replay phase loads an artifact. An external client's own package is the case
+that matters, since it is absent from the child yet its symbols appear
+single-colon."
+  (let* ((index (incf *fixture-sequence*))
+         (source-name (format nil "SNOWGRAVE.REPLAY.~D" index))
+         (source-package (make-package source-name :use '("COMMON-LISP")))
+         (external (intern "EXTERNAL-KEY" source-package))
+         (entry (intern "ENTRY" source-package))
+         (unit (snowgrave:close-source-unit
+                (list :forms (list `(defun ,entry () ',external)))
+                :unit-name (list :replay source-name)
+                :entries (list entry)
+                :external-domains (list (list entry nil))))
+         (closed-package (snowgrave::unit-plan-package (snowgrave::closed-unit-plan unit)))
+         (closed-name (getf (find entry (getf (snowgrave:unit-metadata unit) :entries)
+                                  :key (lambda (row) (getf row :name)))
+                            :code-key))
+         (path (merge-pathnames (format nil "snowgrave-replay-~D.lisp" index)
+                                (uiop:temporary-directory)))
+         (driver (merge-pathnames (format nil "snowgrave-replay-~D-run.lisp" index)
+                                  (uiop:temporary-directory))))
+    (export external source-package)
+    (unwind-protect
+         (progn
+           (with-open-file (stream path :direction :output :if-exists :supersede)
+             (snowgrave:write-unit-source unit stream))
+           ;; The child never loads Snowgrave and deletes the source package.
+           (with-open-file (stream driver :direction :output :if-exists :supersede)
+             (format stream "~
+(when (find-package \"SNOWGRAVE\") (error \"Snowgrave leaked into the child\"))
+(when (find-package ~S) (error \"The source package still exists\"))
+(load ~S)
+(let ((result (funcall (fdefinition (find-symbol ~S ~S)))))
+  (unless (string= result ~S)
+    (error \"The quoted external symbol changed: ~S\" result))
+  (write-line \"REPLAY-OK\"))
+" source-name (namestring path)
+                     (second closed-name) closed-package (symbol-name external) nil))
+           (let ((output (uiop:run-program
+                          (list "sbcl" "--noinform" "--no-sysinit" "--no-userinit"
+                                "--disable-debugger" "--script" (namestring driver))
+                          :output :string :ignore-error-status t)))
+             (check (search "REPLAY-OK" output)
+                    "Fresh replay of a deleted source package failed: ~A"
+                    (subseq output 0 (min 400 (length output))))))
+      (ignore-errors (delete-file path))
+      (ignore-errors (delete-file driver)))))

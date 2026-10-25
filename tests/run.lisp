@@ -25,6 +25,7 @@
     (write-only-slot-test)
     (string-literal-pool-test)
     (self-contained-artifact-tests)
+    (package-replay-test)
     (rejection-tests)
     (admission-boundary-tests)
     (lifecycle-tests)
