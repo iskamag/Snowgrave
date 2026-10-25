@@ -11,6 +11,7 @@
     (literal-scale-tests)
     (configuration-tests)
     (configuration-contour-tests)
+    (configuration-shared-helper-tests)
     (portable-source-tests)
     (control-tests)
     (binding-tests)

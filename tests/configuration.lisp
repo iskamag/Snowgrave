@@ -137,3 +137,42 @@
     (check-signals (snowgrave:snowgrave-error :configuration-dispatch)
       (snowgrave:bind-entry unit (find-symbol "ENTRY" package) (list (vector 7)))
       "Local type declarations escaped their lexical contour")))
+
+(defun configuration-shared-helper-tests ()
+  ;; Two branches share the same next helper at each level. Runtime follows
+  ;; only one branch, so this is a linear computation and a linear source DAG.
+  ;; Forcing every specialized helper inline expands it into a binary tree;
+  ;; GenImmix's minor/escalation graph exhausted a 2GiB SBCL compile heap that way.
+  (let* ((depth 12)
+         (source
+           (with-output-to-string (out)
+             (format out "((defgeneric finish (n)) (defmethod finish ((n integer)) n)
+                          (defun h0 (data n) (declare (ignore data) (type integer n)) (finish n))")
+             (loop for i from 1 to depth do
+               (format out " (defun h~D (data n) (declare (type integer n))
+                             (if (zerop (aref data 0))
+                                 (h~D data (+ n 1)) (h~D data (- n 1))))" i (1- i) (1- i)))
+             (format out " (defun entry (data) (h~D data 0)))" depth))))
+    (multiple-value-bind (unit package)
+        (make-fixture :shared-configured-helpers source "(entry)" "((entry (vector)))" "(finish)"
+                      :universe "(integer)")
+      (let* ((data (vector 0)) (entry (find-symbol "ENTRY" package))
+             (before (test-bytes-consed))
+             (bound (snowgrave:bind-entry unit entry (list data)))
+             (allocated (when before (- (test-bytes-consed) before)))
+             (selector (snowgrave::generic-plan-name
+                        (first (snowgrave::unit-plan-generics (snowgrave::closed-unit-plan unit)))))
+             (original (fdefinition selector)))
+        ;; Generous headroom over the measured ~5MiB cold bind. This detects
+        ;; compiler expansion without a machine-speed-dependent timing limit.
+        #+sbcl (check (< allocated (* 128 1024 1024))
+                      "Shared configured DAG consumed ~D compilation bytes" allocated)
+        #-sbcl (declare (ignore allocated))
+        (unwind-protect
+             (progn
+               (setf (fdefinition selector)
+                     (lambda (&rest args) (declare (ignore args)) (error "Residual method selector")))
+               (check (= depth (funcall bound)) "Configured shared helper lost direct method selection")
+               (setf (aref data 0) 1)
+               (check (= (- depth) (funcall bound)) "Configured shared helper sampled mutable branch data"))
+          (setf (fdefinition selector) original))))))

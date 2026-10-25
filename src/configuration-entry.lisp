@@ -23,7 +23,9 @@
                    "Configured entry returns an escaping callable value."))
     (let ((definitions (mapcar #'specialization-source
                                (nreverse (configuration-emitted configuration)))))
-      (proclaim `(inline ,@(mapcar #'second definitions)))
+      ;; These are already direct specialized calls. Forcing every helper
+      ;; INLINE duplicates shared call graphs (including escalation paths) and
+      ;; can exhaust the host compiler before a bound entry is produced.
       (dolist (definition definitions) (compile-definition definition))
       (compile-function (configuration-entry configuration) `(lambda () ,body)
                         :configuration-compilation))))

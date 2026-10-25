@@ -74,6 +74,10 @@ Admission policies select bindings and reject unsupported operations. The
 rewriter rebuilds expressions during the existing lexical traversal; it does
 not run another macro-expansion pass. Configured specialization uses explicit
 lexical fact contours and lambda sources, separate from host walker environments.
+Selected calls remain direct named helper calls; the binder does not force all
+helpers inline. Shared branch and escalation graphs must remain shared rather
+than expand into exponential compiler input. Host inlining remains a compiler
+choice, separate from eliminating runtime method selection.
 
 A successful closed unit retains
 ordinary source, functions, metadata, and specialization recipes. Open MOP
