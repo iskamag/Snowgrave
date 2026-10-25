@@ -79,9 +79,6 @@
                   do (replace-at (1+ position))))))
     (if changed (cons (first form) arguments) form)))
 
-(defun local-function-p (name environment)
-  (source-local-function-p name environment))
-
 (defun allowed-function-p (build name phase)
   (let ((symbol (if (consp name) (second name) name)))
     (or (source-function-p build name)
@@ -89,9 +86,8 @@
         (and (symbolp symbol)
              (or (eq (symbol-package symbol) (find-package :cl))
                  (eq (symbol-package symbol) (build-output-package build))
-                 (and (eq phase :open) (eq (symbol-package symbol) (build-open-package build)))
-)))))
-
+                 (and (eq phase :open)
+                      (eq (symbol-package symbol) (build-open-package build))))))))
 
 (defun representation-sensitive-type-p (type)
   (cond ((member type '(structure-object standard-object generic-function compiled-function)) t)
@@ -148,7 +144,7 @@
 
 (defun rewrite-type (build type phase)
   (when (and (eq phase :closed) (representation-sensitive-type-p type))
-    (unsupported build :physical-type "Physical type ~S needs a logical representation check." type))
+    (unsupported :physical-type "Physical type ~S needs a logical representation check." type))
   (cond ((source-class-p build type)
          (if (eq phase :open) (open-name build type)
              ;; DECLARE/THE class assertions are not logical TYPEP operations.
@@ -159,29 +155,51 @@
         ((consp type) (cons (first type) (mapcar (lambda (x) (rewrite-type build x phase)) (rest type))))
         (t type)))
 
+(defun rewrite-function-reference (build name phase environment)
+  (cond ((source-local-function-p name environment) name)
+        ((eq name 'make-instance)
+         (unless (build-classes build)
+           (unsupported :external-construction "MAKE-INSTANCE needs an owned class universe."))
+         (record-make-instance-name build phase))
+        ((metadata-operation-name name) (metadata-function-name build name phase))
+        ((observation-function-name build name phase))
+        ((and (eq phase :closed)
+              (or (member name *indirect-record-operations* :test #'equal)
+                  (member name *unsupported-operations*)
+                  (and (build-classes build) (member name *representation-observers*))))
+         (unsupported :indirect-open-operation
+                      "Function reference ~S needs an explicit closed operation." name))
+        ((source-function-p build name) (mapped-name build name phase))
+        ((allowed-function-p build name phase) name)
+        (t (error 'unclosed-call :feature :external-call
+                  :detail (format nil "Function ~S is neither source-owned nor declared external." name)))))
+
+(defun rewrite-binding-form (build node phase)
+  (case (first node)
+    (lambda
+     (list* 'lambda (rewrite-lambda-bindings build (second node) phase)
+            (rewrite-body-declarations build (cddr node) phase)))
+    ((let let*)
+     (list* (first node)
+            (mapcar (lambda (binding)
+                      (if (symbolp binding) (rewrite-variable-name build binding phase)
+                          (cons (rewrite-variable-name build (first binding) phase) (rest binding))))
+                    (second node))
+            (rewrite-body-declarations build (cddr node) phase)))
+    ((flet labels)
+     (list* (first node)
+            (mapcar (lambda (definition)
+                      (list* (first definition)
+                             (rewrite-lambda-bindings build (second definition) phase)
+                             (rewrite-body-declarations build (cddr definition) phase)))
+                    (second node))
+            (rewrite-body-declarations build (cddr node) phase)))
+    (locally
+     (cons 'locally (rewrite-body-declarations build (rest node) phase)))))
+
 (defun rewrite-form (build form phase &key environment)
   (labels
-      ((function-reference (name env)
-         (cond ((local-function-p name env) name)
-               ((eq name 'make-instance)
-                (unless (build-classes build)
-                  (unsupported build :external-construction "MAKE-INSTANCE needs an owned class universe."))
-                (record-make-instance-name build phase))
-               ((metadata-operation-name name)
-                (metadata-function-name build name phase))
-               ((observation-function-name build name phase))
-               ((and (eq phase :closed)
-                     (or (member name *indirect-record-operations* :test #'equal)
-                         (member name *unsupported-operations*)
-                         (and (build-classes build)
-                              (member name *representation-observers*))))
-                (unsupported build :indirect-open-operation
-                             "Function reference ~S needs an explicit closed operation." name))
-               ((source-function-p build name) (mapped-name build name phase))
-               ((allowed-function-p build name phase) name)
-               (t (error 'unclosed-call :feature :external-call
-                         :detail (format nil "Function ~S is neither source-owned nor declared external." name)))))
-       (walk (expression env)
+      ((walk (expression env)
          (walk-source-form
           expression env
           (lambda (node context lexical)
@@ -209,36 +227,17 @@
               ((eq (first node) 'function)
                (let ((target (second node)))
                  (if (function-name-p target)
-                     (values (list 'function (function-reference target lexical)) t)
+                     (values (list 'function (rewrite-function-reference build target phase lexical)) t)
                      node)))
               ((member (first node) '(lambda let let* flet labels locally))
-               (let ((replacement
-                       (case (first node)
-                         (lambda
-                          (list* 'lambda (rewrite-lambda-bindings build (second node) phase)
-                                 (rewrite-body-declarations build (cddr node) phase)))
-                         ((let let*)
-                          (list* (first node)
-                                 (mapcar (lambda (binding)
-                                           (if (symbolp binding) (rewrite-variable-name build binding phase)
-                                               (cons (rewrite-variable-name build (first binding) phase) (rest binding))))
-                                         (second node))
-                                 (rewrite-body-declarations build (cddr node) phase)))
-                         ((flet labels)
-                          (list* (first node)
-                                 (mapcar (lambda (definition)
-                                           (list* (first definition)
-                                                  (rewrite-lambda-bindings build (second definition) phase)
-                                                  (rewrite-body-declarations build (cddr definition) phase)))
-                                         (second node))
-                                 (rewrite-body-declarations build (cddr node) phase)))
-                         (locally
-                          (cons 'locally (rewrite-body-declarations build (rest node) phase))))))
+               (let ((replacement (rewrite-binding-form build node phase)))
                  (if (equal replacement node) node replacement)))
-              ((and (symbolp (first node)) (local-function-p (first node) lexical)) node)
+              ((and (symbolp (first node)) (source-local-function-p (first node) lexical)) node)
               ((or (assoc (first node) *callback-arguments*)
                    (assoc (first node) *callback-keywords*))
-               (let ((replacement (rewrite-callback-designators node #'function-reference)))
+               (let ((replacement (rewrite-callback-designators
+                                   node (lambda (name environment)
+                                          (rewrite-function-reference build name phase environment)))))
                  (if (eq replacement node) node
                      (values (walk replacement lexical) t))))
               ((metadata-operation-name (first node))
@@ -256,10 +255,10 @@
                (values (cons (observation-function-name build 'equalp phase)
                              (mapcar (lambda (part) (walk part lexical)) (rest node))) t))
               ((and (eq phase :closed) (member (first node) *unsupported-operations*))
-               (unsupported build :open-operation "Operation ~S has no closed source realization." (first node)))
+               (unsupported :open-operation "Operation ~S has no closed source realization." (first node)))
               ((and (eq phase :closed) (build-classes build)
                     (member (first node) *representation-observers*))
-               (unsupported build :representation-observation
+               (unsupported :representation-observation
                             "~S needs a logical record observation implementation." (first node)))
               ((eq (first node) 'the)
                (values (list 'the (rewrite-type build (second node) phase)
@@ -267,7 +266,7 @@
               ((and (eq (first node) 'typep) (eq phase :closed)
                     (quoted (third node))
                     (representation-sensitive-type-p (second (third node))))
-               (unsupported build :physical-type "Physical record types are not logical source types."))
+               (unsupported :physical-type "Physical record types are not logical source types."))
               ((and (eq (first node) 'setf)
                     (loop for (place value) on (rest node) by #'cddr
                           thereis (and (consp place) (eq (first place) 'slot-value))))

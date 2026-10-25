@@ -9,10 +9,8 @@
 (asdf:load-system "snowgrave")
 (asdf:load-system "snowgrave/host-tools")
 
-(defparameter *probe-clamsara*
-  (uiop:ensure-directory-pathname
-   (or (uiop:getenv "SNOWGRAVE_CLAMSARA_ROOT") (first (uiop:command-line-arguments))
-       (merge-pathnames "../Clamsara/.worktrees/sane-engine/" *probe-repository*))))
+(load (merge-pathnames "scripts/clamsara-source.lisp" *probe-repository*))
+(defparameter *probe-clamsara* (snowgrave.clamsara-source:clamsara-checkout))
 (defparameter *probe-source* (merge-pathnames "engine/index-set.lisp" *probe-clamsara*))
 (defparameter *probe-source-text* (uiop:read-file-string *probe-source*))
 (unless (find-package "CLAMSARA") (make-package "CLAMSARA" :use '("COMMON-LISP")))

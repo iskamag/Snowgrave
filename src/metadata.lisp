@@ -3,34 +3,29 @@
 ;; A sealed class table is ordinary emitted data. These queries expose the
 ;; logical source layout, never the implementation's DEFSTRUCT metaobjects.
 (defparameter *metadata-operations*
-  '(class-of find-class class-name closer-mop:finalize-inheritance closer-mop:class-slots
-    closer-mop:slot-definition-name closer-mop:slot-definition-allocation
-    closer-mop:slot-definition-type))
+  '((class-of . %metadata-class-of)
+    (find-class . %metadata-find-class)
+    (class-name . %metadata-class-name)
+    (closer-mop:finalize-inheritance . %metadata-finalize-inheritance)
+    (closer-mop:class-slots . %metadata-class-slots)
+    (closer-mop:slot-definition-name . %metadata-slot-name)
+    (closer-mop:slot-definition-allocation . %metadata-slot-allocation)
+    (closer-mop:slot-definition-type . %metadata-slot-type)))
 
 (defun metadata-operation-name (symbol)
-  (when (symbolp symbol)
-    ;; Match actual MOP symbol identities, never unrelated namesakes.
-    (find symbol *metadata-operations* :test #'eq)))
+  ;; Match actual MOP symbol identities, never unrelated namesakes.
+  (car (assoc symbol *metadata-operations*)))
 
 (defun metadata-function-name (build operation phase)
-  (let ((canonical (metadata-operation-name operation)))
-    (unless canonical
-      (unsupported build :metadata-operation "Unsupported metadata operation ~S." operation))
-    (if (eq phase :open)
-        (if (eq canonical 'find-class)
-            (unsupported build :indirect-class-lookup
+  (let ((binding (assoc operation *metadata-operations*)))
+    (unless binding
+      (unsupported :metadata-operation "Unsupported metadata operation ~S." operation))
+    (if (eq phase :closed)
+        (closed-name build (cdr binding))
+        (if (eq operation 'find-class)
+            (unsupported :indirect-class-lookup
                          "An indirect FIND-CLASS needs an explicit builder name mapping.")
-            canonical)
-        (closed-name build
-                     (ecase canonical
-                       (class-of '%metadata-class-of)
-                       (find-class '%metadata-find-class)
-                       (class-name '%metadata-class-name)
-                       (closer-mop:finalize-inheritance '%metadata-finalize-inheritance)
-                       (closer-mop:class-slots '%metadata-class-slots)
-                       (closer-mop:slot-definition-name '%metadata-slot-name)
-                       (closer-mop:slot-definition-allocation '%metadata-slot-allocation)
-                       (closer-mop:slot-definition-type '%metadata-slot-type))))))
+            operation))))
 
 (defun metadata-operation-form (build form phase)
   (let ((operation (metadata-operation-name (first form))))
@@ -42,7 +37,7 @@
                (let ((name (gensym "CLASS-NAME")))
                  `(find-class
                    (let ((,name ,(second form)))
-                     (or (cdr (assoc ,name ,(record-open-class-registry-name build) :test #'eq))
+                     (or (cdr (assoc ,name ,(open-name build '%source-class-names) :test #'eq))
                          ,name))
                    ,@(cddr form)))
                (cons operation (rest form))))
@@ -66,12 +61,6 @@
 (defun closed-class-token-form (build source-class)
   `(,(metadata-function-name build 'find-class :closed) ',source-class))
 
-(defun metadata-class-constructor-name (build)
-  (closed-name build '%metadata-class-constructor))
-
-(defun closed-constructor-function-form (build class-form)
-  `(,(metadata-class-constructor-name build) ,class-form))
-
 (defun emit-metadata (build)
   (let* ((class-type (closed-name build '%logical-class))
          (class-maker (closed-name build '%make-logical-class))
@@ -94,14 +83,6 @@
          (depth (gensym "DEPTH"))
          (standard (gensym "STANDARD-CLASS"))
          (effective (gensym "EFFECTIVE-SLOT-CLASS")))
-    ;; A custom effective slot definition can change the very facts being
-    ;; checked. Refuse it instead of falsely labeling it a stock descriptor.
-    (dolist (description (build-layouts build))
-      (dolist (slot (closer-mop:class-slots (class-description-open-class description)))
-        (unless (eq (class-of slot) (find-class 'closer-mop:standard-effective-slot-definition))
-          (unsupported build :slot-metaclass
-                       "Slot ~S of ~S requires a stock effective slot definition."
-                       (closer-mop:slot-definition-name slot) (class-description-name description)))))
     (emit-form build
                `(defstruct (,class-type (:constructor ,class-maker
                                             (,class-name ,class-slots ,class-owned-p ,class-constructor))
@@ -141,7 +122,7 @@
                                                                :instance ',(slot-description-type slot))))
                                       t #',(class-description-constructor description))))))))
     (emit-form build
-               `(defun ,(metadata-class-constructor-name build) (,object)
+               `(defun ,(closed-name build '%metadata-class-constructor) (,object)
                   (unless (and (,class-p ,object) (,class-owned-p ,object))
                     (error "Only owned classes have closed constructors."))
                   (,class-constructor ,object)))

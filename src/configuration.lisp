@@ -5,7 +5,8 @@
 ;;; mutable. Source specialization selects EMFs and physical slots from declared
 ;;; roles and lexical facts. An unresolved selector is rejected before compilation.
 
-(defstruct configuration unit roots roles fields objects names functions specializations emitted
+(defstruct configuration
+  unit roles fields entry functions specializations emitted
   (captures (make-array 0 :adjustable t :fill-pointer 0))
   (identities (make-hash-table :test #'eq)))
 (defvar *configuration-sequence* 0)
@@ -27,59 +28,71 @@
 
 (defun configuration-slot (layout name)
   (or (find name (getf layout :slots) :key (lambda (slot) (getf slot :name)))
-      (unsupported nil :configuration-slot "~S has no slot ~S." (getf layout :name) name)))
+      (unsupported :configuration-slot "~S has no slot ~S." (getf layout :name) name)))
+
+(defun validate-role-declarations (unit declarations)
+  (dolist (declaration declarations)
+    (let ((layout (find (first declaration) (getf (closed-unit-compiler-data unit) :layouts)
+                        :key (lambda (layout) (getf layout :name)))))
+      (unless layout
+        (unsupported :configuration-class "Unknown role class ~S." (first declaration)))
+      (dolist (group (rest declaration))
+        (dolist (slot (if (symbolp group) (list group) group))
+          (configuration-slot layout slot))))))
+
+(defun configuration-role-values (unit layout object slots)
+  (mapcar (lambda (slot)
+            (unless (logbitp (getf slot :index) (funcall (getf layout :bound) object))
+              (unsupported :unbound-role "Configuration role ~S is unbound." (getf slot :name)))
+            (let ((value (funcall (getf slot :field) object)))
+              (unless (or (null value) (configuration-layout unit value))
+                (unsupported :configuration-role
+                             "Role ~S needs an owned component or NIL, got ~S."
+                             (getf slot :name) (type-of value)))
+              value))
+          slots))
+
+(defun register-role-group (configuration layout object group)
+  (let* ((names (if (symbolp group) (list group) group))
+         (slots (mapcar (lambda (name) (configuration-slot layout name)) names))
+         (values (configuration-role-values (configuration-unit configuration) layout object slots))
+         (allowed (remove-duplicates values))
+         (roles (configuration-roles configuration))
+         (fields (configuration-fields configuration)))
+    (dolist (slot slots)
+      (when (assoc (getf slot :name) (gethash object roles))
+        (unsupported :configuration-role "Repeated role ~S." (getf slot :name)))
+      (push (cons (getf slot :name) allowed) (gethash object roles))
+      (push (cons object allowed) (gethash (getf slot :field) fields)))
+    values))
 
 (defun prepare-configuration (unit roots declarations)
-  (let ((roles (make-hash-table :test #'eq)) (fields (make-hash-table :test #'eq))
+  (validate-role-declarations unit declarations)
+  (let ((configuration (make-configuration
+                        :unit unit
+                        :roles (make-hash-table :test #'eq)
+                        :fields (make-hash-table :test #'eq)
+                        :functions (make-hash-table :test #'equal)
+                        :specializations (make-hash-table :test #'equal)))
         (seen (make-hash-table :test #'eq)))
-    (dolist (declaration declarations)
-      (let ((layout (find (first declaration) (getf (closed-unit-compiler-data unit) :layouts)
-                          :key (lambda (layout) (getf layout :name)))))
-        (unless layout
-          (unsupported nil :configuration-class "Unknown role class ~S." (first declaration)))
-        (dolist (group (rest declaration))
-          (dolist (slot (if (symbolp group) (list group) group)) (configuration-slot layout slot)))))
     (labels ((visit (object)
                (let ((layout (configuration-layout unit object)))
                  (when (and layout (not (gethash object seen)))
-                   (setf (gethash object seen) layout)
+                   (setf (gethash object seen) t)
                    (dolist (declaration declarations)
                      (when (member (first declaration) (getf layout :cpl))
                        (dolist (group (rest declaration))
-                         (let* ((slots (mapcar (lambda (name) (configuration-slot layout name))
-                                              (if (symbolp group) (list group) group)))
-                                (values
-                                  (mapcar (lambda (slot)
-                                            (unless (logbitp (getf slot :index)
-                                                             (funcall (getf layout :bound) object))
-                                              (unsupported nil :unbound-role "Configuration role ~S is unbound."
-                                                           (getf slot :name)))
-                                            (let ((value (funcall (getf slot :field) object)))
-                                              (unless (or (null value) (configuration-layout unit value))
-                                                (unsupported nil :configuration-role
-                                                             "Role ~S needs an owned component or NIL, got ~S."
-                                                             (getf slot :name) (type-of value)))
-                                              value)) slots)))
-                           (loop for slot in slots
-                                 for existing = (assoc (getf slot :name) (gethash object roles))
-                                 do (when existing
-                                      (unsupported nil :configuration-role "Repeated role ~S." (getf slot :name)))
-                                    (push (cons (getf slot :name) (remove-duplicates values)) (gethash object roles))
-                                    (push (cons object (remove-duplicates values)) (gethash (getf slot :field) fields)))
-                           (mapc #'visit values)))))))))
+                         (mapc #'visit (register-role-group configuration layout object group)))))))))
       (mapc #'visit roots))
-    (make-configuration :unit unit :roots roots :roles roles :fields fields :objects seen
-                        :names (make-hash-table :test #'equal)
-                        :functions (make-hash-table :test #'equal)
-                        :specializations (make-hash-table :test #'equal))))
+    configuration))
 
 (defun check-configuration-arguments (unit entry arguments)
   (let ((domains (second (assoc entry (getf (closed-unit-compiler-data unit) :entries) :test #'equal))))
     (unless (= (length domains) (length arguments))
-      (unsupported nil :configuration-arguments "Entry ~S expects ~D arguments." entry (length domains)))
+      (unsupported :configuration-arguments "Entry ~S expects ~D arguments." entry (length domains)))
     (loop for argument in arguments for domain in domains
           unless (typep argument domain)
-            do (unsupported nil :configuration-arguments "Argument for ~S does not satisfy ~S." entry domain))))
+            do (unsupported :configuration-arguments "Argument for ~S does not satisfy ~S." entry domain))))
 
 (defun configuration-role-guard (rows object &optional value writep)
   `(cond ,@(loop for (owner . allowed) in rows
@@ -113,40 +126,51 @@
        (dolist (slot slots)
          (let ((old (assoc (car slot) (gethash object previous))))
            (when (and old (or (set-difference (cdr slot) (cdr old)) (set-difference (cdr old) (cdr slot))))
-             (unsupported nil :configuration-seal "Binding would change an existing role seal for ~S." (car slot))))))
+             (unsupported :configuration-seal "Binding would change an existing role seal for ~S." (car slot))))))
      (configuration-roles configuration))))
 
-(defun publish-configuration-seals (configuration)
-  (let* ((unit (configuration-unit configuration)) (registry (make-hash-table :test #'eq)) (wrappers nil))
-    (maphash (lambda (object slots) (setf (gethash object registry) (copy-list slots))) (closed-unit-seals unit))
+(defun merged-configuration-seals (configuration)
+  (let ((registry (make-hash-table :test #'eq)))
+    (maphash (lambda (object slots) (setf (gethash object registry) (copy-list slots)))
+             (closed-unit-seals (configuration-unit configuration)))
     (maphash (lambda (object slots)
                (dolist (slot slots) (pushnew slot (gethash object registry) :key #'car)))
              (configuration-roles configuration))
-    (dolist (plan (getf (closed-unit-compiler-data unit) :slots))
-      (when (member (getf plan :operation) '(:write :unbind))
-        (let* ((name (getf plan :name))
-               (rows (loop for object being the hash-keys of registry using (hash-value slots)
-                           for slot = (assoc (getf plan :slot) slots)
-                           when slot collect (cons object (cdr slot)))))
-          (when rows
-            (let ((original (or (gethash name (closed-unit-sealed-writers unit)) (fdefinition name)))
-                  (object (getf plan :object)) (value (getf plan :value)))
-              (multiple-value-bind (function warnings failure)
-                  (compile nil
-                             `(lambda ,(getf plan :arguments)
-                                (cond ,@(loop for (owner . allowed) in rows
-                                              collect `((eq ,object ,(configured-value configuration owner))
-                                                        ,(if (eq (getf plan :operation) :unbind)
-                                                             `(error "Cannot unbind a sealed component role.")
-                                                             `(unless (member ,value ,(configured-value configuration allowed) :test #'eq)
-                                                                (error "Cannot reconfigure a bound component role."))))))
-                                (funcall ,(configured-value configuration original) ,@(getf plan :arguments))))
-                (declare (ignore warnings))
-                (when failure
-                  (unsupported nil :configuration-seal "Cannot compile role guard ~S." name))
-                (push (list name original function) wrappers)))))))
+    registry))
+
+(defun compile-sealed-writer (configuration plan registry)
+  (let* ((unit (configuration-unit configuration))
+         (name (getf plan :name))
+         (object (getf plan :object))
+         (value (getf plan :value))
+         (rows (loop for owner being the hash-keys of registry using (hash-value slots)
+                     for slot = (assoc (getf plan :slot) slots)
+                     when slot collect (cons owner (cdr slot)))))
+    (when rows
+      (let* ((original (or (gethash name (closed-unit-sealed-writers unit)) (fdefinition name)))
+             (source
+               `(lambda ,(getf plan :arguments)
+                  (cond ,@(loop for (owner . allowed) in rows
+                                collect
+                                `((eq ,object ,(configured-value configuration owner))
+                                  ,(if (eq (getf plan :operation) :unbind)
+                                       `(error "Cannot unbind a sealed component role.")
+                                       `(unless (member ,value ,(configured-value configuration allowed) :test #'eq)
+                                          (error "Cannot reconfigure a bound component role."))))))
+                  (funcall ,(configured-value configuration original) ,@(getf plan :arguments)))))
+        (list name original (compile-function nil source :configuration-seal))))))
+
+(defun publish-configuration-seals (configuration)
+  (let* ((unit (configuration-unit configuration))
+         (registry (merged-configuration-seals configuration))
+         (wrappers
+           (loop for plan in (getf (closed-unit-compiler-data unit) :slots)
+                 when (member (getf plan :operation) '(:write :unbind))
+                   append (let ((wrapper (compile-sealed-writer configuration plan registry)))
+                            (when wrapper (list wrapper))))))
     ;; Complete compilation before publishing any changed function or seal.
     (dolist (wrapper wrappers)
-      (setf (gethash (first wrapper) (closed-unit-sealed-writers unit)) (second wrapper)
-            (fdefinition (first wrapper)) (third wrapper)))
+      (destructuring-bind (name original function) wrapper
+        (setf (gethash name (closed-unit-sealed-writers unit)) original
+              (fdefinition name) function)))
     (setf (closed-unit-seals unit) registry)))

@@ -1,9 +1,22 @@
-*.fasl
+# Local builds and research evidence
 .build/
 agent-board/
-paper/*.aux
-paper/*.bbl
-paper/*.blg
-paper/*.log
-paper/*.out
-paper/*.toc
+.nobs/
+.qlot/
+qlfile
+qlfile.lock
+
+# Compiled Lisp (implementation-specific)
+*.fasl
+*.fas
+*.fsl
+*.lx64fsl
+*.dx64fsl
+
+# Local specification and generated paper
+paper/
+
+# Editor recovery files
+*~
+\#*\#
+.\#*

@@ -54,5 +54,5 @@
            (closer-mop:compute-effective-method
             oracle (closer-mop:find-method-combination oracle 'source-standard nil) methods)
            (or *composition-source*
-               (unsupported nil :method-composition "The MOP did not invoke the source method combination.")))
+               (unsupported :method-composition "The MOP did not invoke the source method combination.")))
       (fmakunbound name))))

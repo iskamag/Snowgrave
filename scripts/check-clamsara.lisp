@@ -1,7 +1,7 @@
 ;;; Optional whole-source Clamsara integration gate, run in a fresh host process:
 ;;;   sbcl --dynamic-space-size 1024 --noinform --script scripts/check-clamsara.lisp \
 ;;;     /path/to/Clamsara/checkout /path/to/artifacts/
-;;; Defaults: sibling Clamsara/.worktrees/sane-engine and .build/clamsara/.
+;;; Supply the engine-rewrite checkout; artifacts default to .build/clamsara/.
 ;;; Closer MOP must be visible to ASDF; for a standalone checkout, set e.g.
 ;;; CL_SOURCE_REGISTRY=/path/to/closer-mop//: for this command.
 ;;; Exit zero requires native, closed, poisoned-original, fresh source, fresh
@@ -177,7 +177,7 @@
         (progn
           ;; Explicit ASD registration takes precedence over another checkout
           ;; in the source registry. Verify the resulting systems before load.
-          (asdf:load-asd (merge-pathnames "clamsara.asd" checkout))
+          (register-clamsara-checkout checkout)
           (dolist (name '("clamsara" "clamsara/word-memory" "clamsara/tests"))
             (unless (equal checkout (truename (asdf:system-source-directory name)))
               (error "ASDF resolved ~A outside the selected checkout" name)))
@@ -298,10 +298,7 @@
         1))))
 
 (let* ((arguments (uiop:command-line-arguments))
-       (checkout (truename (uiop:ensure-directory-pathname
-                            (or (uiop:getenv "SNOWGRAVE_CLAMSARA_ROOT") (first arguments)
-                                (merge-pathnames "../Clamsara/.worktrees/sane-engine/"
-                                                 cl-user::*snowgrave-root*)))))
+       (checkout (clamsara-checkout (first arguments)))
        (artifacts (uiop:ensure-directory-pathname
                    (or (uiop:getenv "SNOWGRAVE_ARTIFACTS") (second arguments) (merge-pathnames ".build/clamsara/" cl-user::*snowgrave-root*)))))
   (when (cddr arguments) (error "Usage: check-clamsara.lisp [checkout [artifacts]]"))

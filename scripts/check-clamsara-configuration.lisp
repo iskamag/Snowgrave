@@ -7,10 +7,8 @@
   (asdf:load-system "snowgrave")
   (asdf:load-system "snowgrave/host-tools")
   (load (merge-pathnames "scripts/clamsara-source.lisp" root))
-  (asdf:load-asd (merge-pathnames "clamsara.asd"
-                  (uiop:ensure-directory-pathname
-                   (or (uiop:getenv "SNOWGRAVE_CLAMSARA_ROOT") (first (uiop:command-line-arguments))
-                       (merge-pathnames "../Clamsara/.worktrees/sane-engine/" root))))))
+  (uiop:symbol-call :snowgrave.clamsara-source :register-clamsara-checkout
+                    (uiop:symbol-call :snowgrave.clamsara-source :clamsara-checkout)))
 (asdf:load-system "clamsara/word-memory")
 
 (defpackage #:snowgrave.clamsara-configuration
