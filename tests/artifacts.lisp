@@ -216,6 +216,28 @@ SBCL announces these as STYLE-WARNINGs, so a plain WARNING handler misses them."
                                    (list made)))
              "Logical EQUALP or literal slot read changed behaviour"))))
 
+(defun write-child-driver (stream form)
+  "Write FORM as a child driver, printed from CL-USER.
+The child has neither Snowgrave nor the test package, so any name interned in
+either would read back unqualified-but-unresolvable. Printing from CL-USER
+keeps the driver's own locals readable."
+  (let ((*package* (find-package :cl-user))
+        (*print-readably* nil)
+        (*print-circle* t))
+    (write form :stream stream)
+    (terpri stream)))
+
+(defun child-replay-succeeds-p (driver sentinel)
+  "Whether DRIVER runs in a fresh child and writes SENTINEL.
+A printed marker is not enough: a failing child echoes its own source in the
+backtrace, so a search would find the literal marker text in the failure."
+  (ignore-errors (delete-file sentinel))
+  (uiop:run-program
+   (list "sbcl" "--noinform" "--no-sysinit" "--no-userinit"
+         "--disable-debugger" "--script" (namestring driver))
+   :output :string :error-output :output :ignore-error-status t)
+  (probe-file sentinel))
+
 (defun package-replay-test ()
   "A unit printed with single-colon qualifiers must still read back in a fresh
 image where the original source package is gone: that is how the fresh-source
@@ -232,37 +254,107 @@ single-colon."
                 :unit-name (list :replay source-name)
                 :entries (list entry)
                 :external-domains (list (list entry nil))))
-         (closed-package (snowgrave::unit-plan-package (snowgrave::closed-unit-plan unit)))
-         (closed-name (getf (find entry (getf (snowgrave:unit-metadata unit) :entries)
-                                  :key (lambda (row) (getf row :name)))
-                            :code-key))
+         (closed (snowgrave::unit-plan-package (snowgrave::closed-unit-plan unit)))
+         (closed-name (second (getf (find entry (getf (snowgrave:unit-metadata unit) :entries)
+                                            :key (lambda (row) (getf row :name)))
+                                    :code-key)))
          (path (merge-pathnames (format nil "snowgrave-replay-~D.lisp" index)
                                 (uiop:temporary-directory)))
          (driver (merge-pathnames (format nil "snowgrave-replay-~D-run.lisp" index)
-                                  (uiop:temporary-directory))))
+                                  (uiop:temporary-directory)))
+         (sentinel (merge-pathnames (format nil "snowgrave-replay-~D-ok" index)
+                                    (uiop:temporary-directory)))
+         ;; The driver is read by a child, so its locals must be written as
+         ;; interned names the child will also have, never gensym syntax.
+         (resolved-name (intern "SNOWGRAVE-REPLAY-RESULT" :cl-user))
+         (stream-name (intern "SNOWGRAVE-REPLAY-STREAM" :cl-user)))
     (export external source-package)
     (unwind-protect
          (progn
            (with-open-file (stream path :direction :output :if-exists :supersede)
              (snowgrave:write-unit-source unit stream))
-           ;; The child never loads Snowgrave and deletes the source package.
            (with-open-file (stream driver :direction :output :if-exists :supersede)
-             (format stream "~
-(when (find-package \"SNOWGRAVE\") (error \"Snowgrave leaked into the child\"))
-(when (find-package ~S) (error \"The source package still exists\"))
-(load ~S)
-(let ((result (funcall (fdefinition (find-symbol ~S ~S)))))
-  (unless (string= result ~S)
-    (error \"The quoted external symbol changed: ~S\" result))
-  (write-line \"REPLAY-OK\"))
-" source-name (namestring path)
-                     (second closed-name) closed-package (symbol-name external) nil))
-           (let ((output (uiop:run-program
-                          (list "sbcl" "--noinform" "--no-sysinit" "--no-userinit"
-                                "--disable-debugger" "--script" (namestring driver))
-                          :output :string :ignore-error-status t)))
-             (check (search "REPLAY-OK" output)
-                    "Fresh replay of a deleted source package failed: ~A"
-                    (subseq output 0 (min 400 (length output))))))
+             (write-child-driver
+              stream
+              `(progn
+                 (when (find-package "SNOWGRAVE")
+                   (error "Snowgrave leaked into the child"))
+                 (when (find-package ,source-name)
+                   (error "The source package still exists"))
+                 (load ,(namestring path))
+                 (let ((,resolved-name
+                         (funcall (fdefinition (find-symbol ,closed-name ,closed)))))
+                   (unless (and (eq (symbol-package ,resolved-name)
+                                    (find-package ,source-name))
+                                (string= (symbol-name ,resolved-name) ,(symbol-name external)))
+                     (error "The quoted symbol resolved as ~S" ,resolved-name)))
+                 (with-open-file (,stream-name ,(namestring sentinel)
+                                               :direction :output
+                                               :if-exists :supersede)
+                   (write-line "ok" ,stream-name)))))
+           (check (child-replay-succeeds-p driver sentinel)
+                  "Fresh replay of a deleted source package failed"))
       (ignore-errors (delete-file path))
-      (ignore-errors (delete-file driver)))))
+      (ignore-errors (delete-file driver))
+      (ignore-errors (delete-file sentinel)))))
+
+(defun multi-package-replay-test ()
+  "A cohort quoting symbols from two different client packages must bootstrap
+both, so the artifact reads back where neither package exists. One package is
+not a strong enough test: each gets its own bootstrap form, and dropping or
+collapsing one shows up only with more than one."
+  (let* ((index (incf *fixture-sequence*))
+         (names (list (format nil "SNOWGRAVE.CLIENT-A.~D" index)
+                      (format nil "SNOWGRAVE.CLIENT-B.~D" index)))
+         (packages (mapcar (lambda (name) (make-package name :use '("COMMON-LISP"))) names))
+         (keys (mapcar (lambda (package) (intern "EXTERNAL-KEY" package)) packages))
+         (entry (intern "ENTRY" (make-package (format nil "SNOWGRAVE.ENTRY.~D" index)
+                                              :use '("COMMON-LISP"))))
+         (unit (snowgrave:close-source-unit
+                (list :forms (list `(defun ,entry () (values ,@(mapcar (lambda (key) `',key) keys)))))
+                :unit-name (list :multi index) :entries (list entry)
+                :external-domains (list (list entry nil))))
+         (closed (snowgrave::unit-plan-package (snowgrave::closed-unit-plan unit)))
+         (closed-name (second (getf (find entry (getf (snowgrave:unit-metadata unit) :entries)
+                                            :key (lambda (row) (getf row :name)))
+                                    :code-key)))
+         (path (merge-pathnames (format nil "snowgrave-multi-~D.lisp" index)
+                                (uiop:temporary-directory)))
+         (driver (merge-pathnames (format nil "snowgrave-multi-~D-run.lisp" index)
+                                  (uiop:temporary-directory)))
+         (sentinel (merge-pathnames (format nil "snowgrave-multi-~D-ok" index)
+                                    (uiop:temporary-directory)))
+         (resolved-name (intern "SNOWGRAVE-REPLAY-RESULT" :cl-user))
+         (symbol-name (intern "SNOWGRAVE-REPLAY-SYMBOL" :cl-user))
+         (stream-name (intern "SNOWGRAVE-REPLAY-STREAM" :cl-user)))
+    (dolist (package packages) (export (intern "EXTERNAL-KEY" package) package))
+    (unwind-protect
+         (progn
+           (with-open-file (stream path :direction :output :if-exists :supersede)
+             (snowgrave:write-unit-source unit stream))
+           (with-open-file (stream driver :direction :output :if-exists :supersede)
+             (write-child-driver
+              stream
+              `(progn
+                 (when (find-package "SNOWGRAVE")
+                   (error "Snowgrave leaked into the child"))
+                 ,@(loop for name in names
+                         collect `(when (find-package ,name)
+                                    (error "~A still exists" ,name)))
+                 (load ,(namestring path))
+                 (let ((,resolved-name
+                         (mapcar (lambda (,symbol-name)
+                                   (package-name (symbol-package ,symbol-name)))
+                                 (multiple-value-list
+                                  (funcall (fdefinition (find-symbol ,closed-name ,closed)))))))
+                   (unless (equal ,resolved-name (list ,@names))
+                     (error "Quoted client symbols resolved as ~S" ,resolved-name)))
+                 (with-open-file (,stream-name ,(namestring sentinel)
+                                               :direction :output
+                                               :if-exists :supersede)
+                   (write-line "ok" ,stream-name)))))
+           (check (child-replay-succeeds-p driver sentinel)
+                  "Replay of two deleted client packages failed"))
+      (ignore-errors (delete-file path))
+      (ignore-errors (delete-file driver))
+      (ignore-errors (delete-file sentinel)))))

@@ -26,6 +26,7 @@
     (string-literal-pool-test)
     (self-contained-artifact-tests)
     (package-replay-test)
+    (multi-package-replay-test)
     (rejection-tests)
     (admission-boundary-tests)
     (lifecycle-tests)
