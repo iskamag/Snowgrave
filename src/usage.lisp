@@ -16,9 +16,15 @@
 (defun usage-need-slot (usage operation slot)
   "Record that SLOT's OPERATION helper must exist, without implying a use."
   (when (eq operation :write) (usage-need-slot usage :read slot))
-  ;; Every reader signals the shared unbound-slot slow path.
+  ;; Every emitted reader can signal the shared unbound-slot slow path.
   (when (eq operation :read) (usage-mark-operation usage :unbound))
   (setf (gethash (cons operation slot) (usage-slots usage)) t))
+
+(defun usage-read-helper-p (usage)
+  "Whether any reader helper is emitted, and so the unbound-slot slow path too."
+  (or (usage-computed-p usage :read)
+      (loop for key being the hash-keys of (usage-slots usage)
+            thereis (eq (car key) :read))))
 
 (defun usage-mark-slot (usage operation slot)
   (usage-mark-operation usage operation)
@@ -29,6 +35,11 @@
     (usage-mark-operation usage :read)
     (setf (gethash :read (usage-computed usage)) t))
   (when (eq operation :read) (usage-mark-operation usage :unbound))
+  (usage-mark-operation usage operation)
+  (setf (gethash operation (usage-computed usage)) t))
+
+(defun usage-mark-symbol-dispatch (usage operation)
+  "Require OPERATION's runtime slot-name entry point."
   (usage-mark-operation usage operation)
   (setf (gethash operation (usage-computed usage)) t))
 
@@ -169,7 +180,7 @@
   "Whether a runtime slot-name entry point is reachable for OPERATION."
   (or (usage-computed-p usage operation)
       ;; %RECORD-UNBOUND's store-value restart calls the read dispatcher, and
-      ;; that dispatcher writes through (setf %RECORD-READ). Both dispatchers
-      ;; must exist whenever an unbound read is reachable.
-      (and (member operation '(:read :write))
-           (usage-operation-p usage :read))))
+      ;; that dispatcher stores through (setf %RECORD-READ). Both must exist as
+      ;; soon as any reader is emitted, even when no source call uses a
+      ;; runtime slot name.
+      (and (member operation '(:read :write)) (usage-read-helper-p usage))))

@@ -24,6 +24,7 @@
     (pruned-helper-tests)
     (write-only-slot-test)
     (string-literal-pool-test)
+    (self-contained-artifact-tests)
     (rejection-tests)
     (admission-boundary-tests)
     (lifecycle-tests)

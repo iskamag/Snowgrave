@@ -153,3 +153,65 @@
                   (not (search "RECIPE" (princ-to-string literal-form)))
                   (search "COPY-SEQ" (princ-to-string literal-form)))
              "A strings-only literal pool did not take the direct path"))))
+
+(defun undefined-reference-count (unit)
+  "Number of undefined functions compiling UNIT's emitted source reports.
+SBCL announces these as STYLE-WARNINGs, so a plain WARNING handler misses them."
+  (let* ((path (merge-pathnames
+                (format nil "snowgrave-undef-~D.lisp" (incf *fixture-sequence*))
+                (uiop:temporary-directory)))
+         (fasl (make-pathname :type "fasl" :defaults path))
+         (count 0))
+    (unwind-protect
+         (let ((*error-output* (make-broadcast-stream))
+               (*standard-output* (make-broadcast-stream)))
+           (with-open-file (stream path :direction :output :if-exists :supersede)
+             (snowgrave:write-unit-source unit stream))
+           (handler-bind (((or style-warning warning)
+                            (lambda (condition)
+                              (when (search "undefined function" (princ-to-string condition))
+                                (incf count)))))
+             (compile-file path :output-file fasl))
+           count)
+      (ignore-errors (delete-file path))
+      (ignore-errors (delete-file fasl)))))
+
+(defun emitted-defun-names (unit)
+  (loop for form in (snowgrave:unit-source unit)
+        when (and (consp form) (eq (first form) 'defun))
+          collect (second form)))
+
+(defun self-contained-artifact-tests ()
+  ;; A constructor writes its initform, so the unbound-slot slow path is
+  ;; emitted. That slow path's store-value restart calls the runtime symbol
+  ;; dispatchers, which must therefore be emitted too, even though no source
+  ;; form ever reads a slot.
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :self-contained
+       "((defclass cell () ((value :initform 1)))
+          (defun entry () (let ((object (make-instance 'cell)))
+                            (declare (ignore object))
+                            :ok)))"
+       "(entry)" "((entry ()))" "()" :universe "(cell)")
+    (declare (ignore package))
+    (check (zerop (undefined-reference-count unit))
+           "Emitted source referenced an undefined function"))
+  ;; The logical EQUALP comparator calls the logical metadata predicates, so a
+  ;; unit whose only class use is EQUALP still needs the table, defined first.
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :ordering
+       "((defclass cell () ((value :initform 1)))
+          (defun make () (make-instance 'cell))
+          (defun entry (object) (values (slot-value object 'value) (equalp object object))))"
+       "(make entry)" "((make ()) (entry (cell)))" "()" :universe "(cell)")
+    (check (zerop (undefined-reference-count unit))
+           "A metadata-consuming artifact referenced an undefined function")
+    ;; MAKE is typed as a function-returning entry; call the closed function directly.
+    (let* ((symbol (find-symbol "MAKE" package))
+           (made (funcall (snowgrave:unit-function unit symbol))))
+      (check (equal '((1 t) nil)
+                    (observed-call (snowgrave:unit-function unit (find-symbol "ENTRY" package))
+                                   (list made)))
+             "Logical EQUALP or literal slot read changed behaviour"))))

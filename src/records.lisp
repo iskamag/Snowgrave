@@ -233,9 +233,13 @@
          (error 'simple-error
                 :format-control "The slot ~S is missing from the object ~S."
                 :format-arguments (list ,slot ,object))))
-    ;; Every emitted reader can signal this; its storing restart forwards
-    ;; through the runtime symbol dispatcher.
+    ;; Every emitted reader can signal this, and its storing restart forwards
+    ;; through the runtime symbol dispatchers. Those therefore become required
+    ;; as soon as the slow path is, even when no source call names a slot at
+    ;; runtime; leaving them out would emit a SETF of an undefined function.
     (when (usage-operation-p (build-usage build) :unbound)
+      (usage-mark-symbol-dispatch (build-usage build) :read)
+      (usage-mark-symbol-dispatch (build-usage build) :write)
       (emit-form build
         `(defun ,(closed-name build '%record-unbound) (,object ,slot)
            (restart-case (error 'unbound-slot :instance ,object :name ,slot)
