@@ -27,6 +27,8 @@
     (self-contained-artifact-tests)
     (package-replay-test)
     (multi-package-replay-test)
+    (shared-export-replay-test)
+    (reexport-replay-test)
     (rejection-tests)
     (admission-boundary-tests)
     (lifecycle-tests)

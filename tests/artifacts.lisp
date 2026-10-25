@@ -358,3 +358,124 @@ collapsing one shows up only with more than one."
       (ignore-errors (delete-file path))
       (ignore-errors (delete-file driver))
       (ignore-errors (delete-file sentinel)))))
+
+(defun shared-export-replay-test ()
+  "Two client packages exporting the same name must bootstrap it in both, and
+the child must still get two distinct symbols. A bootstrap keyed by name alone
+would collapse them into one."
+  (let* ((index (incf *fixture-sequence*))
+         (names (list (format nil "SNOWGRAVE.SHARED-A.~D" index)
+                      (format nil "SNOWGRAVE.SHARED-B.~D" index)))
+         (packages (mapcar (lambda (name) (make-package name :use '("COMMON-LISP"))) names))
+         (keys (mapcar (lambda (package) (intern "SHARED-NAME" package)) packages))
+         (entry (intern "ENTRY" (make-package (format nil "SNOWGRAVE.SENTRY.~D" index)
+                                              :use '("COMMON-LISP"))))
+         (unit (snowgrave:close-source-unit
+                (list :forms (list `(defun ,entry () (values ,@(mapcar (lambda (key) `',key) keys)))))
+                :unit-name (list :shared index) :entries (list entry)
+                :external-domains (list (list entry nil))))
+         (closed (snowgrave::unit-plan-package (snowgrave::closed-unit-plan unit)))
+         (closed-name (second (getf (find entry (getf (snowgrave:unit-metadata unit) :entries)
+                                            :key (lambda (row) (getf row :name)))
+                                    :code-key)))
+         (path (merge-pathnames (format nil "snowgrave-shared-~D.lisp" index)
+                                (uiop:temporary-directory)))
+         (driver (merge-pathnames (format nil "snowgrave-shared-~D-run.lisp" index)
+                                  (uiop:temporary-directory)))
+         (sentinel (merge-pathnames (format nil "snowgrave-shared-~D-ok" index)
+                                    (uiop:temporary-directory)))
+         (resolved-name (intern "SNOWGRAVE-REPLAY-RESULT" :cl-user))
+         (stream-name (intern "SNOWGRAVE-REPLAY-STREAM" :cl-user)))
+    (dolist (package packages) (export (intern "SHARED-NAME" package) package))
+    (unwind-protect
+         (progn
+           (with-open-file (stream path :direction :output :if-exists :supersede)
+             (snowgrave:write-unit-source unit stream))
+           (with-open-file (stream driver :direction :output :if-exists :supersede)
+             (write-child-driver
+              stream
+              `(progn
+                 ,@(loop for name in names
+                         collect `(when (find-package ,name)
+                                    (error "~A still exists" ,name)))
+                 (load ,(namestring path))
+                 (let ((,resolved-name
+                         (multiple-value-list
+                          (funcall (fdefinition (find-symbol ,closed-name ,closed))))))
+                   (unless (and (= 2 (length ,resolved-name))
+                                (not (eq (first ,resolved-name) (second ,resolved-name)))
+                                (equal (mapcar (lambda (symbol)
+                                                 (package-name (symbol-package symbol)))
+                                               ,resolved-name)
+                                       (list ,@names)))
+                     (error "Shared exports did not stay distinct: ~S" ,resolved-name)))
+                 (with-open-file (,stream-name ,(namestring sentinel)
+                                               :direction :output
+                                               :if-exists :supersede)
+                   (write-line "ok" ,stream-name)))))
+           (check (child-replay-succeeds-p driver sentinel)
+                  "Replay of two packages sharing an exported name failed"))
+      (ignore-errors (delete-file path))
+      (ignore-errors (delete-file driver))
+      (ignore-errors (delete-file sentinel)))))
+
+(defun reexport-replay-test ()
+  "A symbol re-exported by a second package is one identity. The artifact names
+its home package, and the child gets the original symbol back from both uses."
+  (let* ((index (incf *fixture-sequence*))
+         (home (format nil "SNOWGRAVE.HOME.~D" index))
+         (relay (format nil "SNOWGRAVE.RELAY.~D" index))
+         (home-package (make-package home :use '("COMMON-LISP")))
+         (relay-package (make-package relay :use '("COMMON-LISP")))
+         (payload (intern "PAYLOAD" home-package))
+         (entry (intern "ENTRY" (make-package (format nil "SNOWGRAVE.RENTRY.~D" index)
+                                              :use '("COMMON-LISP")))))
+    (import payload relay-package)
+    (export payload home-package)
+    (export payload relay-package)
+    (let* ((unit (snowgrave:close-source-unit
+                  (list :forms (list `(defun ,entry ()
+                                        (values ',payload
+                                                ',(intern "PAYLOAD" relay-package)))))
+                  :unit-name (list :reexport index) :entries (list entry)
+                  :external-domains (list (list entry nil))))
+           (closed (snowgrave::unit-plan-package (snowgrave::closed-unit-plan unit)))
+           (closed-name (second (getf (find entry (getf (snowgrave:unit-metadata unit) :entries)
+                                              :key (lambda (row) (getf row :name)))
+                                      :code-key)))
+           (path (merge-pathnames (format nil "snowgrave-reexport-~D.lisp" index)
+                                  (uiop:temporary-directory)))
+           (driver (merge-pathnames (format nil "snowgrave-reexport-~D-run.lisp" index)
+                                    (uiop:temporary-directory)))
+           (sentinel (merge-pathnames (format nil "snowgrave-reexport-~D-ok" index)
+                                      (uiop:temporary-directory)))
+           (resolved-name (intern "SNOWGRAVE-REPLAY-RESULT" :cl-user))
+           (stream-name (intern "SNOWGRAVE-REPLAY-STREAM" :cl-user)))
+      (unwind-protect
+           (progn
+             (with-open-file (stream path :direction :output :if-exists :supersede)
+               (snowgrave:write-unit-source unit stream))
+             (with-open-file (stream driver :direction :output :if-exists :supersede)
+               (write-child-driver
+                stream
+                `(progn
+                   (when (find-package ,relay)
+                     (error "The relaying package still exists"))
+                   (load ,(namestring path))
+                   (let ((,resolved-name
+                           (multiple-value-list
+                            (funcall (fdefinition (find-symbol ,closed-name ,closed))))))
+                     (unless (and (= 2 (length ,resolved-name))
+                                  (eq (first ,resolved-name) (second ,resolved-name))
+                                  (eq (symbol-package (first ,resolved-name))
+                                      (find-package ,home)))
+                       (error "A re-exported symbol lost its identity: ~S" ,resolved-name)))
+                   (with-open-file (,stream-name ,(namestring sentinel)
+                                                 :direction :output
+                                                 :if-exists :supersede)
+                     (write-line "ok" ,stream-name)))))
+             (check (child-replay-succeeds-p driver sentinel)
+                    "Replay of a re-exported symbol failed"))
+        (ignore-errors (delete-file path))
+        (ignore-errors (delete-file driver))
+        (ignore-errors (delete-file sentinel))))))
