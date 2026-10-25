@@ -29,8 +29,7 @@
                  (lambda-form
                    (rewrite-form build
                                  `(lambda ,lambda-list ,@prefix
-                                     (block ,(if (consp name) (second name) name)
-                                       ,@checks ,@executable))
+                                     ,(source-block-form name (append checks executable)))
                                  :closed)))
             (emit-form build (list* 'defun (closed-name build name) (rest lambda-form)))))))
     ;; Keep source initialization order: constants must be established before

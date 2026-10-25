@@ -68,6 +68,10 @@
                  (and (eq phase :open)
                       (eq (symbol-package symbol) (build-open-package build))))))))
 
+(defun require-owned-class-universe (build)
+  (unless (build-classes build)
+    (unsupported :external-construction "MAKE-INSTANCE needs an owned class universe.")))
+
 (defun representation-sensitive-type-p (type)
   (cond ((member type '(structure-object standard-object generic-function compiled-function)) t)
         ;; Logical metadata are ordinary structures, not host metaobjects.
@@ -111,8 +115,7 @@
     (return-from resolve-function-reference name))
   (check-source-operation build name phase :referencep t)
   (cond ((eq name 'make-instance)
-         (unless (build-classes build)
-           (unsupported :external-construction "MAKE-INSTANCE needs an owned class universe."))
+         (require-owned-class-universe build)
          (record-make-instance-name build phase))
         ((metadata-operation-name name) (metadata-function-name build name phase))
         ((observation-function-name build name phase))

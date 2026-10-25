@@ -117,7 +117,7 @@
                                (list (first item) (open-name build (second item))) item)) lambda-list)
               ,@(cddr (rewrite-form build `(lambda ,(ordinary-method-lambda-list lambda-list)
                                              ,@prefix
-                                             (block ,(if (consp name) (second name) name) ,@executable))
+                                             ,(source-block-form name executable))
                                     :open)))))))
     (defun
      (let ((lambda-form (rewrite-form build (cons 'lambda (cddr form)) :open)))

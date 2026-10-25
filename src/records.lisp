@@ -169,6 +169,10 @@
          `(not ,(closed-slot-type-test build (second type) value)))
         (t `(typep ,value ',type))))
 
+(defun trivial-slot-type-p (type)
+  "TYPEP against T never fails, so its check is dead code."
+  (eq type t))
+
 (defun record-operation-helper (build operation)
   (let ((reader (closed-name build '%record-read)))
     (ecase operation
@@ -206,11 +210,13 @@
                   (,(closed-name build '%record-unbound)
                    ,object ',(slot-description-name slot))))
       (:write
-       `(progn
-          (unless ,(closed-slot-type-test build (slot-description-type slot) value)
-            (error 'type-error :datum ,value :expected-type ',(slot-description-type slot)))
-          (setf ,access ,value ,bound (logior ,bound ,(ash 1 index)))
-          ,value))
+       (let ((type (slot-description-type slot)))
+         `(progn
+            ,@(unless (trivial-slot-type-p type)
+                `((unless ,(closed-slot-type-test build type value)
+                    (error 'type-error :datum ,value :expected-type ',type))))
+            (setf ,access ,value ,bound (logior ,bound ,(ash 1 index)))
+            ,value)))
       (:boundp `(logbitp ,index ,bound))
       (:unbind `(progn (setf ,access nil ,bound (logandc2 ,bound ,(ash 1 index))) ,object)))))
 
@@ -227,19 +233,23 @@
          (error 'simple-error
                 :format-control "The slot ~S is missing from the object ~S."
                 :format-arguments (list ,slot ,object))))
-    (emit-form build
-      `(defun ,(closed-name build '%record-unbound) (,object ,slot)
-         (restart-case (error 'unbound-slot :instance ,object :name ,slot)
-           (use-value (,value) ,value)
-           (store-value (,value)
-             (setf (,(closed-name build '%record-read) ,object ,slot) ,value)))))))
+    ;; Every emitted reader can signal this; its storing restart forwards
+    ;; through the runtime symbol dispatcher.
+    (when (usage-operation-p (build-usage build) :unbound)
+      (emit-form build
+        `(defun ,(closed-name build '%record-unbound) (,object ,slot)
+           (restart-case (error 'unbound-slot :instance ,object :name ,slot)
+             (use-value (,value) ,value)
+             (store-value (,value)
+               (setf (,(closed-name build '%record-read) ,object ,slot) ,value))))))))
 
 (defun emit-record-slot-dispatch (build operation)
-  (let* ((name (record-operation-helper build operation))
+  (let* ((usage (build-usage build))
+         (name (record-operation-helper build operation))
          (object (gensym "RECORD")) (slot-name (gensym "SLOT")) (value (gensym "VALUE"))
-         (slots (remove-duplicates
-                 (loop for description in (build-layouts build)
-                       append (mapcar #'slot-description-name (class-description-slots description)))))
+         ;; Only the slots an admitted call reaches, or every slot when some
+         ;; operand is computed, need a helper and a symbol dispatch arm.
+         (slots (usage-slot-operations build usage operation))
          (arguments (if (eq operation :write) (list value object) (list object))))
     (dolist (slot slots)
       (let ((cases (loop for description in (build-layouts build)
@@ -262,15 +272,18 @@
                ,@(loop for case in cases
                        collect `((,(slot-case-predicate case) ,object) ,(slot-case-body case)))
                (t (,(closed-name build '%record-invalid-slot) ,object ',slot)))))))
-    (emit-form
-     build
-     `(defun ,name ,(if (eq operation :write) (list value object slot-name) (list object slot-name))
-        (unless (symbolp ,slot-name)
-          (error 'type-error :datum ,slot-name :expected-type 'symbol))
-        (case ,slot-name
-          ,@(loop for slot in slots collect
-                  `((,slot) (funcall #',(record-slot-function build operation slot) ,@arguments)))
-          (otherwise (,(closed-name build '%record-invalid-slot) ,object ,slot-name)))))))
+    ;; The runtime-symbol entry point exists only when some admitted operand is
+    ;; computed, or when the unbound read's storing restart forwards here.
+    (when (usage-symbol-dispatch-p usage operation)
+      (emit-form
+       build
+       `(defun ,name ,(if (eq operation :write) (list value object slot-name) (list object slot-name))
+          (unless (symbolp ,slot-name)
+            (error 'type-error :datum ,slot-name :expected-type 'symbol))
+          (case ,slot-name
+            ,@(loop for slot in slots collect
+                    `((,slot) (funcall #',(record-slot-function build operation slot) ,@arguments)))
+            (otherwise (,(closed-name build '%record-invalid-slot) ,object ,slot-name))))))))
 
 (defun emit-record-constructor (build description)
   (let ((args (gensym "INITARGS")) (object (gensym "RECORD"))
@@ -291,29 +304,39 @@
                   (cons :allow-other-keys
                         (loop for slot in (class-description-slots description)
                               append (slot-description-initargs slot))))
-         ,(closed-class-token-form build (class-description-name description)))
+         ',(class-description-name description))
         (let ((,object (,(class-description-allocator description))))
           ,@(loop for slot in (class-description-slots description)
                   collect
                   `(multiple-value-bind (,value ,presentp)
                        (,lookup ,args ',(slot-description-initargs slot))
                      (cond (,presentp
-                            (setf (,(closed-name build '%record-read) ,object ',(slot-description-name slot)) ,value))
+                            (setf (,(record-slot-function build :read (slot-description-name slot)) ,object) ,value))
                            ,@(when (slot-description-initform-p slot)
-                               `((t (setf (,(closed-name build '%record-read) ,object ',(slot-description-name slot))
+                               `((t (setf (,(record-slot-function build :read (slot-description-name slot)) ,object)
                                           ,(rewrite-form build (slot-description-initform slot) :closed))))))))
           ,object)))))
 
 (defun emit-record-make-instance-binding (build)
+  ;; A literal owned class reaches its constructor directly. Only a computed
+  ;; class operand needs the logical class table, and the usage scan then
+  ;; retains it along with the descriptor-checked constructor indirection.
   (let ((class (gensym "CLASS")) (initargs (gensym "INITARGS"))
-        (descriptor (gensym "CLASS-DESCRIPTOR")))
+        (descriptor (gensym "CLASS-DESCRIPTOR"))
+        (tablep (usage-needs-metadata-p (build-usage build))))
     (emit-form
      build
      `(defun ,(record-make-instance-name build :closed) (,class &rest ,initargs)
-        (let ((,descriptor (if (symbolp ,class)
-                               (,(metadata-function-name build 'find-class :closed) ,class)
-                               ,class)))
-          (apply (,(closed-name build '%metadata-class-constructor) ,descriptor) ,initargs))))))
+        (cond
+          ,@(loop for description in (build-layouts build)
+                  collect `((eq ,class ',(class-description-name description))
+                            (apply #',(class-description-constructor description) ,initargs)))
+          ,(if tablep
+               `(t (let ((,descriptor (if (symbolp ,class)
+                                          (,(metadata-function-name build 'find-class :closed) ,class)
+                                          ,class)))
+                     (apply (,(closed-name build '%metadata-class-constructor) ,descriptor) ,initargs)))
+               `(t (error 'type-error :datum ,class :expected-type 'symbol))))))))
 
 (defun emit-records (build)
   (unless (build-layouts build) (return-from emit-records nil))
@@ -344,11 +367,16 @@
             (when ,invalid
               (error ',(closed-name build '%program-error) :format-control "Invalid initialization arguments ~S for ~S."
                      :format-arguments (list (nreverse ,invalid) ,class))))))))
-  (emit-record-slot-errors build)
-  (dolist (operation '(:read :write :boundp :unbind))
-    (emit-record-slot-dispatch build operation))
+  (let ((usage (build-usage build)))
+    (when (loop for operation in '(:read :write :boundp :unbind)
+                thereis (usage-operation-p usage operation))
+      (emit-record-slot-errors build)
+      (dolist (operation '(:read :write :boundp :unbind))
+        (emit-record-slot-dispatch build operation))))
   (dolist (description (build-layouts build))
     (emit-record-constructor build description))
+  ;; Construction is a published plan entry, so its binding always exists.
+  ;; Only its computed-class arm depends on the logical class table.
   (emit-record-make-instance-binding build))
 
 (defun record-type-mentioned-p (build type)
@@ -362,8 +390,7 @@ Operands remain source forms for the shared lexical rewriter."
   (let ((operator (first form)))
     (case operator
       (make-instance
-       (unless (build-classes build)
-         (unsupported :external-construction "MAKE-INSTANCE needs an owned class universe."))
+       (require-owned-class-universe build)
        ;; Direct and captured calls share the same replacement function.
        ;; Ordinary evaluation completes every operand before class lookup.
        (values `(,(record-make-instance-name build phase) ,@(rest form)) t))

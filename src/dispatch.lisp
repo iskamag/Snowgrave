@@ -51,12 +51,22 @@
       (loop for item in (first axes) append
         (loop for tail in (method-cartesian-product (rest axes)) collect (cons item tail)))))
 
+(defun emit-miss-path (build)
+  ;; One shared miss implementation instead of a copy per dispatcher.
+  (let ((generic (gensym "GENERIC")) (arguments (gensym "ARGUMENTS"))
+        (dispatcher (gensym "DISPATCHER")))
+    (emit-form
+     build
+     `(defun ,(closed-name build '%record-no-applicable) (,generic ,arguments ,dispatcher)
+        (restart-case
+            (error 'simple-error :format-control "No applicable method for ~S with arguments ~S."
+                   :format-arguments (list ,generic ,arguments))
+          (retry () :report "Retry the closed generic function."
+            (apply ,dispatcher ,arguments)))))))
+
 (defun no-applicable-method-form (build generic arguments)
-  `(restart-case
-       (error 'simple-error :format-control "No applicable method for ~S with arguments ~S."
-              :format-arguments (list ',generic ,arguments))
-     (retry () :report "Retry the closed generic function."
-       (apply #',(closed-name build generic) ,arguments))))
+  `(,(closed-name build '%record-no-applicable) ',generic ,arguments
+    #',(closed-name build generic)))
 
 (defun no-next-method-form (generic arguments)
   `(error 'simple-error :format-control "No next method for ~S with arguments ~S."
@@ -85,12 +95,20 @@
                   (values)))
     `(apply #',name ,arguments)))
 
+(defun axis-strides (axes)
+  "Row-major stride per axis in the flattened cell index."
+  (loop for tail on axes
+        collect (apply #'* (mapcar #'length (rest tail)))))
+
 (defun method-axis-index-form (build axis argument)
   ;; Exact owned classes and admitted native cuts partition one argument.
   ;; The final remainder is exhaustive after all preceding tests fail.
-  `(cond ,@(loop for tail on axis for index from 0
-                 collect `(,(if (rest tail) (axis-cut-test build (first tail) argument) t)
-                            ,index))))
+  (if (rest axis)
+      `(cond ,@(loop for tail on axis for index from 0
+                     collect `(,(if (rest tail) (axis-cut-test build (first tail) argument) t)
+                                ,index)))
+      ;; A single cut accepts every value, so the index is constant.
+      0))
 
 (defun generic-method-groups (build generic gf axes)
   "Group cell indices by the MOP's ordered applicable-method list."
@@ -154,34 +172,42 @@
                 ;; calls have an empty tail.
                 `(&rest ,overflow)))))
 
+(defun generic-cell-index-form (build axes abi)
+  "Flattened cell index, computed directly instead of by repeated SETF."
+  (let ((forms (loop for axis in axes for position from 0
+                     collect (method-axis-index-form
+                              build axis (call-abi-argument abi position)))))
+    (cond ((null forms) 0)
+          ((null (cdr forms)) (car forms))
+          (t (cons '+ (loop for form in forms
+                            for stride in (axis-strides axes)
+                            collect (if (= stride 1) form (list '* stride form))))))))
+
 (defun generic-entry-form (build generic shape axes abi overflow clauses)
   (let ((arguments (method-call-abi-list-parameter abi))
         (required (length (lambda-shape-required shape)))
         (supplied (loop repeat (length (lambda-shape-optional shape)) collect (gensym "SUPPLIED")))
+        (count (method-call-abi-optional-count abi))
         (cell-index (gensym "CELL")))
     `(defun ,(closed-name build generic) ,(generic-entry-lambda-list abi supplied overflow)
        ,@(when (and arguments (plusp required))
-           `((when (< (length ,arguments) ,required)
-               (error ',(closed-name build '%program-error)
-                      :format-control "Too few arguments for closed generic ~S: ~S."
-                      :format-arguments (list ',generic ,arguments)))))
-       (let ((,cell-index 0)
-             ,@(when (method-call-abi-optional-count abi)
-                 `((,(method-call-abi-optional-count abi)
-                    (cond ,@(loop for present in (reverse supplied)
-                                  for count downfrom (length supplied) collect `(,present ,count))
-                          (t 0))))))
-         ,@(loop for axis in axes for index from 0
-                 collect `(setf ,cell-index
-                                (+ (* ,cell-index ,(length axis))
-                                   ,(method-axis-index-form build axis (call-abi-argument abi index)))))
-         (case ,cell-index
-           ,@(mapcar (lambda (clause)
-                       (cons (generic-clause-indices clause) (generic-clause-body clause)))
-                     clauses)
-           (otherwise ,(no-applicable-method-form
-                        build generic (if arguments arguments
-                                          `(append ,(call-abi-list abi) ,overflow)))))))))
+           (list `(when (< (length ,arguments) ,required)
+                    (error ',(closed-name build '%program-error)
+                           :format-control "Too few arguments for closed generic ~S: ~S."
+                           :format-arguments (list ',generic ,arguments)))))
+       (let (,@(when count
+                 (list `(,count (cond ,@(loop for present in (reverse supplied)
+                                              for seen downfrom (length supplied)
+                                              collect `(,present ,seen))
+                                      (t 0))))))
+         (let ((,cell-index ,(generic-cell-index-form build axes abi)))
+           (case ,cell-index
+             ,@(mapcar (lambda (clause)
+                         (cons (generic-clause-indices clause) (generic-clause-body clause)))
+                       clauses)
+             (otherwise
+              ,(no-applicable-method-form
+                build generic (if arguments arguments `(append ,(call-abi-list abi) ,overflow))))))))))
 
 (defun emit-one-generic (build generic)
   (let* ((gf (validate-generic-methods build generic (generic-open-function build generic)))
@@ -203,4 +229,5 @@
     (emit-form build (generic-entry-form build generic shape axes abi overflow clauses))))
 
 (defun emit-generics (build)
+  (when (build-generics build) (emit-miss-path build))
   (dolist (generic (build-generics build)) (emit-one-generic build generic)))

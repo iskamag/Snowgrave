@@ -19,6 +19,7 @@
                (:file "src/records")
                (:file "src/metadata")
                (:file "src/observation")
+               (:file "src/usage")
                (:file "src/composition")
                (:file "src/method-abi")
                (:file "src/methods")

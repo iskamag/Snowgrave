@@ -17,7 +17,7 @@
 (defun specialize-function-reference-form (configuration form environment)
   (let* ((target (second form))
          (namedp (function-name-p target))
-         (plan (closed-unit-plan (configuration-unit configuration))))
+         (plan (configuration-plan configuration)))
     (when (and namedp (assoc target (env-functions environment) :test #'equal))
       (unsupported :configuration-indirect-call
                    "A lexical function value needs explicit capture conversion outside a direct FUNCALL."))

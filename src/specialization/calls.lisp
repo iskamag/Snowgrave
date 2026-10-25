@@ -116,7 +116,7 @@
 
 (defun specialize-known-call (configuration name arguments facts environment)
   (let* ((environment (or environment (make-lexical-facts)))
-         (plan (closed-unit-plan (configuration-unit configuration)))
+         (plan (configuration-plan configuration))
          (local (cdr (assoc name (env-functions environment) :test #'equal)))
          (generic (find name (unit-plan-generics plan) :key #'generic-plan-name :test #'equal))
          (slot (find name (unit-plan-slots plan) :key #'slot-plan-name :test #'equal)))

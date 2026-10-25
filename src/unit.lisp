@@ -93,12 +93,13 @@
 
 (defun generate-closed-source (build)
   (prepare-records build)
+  (scan-usage build)
   (emit-form build
              `(define-condition ,(closed-name build '%program-error)
                   (simple-condition program-error) ()))
   (emit-records build)
-  (emit-metadata build)
-  (emit-observations build)
+  (when (usage-needs-metadata-p (build-usage build)) (emit-metadata build))
+  (when (usage-flag-p (build-usage build) 'equalp) (emit-observations build))
   (emit-generics build)
   (emit-functions build)
   (let ((literals (literal-definition build :closed))

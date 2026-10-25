@@ -49,7 +49,7 @@ ordinary entry calls, and configured binding.
 | `source.lisp`, `literals.lisp` | Definition indexing, open source, literal identity and cycles |
 | `walker.lisp`, `normalize.lisp`, `hosts/` | Lexical traversal and portable macro-expansion snapshots |
 | `admission.lisp`, `rewrite.lisp`, `functions.lisp` | Admission and name resolution, source rebuilding, entry domains, and ordinary definitions |
-| `records.lisp`, `metadata.lisp`, `observation.lisp` | Physical records, logical metadata, and admitted comparisons |
+| `records.lisp`, `metadata.lisp`, `observation.lisp`, `usage.lisp` | Physical records, logical metadata, admitted comparisons, and the reachability scan that prunes them |
 | `composition.lisp`, `methods.lisp`, `method-abi.lisp`, `dispatch.lisp` | MOP composition, continuations, argument transport, and finite method partitions |
 | `artifact.lisp` | Residual source audit and independent source/metadata serialization |
 | `configuration.lisp`, `configuration-entry.lisp` | Validate component graphs, compile bound entries, and publish role seals |
@@ -60,6 +60,15 @@ lambda-shape recipes use records with named fields. Retained plans reuse the
 class and slot descriptions, including each slot's fixed index. Builder-only
 dispatch cuts carry MOP classes; retained dispatch domains carry source types.
 Public metadata remains serialized Lisp data.
+
+`usage.lisp` indexes which runtime helpers the normalized source can actually
+reach. The closed emitter adds the logical class table, the logical `equalp`
+comparator, and each per-slot or runtime-symbol slot helper only when an
+admitted call needs it, so a unit that never queries a layout does not ship
+the machinery. The scan is conservative: a quoted or computed designator keeps
+the general path, and a computed class operand in `make-instance` retains the
+class table. A retained `unit-plan` records the same helper identities, because
+`bind-entry` reads plans after closing.
 
 Admission policies select bindings and reject unsupported operations. The
 rewriter rebuilds expressions during the existing lexical traversal; it does

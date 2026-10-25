@@ -58,9 +58,6 @@
        (or (,(closed-name build '%logical-class-p) ,object)
            (,(closed-name build '%logical-slot-p) ,object)))))
 
-(defun closed-class-token-form (build source-class)
-  `(,(metadata-function-name build 'find-class :closed) ',source-class))
-
 (defun emit-metadata (build)
   (let* ((class-type (closed-name build '%logical-class))
          (class-maker (closed-name build '%make-logical-class))

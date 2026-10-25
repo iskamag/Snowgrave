@@ -13,7 +13,7 @@
   (open-literal-index (make-hash-table :test #'eq))
   (closed-literal-index (make-hash-table :test #'eq))
   (slot-functions (make-hash-table :test #'equal))
-  open-literal-name closed-literal-name)
+  open-literal-name closed-literal-name usage)
 
 (defun mapped-name (build name phase)
   (if (consp name)
@@ -44,5 +44,12 @@
 (defun find-source-definition (build operator name)
   (find-if (lambda (form) (and (eq (first form) operator) (equal (second form) name)))
            (build-forms build)))
+(defun generic-block-name (name)
+  "The block name DEFUN/DEFMETHOD establishes for its body."
+  (if (consp name) (second name) name))
+
+(defun source-block-form (name body)
+  `(block ,(generic-block-name name) ,@body))
+
 (defun quoted (form)
   (and (consp form) (eq (first form) 'quote) (consp (rest form)) (null (cddr form))))

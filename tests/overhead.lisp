@@ -57,13 +57,20 @@
     (dotimes (i count result) (setf result (funcall function argument)))))
 
 (defun check-zero-call-allocation (function argument description)
+  ;; SBCL charges a one-time cost to the first window after a full GC, even for
+  ;; #'IDENTITY, so that window is discarded. A genuinely allocating callee
+  ;; allocates in every window, which the remaining ones still catch.
   (unless (test-bytes-consed) (return-from check-zero-call-allocation))
-  (test-gc)
-  (call-loop function argument 1000)
-  (let ((before (test-bytes-consed)))
-    (call-loop function argument 100000)
-    (let ((bytes (- (test-bytes-consed) before)))
-      (check (zerop bytes) "~A allocates ~D bytes during warmed bounded calls" description bytes))))
+  (labels ((window ()
+             (let ((before (test-bytes-consed)))
+               (call-loop function argument 100000)
+               (- (test-bytes-consed) before))))
+    (test-gc)
+    (call-loop function argument 1000)
+    (window)
+    (dotimes (i 3)
+      (let ((bytes (window)))
+        (check (zerop bytes) "~A allocates ~D bytes during warmed bounded calls" description bytes)))))
 
 (defun slot-helper-tests ()
   (multiple-value-bind (unit package)

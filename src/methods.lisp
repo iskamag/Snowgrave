@@ -120,6 +120,19 @@
     (validate-stock-miss-protocol gf method))
   gf)
 
+(defun method-continuation-uses (lambda-list declarations executable)
+  "Which continuation functions the method body and its initforms can reach."
+  (let ((uses nil))
+    (labels ((visit (node)
+               (when (consp node)
+                 (unless (eq (first node) 'quote)
+                   (case (first node)
+                     (call-next-method (pushnew :next uses))
+                     (next-method-p (pushnew :nextp uses)))
+                   (mapc #'visit node)))))
+      (mapc #'visit (list* lambda-list declarations executable)))
+    uses))
+
 (defun emitted-method-function (build generic method next-methods abi)
   (let* ((key (list method next-methods))
          (existing (gethash key *method-source-cache*)))
@@ -149,17 +162,20 @@
            (multiple-value-bind (declarations executable) (body-parts body)
              (setf declarations (remove-if #'stringp declarations))
              (let* ((ordinary (permissive-method-lambda-list (ordinary-method-lambda-list lambda-list)))
+                    (uses (method-continuation-uses lambda-list declarations executable))
                     (method-wrapper
                      `(lambda ,(call-abi-parameters abi)
-                        (flet ((,next-name ()
-                                 ,(or next (no-next-method-form generic (call-abi-list abi))))
-                               (,nextp-name () ,(not (null next-methods))))
+                        (flet (,@(when (member :next uses)
+                                   (list `(,next-name ()
+                                            ,(or next (no-next-method-form generic (call-abi-list abi))))))
+                               ,@(when (member :nextp uses)
+                                   (list `(,nextp-name () ,(not (null next-methods))))))
                           ;; The continuation scope also surrounds optional
                           ;; and keyword initforms, as it does in DEFMETHOD.
                           ,(call-abi-lambda
                             abi (walk-source-form
                                  `(lambda ,ordinary ,@declarations
-                                    (block ,(if (consp generic) (second generic) generic) ,@executable))
+                                    ,(source-block-form generic executable))
                                  nil
                                  (lambda (node context environment)
                                    (declare (ignore environment))

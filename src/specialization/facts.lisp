@@ -14,6 +14,9 @@
 
 (defstruct local-scope (definitions nil) (cache (make-hash-table :test #'equal)))
 
+(defun configuration-plan (configuration)
+  (closed-unit-plan (configuration-unit configuration)))
+
 (defun literal-fact (value)
   (let ((callable (and (functionp value) value)))
     (make-fact :type (cond ((null value) 'null) ((eq value t) '(eql t))
@@ -50,7 +53,7 @@
 (defun audit-callable-transfer (configuration fact destination)
   ;; Lost type/value facts must not hide a reference to an unspecialized function.
   (let ((callee (fact-callable fact))
-        (plan (closed-unit-plan (configuration-unit configuration))))
+        (plan (configuration-plan configuration)))
     (when (or (fact-owned-callable fact)
               (and callee
                    (or (not (function-name-p callee))
@@ -87,7 +90,7 @@
 
 (defun unstable-source-variables (configuration form body)
   (append (assigned-source-variables form) (declared-special-variables body)
-          (unit-plan-special-variables (closed-unit-plan (configuration-unit configuration)))))
+          (unit-plan-special-variables (configuration-plan configuration))))
 
 (defun source-return-p (name form)
   (and (consp form) (not (eq (first form) 'quote))

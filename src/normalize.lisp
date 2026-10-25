@@ -15,8 +15,7 @@
 (defun normalize-source-lambda (name lambda-list body environment)
   (multiple-value-bind (prefix executable) (body-parts body)
     (normalize-source-expression
-     `(lambda ,lambda-list ,@prefix
-        (block ,(if (consp name) (second name) name) ,@executable))
+     `(lambda ,lambda-list ,@prefix ,(source-block-form name executable))
      environment)))
 
 (defun normalize-source-class (form environment)
