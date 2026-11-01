@@ -17,11 +17,15 @@
         (if (zerop n) (values (setf (left-value h) value) :done)
             (recursive-write h value (1- n))))
       (defun write-alias (data value) (setf (slot-value (aref data 0) 'left) value))
+      (defun redirected-write (h data value)
+        (setq h (aref data 0)) (setf (slot-value h 'left) value))
+      (defun identity-query (a b) (if (eq a b) :same :different))
       (defun clear-alias (data) (slot-makunbound (aref data 0) 'left)))"
-   "(construct read-left read-right write-left write-right recursive-write write-alias clear-alias)"
+   "(construct read-left read-right write-left write-right recursive-write write-alias
+      redirected-write identity-query clear-alias)"
    "((construct ()) (read-left (holder)) (read-right (holder))
       (write-left (holder t)) (write-right (holder t)) (recursive-write (holder t fixnum))
-      (write-alias (vector t)) (clear-alias (vector)))"
+      (write-alias (vector t)) (redirected-write (holder vector t)) (identity-query (t t)) (clear-alias (vector)))"
    "(left-value (setf left-value) right-value (setf right-value))"))
 
 (defun publication-alias-tests ()
@@ -101,9 +105,10 @@
   (multiple-value-bind (unit package) (publication-fixture)
     (flet ((entry (name) (find-symbol name package)))
       (let* ((root (funcall (snowgrave:unit-function unit (entry "CONSTRUCT"))))
+             (initial (funcall (snowgrave:unit-function unit (entry "READ-LEFT")) root))
              (replacement (funcall (snowgrave:unit-function unit (entry "READ-RIGHT")) root))
              (one (snowgrave:bind-entry unit (entry "WRITE-LEFT") (list root replacement)))
-             (two (snowgrave:bind-entry unit (entry "WRITE-LEFT") (list root replacement)))
+             (two (snowgrave:bind-entry unit (entry "WRITE-LEFT") (list root initial)))
              (bindings (snowgrave::closed-unit-configured-bindings unit))
              (registry (snowgrave::closed-unit-seals unit))
              (writers (snowgrave::closed-unit-sealed-writers unit))
@@ -137,7 +142,7 @@
                       (every #'eq targets (mapcar (lambda (binding) (fdefinition (snowgrave::configured-binding-name binding))) bindings)))
                  "Failed ~S changed published bindings or seals" phase)
           (check (null (set-difference (list-all-packages) packages)) "Failed ~S leaked private packages" phase))
-        (check (and (eq replacement (funcall one)) (eq replacement (funcall two)))
+        (check (and (eq replacement (funcall one)) (eq initial (funcall two)))
                "Failed staging damaged previously returned functions")
         ;; Retirement errors happen after commit and must not erase live code.
         (let* ((retired (snowgrave::configured-generation-package (first generations)))
@@ -151,11 +156,12 @@
                  (let ((reader (handler-bind ((warning #'muffle-warning))
                                  (snowgrave:bind-entry unit (entry "READ-LEFT") (list root)
                                                       :roles (fixture-read package "((holder left))")))))
-                   (check (eq replacement (funcall reader))
+                   (check (eq initial (funcall reader))
                           "Retirement failure revoked the successfully published binding")))
             (setf (fdefinition 'snowgrave::discard-configuration-package) discard)
             (when (package-name retired) (funcall discard retired)))
-          (check (and (eq replacement (funcall one)) (eq replacement (funcall two)))
+          (check-signals (error) (funcall one) "Retirement failure lost the published seal")
+          (check (eq initial (funcall two))
                  "Retirement failure destroyed newly published implementations"))))))
 
 (defun configuration-publication-tests ()

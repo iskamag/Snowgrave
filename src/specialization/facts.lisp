@@ -23,6 +23,14 @@
 (defun configuration-plan (configuration)
   (closed-unit-plan (configuration-unit configuration)))
 
+(defun record-configuration-mutation (configuration field receiver)
+  (let* ((table (configuration-mutations configuration))
+         (dependency (or (gethash field table)
+                         (setf (gethash field table) (make-mutation-dependency)))))
+    (if (fact-known receiver)
+        (pushnew (fact-value receiver) (mutation-dependency-owners dependency) :test #'eq)
+        (setf (mutation-dependency-unknown dependency) t))))
+
 (defun literal-fact (value)
   (let ((callable (and (functionp value) value)))
     (make-fact :type (cond ((null value) 'null) ((eq value t) '(eql t))

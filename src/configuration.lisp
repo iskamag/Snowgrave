@@ -6,8 +6,7 @@
 ;;; roles and lexical facts. An unresolved selector is rejected before compilation.
 
 (defstruct configuration
-  unit roles fields entry write-fields emitted
-  (functions (make-hash-table :test #'equal))
+  unit roles fields entry write-fields emitted functions
   (specializations (make-hash-table :test #'equal))
   (mutations (make-hash-table :test #'eq))
   (captures (make-array 0 :adjustable t :fill-pointer 0))
@@ -95,6 +94,20 @@
           unless (typep argument domain)
             do (unsupported :configuration-arguments "Argument for ~S does not satisfy ~S." entry domain))))
 
+(defun same-configuration-roles-p (left right)
+  "Compare frozen role facts without depending on traversal or group order."
+  (and (= (hash-table-count left) (hash-table-count right))
+       (loop for owner being the hash-keys of left using (hash-value slots)
+             always
+             (multiple-value-bind (other presentp) (gethash owner right)
+               (and presentp (= (length slots) (length other))
+                    (every (lambda (slot)
+                             (let ((match (assoc (car slot) other)))
+                               (and match (= (length (cdr slot)) (length (cdr match)))
+                                    (every (lambda (value) (member value (cdr match) :test #'eq))
+                                           (cdr slot)))))
+                           slots))))))
+
 (defun configuration-role-guard (configuration rows object
                                  &key (operation :read) value (require-owner t))
   `(cond ,@(loop for (owner . allowed) in rows
@@ -118,14 +131,15 @@
      registry)
     fields))
 
-(defun configured-slot-body (configuration plan row)
+(defun configured-slot-body (configuration plan row &optional receiver knownp)
   (let* ((field (slot-case-field row)) (body (slot-case-body row))
          (object (slot-plan-object plan)) (value (slot-plan-value plan))
          (roles (gethash field (configuration-fields configuration)))
          (values (remove-duplicates (loop for row in roles append (copy-list (cdr row)))))
          (types (remove-duplicates (mapcar #'type-of values))))
     (if (null roles)
-        (let ((seals (gethash field (configuration-write-fields configuration))))
+        (let* ((rows (gethash field (configuration-write-fields configuration)))
+               (seals (if knownp (remove-if-not (lambda (row) (eq (car row) receiver)) rows) rows)))
           (if (and seals (member (slot-plan-operation plan) '(:write :unbind)))
               `(progn ,(configuration-role-guard configuration seals object
                          :operation (slot-plan-operation plan) :value value :require-owner nil)
@@ -159,9 +173,10 @@
                (dolist (slot slots)
                  (unless (assoc (car slot) (gethash object registry))
                    (push slot (gethash object registry))
-                   (setf (gethash (slot-description-field
-                                  (configuration-slot (configuration-layout unit object) (car slot)))
-                                 changed) t))))
+                   (pushnew object
+                            (gethash (slot-description-field
+                                      (configuration-slot (configuration-layout unit object) (car slot)))
+                                     changed) :test #'eq))))
              (configuration-roles configuration))
     (values registry changed)))
 

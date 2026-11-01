@@ -10,7 +10,7 @@
     ;; Expose the selected field operation to its caller so the host can keep
     ;; numeric values unboxed across reads, arithmetic and stores. Only stock
     ;; accessor leaves expand; ordinary helpers keep their shared call graph.
-    (let ((definition (gethash name (configuration-functions configuration))))
+    (let ((definition (configuration-function-source configuration name)))
       (return-from specialize-owned-call
         (specialize-lambda-call configuration (cddr definition) arguments facts
                                 (make-lexical-facts) name))))
@@ -21,7 +21,7 @@
       (return-from specialize-owned-call
         (values (cons (specialization-name existing) arguments)
                 (or (specialization-fact existing) (make-fact)))))
-    (let* ((definition (gethash name (configuration-functions configuration)))
+    (let* ((definition (configuration-function-source configuration name))
            (target (intern (format nil "~A.~D" (if (consp name) (symbol-name (second name)) (symbol-name name))
                                    (hash-table-count table))
                            (symbol-package (configuration-entry configuration))))
@@ -101,13 +101,17 @@
     ;; Raw operations still depend on future publications of this field.
     ;; This includes mutations inside any materialized effective-method body.
     (when (member (slot-plan-operation plan) '(:write :unbind))
-      (setf (gethash (slot-case-field row) (configuration-mutations configuration)) t))
-    (let* ((body (configured-slot-body configuration plan row))
+      (record-configuration-mutation configuration (slot-case-field row) (nth object-index facts)))
+    (let* ((receiver (nth object-index facts))
+           (body (configured-slot-body configuration plan row (fact-value receiver) (fact-known receiver)))
            (roles (gethash (slot-case-field row) (configuration-fields configuration)))
            (values (remove-duplicates (loop for row in roles append (copy-list (cdr row)))))
            (result (case (slot-plan-operation plan)
-                     (:read (if roles (make-fact :type `(or ,@(mapcar (lambda (value) (class-name (class-of value))) values)))
-                                (make-fact)))
+                     (:read (cond ((null roles) (make-fact))
+                                  ;; A singleton role is an identity guarantee,
+                                  ;; unlike an ordinary mutable field's value.
+                                  ((null (rest values)) (literal-fact (first values)))
+                                  (t (make-fact :type `(or ,@(mapcar (lambda (value) (class-name (class-of value))) values))))))
                      (:write (first facts))
                      (:unbind (nth object-index facts))
                      (otherwise (make-fact :type 'boolean)))))

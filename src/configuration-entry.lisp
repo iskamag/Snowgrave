@@ -3,7 +3,7 @@
 ;;; A binding keeps its admitted facts; a generation owns only compiled code.
 ;;; Returned bridges never change identity when cold publication replaces code.
 (defstruct configured-binding name entry arguments roles fields generation)
-(defstruct configured-generation package function bridge mutations)
+(defstruct configured-generation package function mutations)
 
 ;; Keep post-commit housekeeping behind its own callable boundary.
 (declaim (notinline discard-configuration-package))
@@ -15,13 +15,29 @@
     (find-symbol (second key) (first key))))
 
 (defun index-configuration-functions (configuration)
-  (dolist (form (closed-unit-source (configuration-unit configuration)))
-    (when (eq (first form) 'defun)
-      (setf (gethash (second form) (configuration-functions configuration))
-            (list* 'defun (second form)
-                   (rest (canonical-source (cons 'lambda (cddr form)))))))))
+  (let* ((unit (configuration-unit configuration)) (plan (closed-unit-plan unit)))
+    ;; Index immutable definitions once. Normalize only functions that a binding
+    ;; actually reaches, so unrelated entry points cost no source traversal.
+    (setf (configuration-functions configuration)
+          (or (unit-plan-function-sources plan)
+              (setf (unit-plan-function-sources plan)
+                    (let ((functions (make-hash-table :test #'equal)))
+                      (dolist (form (closed-unit-source unit))
+                        (when (eq (first form) 'defun)
+                          (setf (gethash (second form) functions) (make-function-source :form form))))
+                      functions))))))
 
-(defun compile-configured-entry (configuration entry arguments &optional bridge-name)
+(defun configuration-function-source (configuration name)
+  (let ((source (gethash name (configuration-functions configuration))))
+    (when source
+      (or (function-source-normalized source)
+          (let* ((form (function-source-form source))
+                 (normalized (list* 'defun (second form)
+                                    (rest (canonical-source (cons 'lambda (cddr form)))))))
+            ;; A completed normalized definition is immutable and unit-local.
+            (setf (function-source-normalized source) normalized))))))
+
+(defun compile-configured-entry (configuration entry arguments)
   (multiple-value-bind (body fact)
       (specialize-known-call configuration entry
                              (mapcar (lambda (value) (configured-value configuration value)) arguments)
@@ -39,16 +55,18 @@
       ;; INLINE duplicates shared call graphs (including escalation paths) and
       ;; can exhaust the host compiler before a bound entry is produced.
       (dolist (definition definitions) (compile-definition definition))
-      (let ((function (fdefinition (first body))))
-        (values function
-                (when bridge-name
-                  ;; The first target is private until publication. Compile
-                  ;; captures in this generation's dynamic capture context.
-                  (setf (fdefinition bridge-name) function)
-                  (compile-function nil
-                                    `(lambda () (declare (notinline ,bridge-name))
-                                       (,bridge-name ,@(rest body)))
-                                    :configuration-compilation)))))))
+      (fdefinition (first body)))))
+
+(defun compile-configuration-bridge (configuration binding generation)
+  (let* ((*configuration* configuration)
+         (name (configured-binding-name binding))
+         (arguments (mapcar (lambda (value) (configured-value configuration value))
+                            (configured-binding-arguments binding))))
+    ;; Each binding owns its target and captures, even when code is shared.
+    ;; This new target is private until publication.
+    (setf (fdefinition name) (configured-generation-function generation))
+    (compile-function nil `(lambda () (declare (notinline ,name)) (,name ,@arguments))
+                      :configuration-compilation)))
 
 (defun discard-configuration-package (package)
   (do-symbols (symbol package)
@@ -68,13 +86,11 @@
     (unwind-protect
          (progn
            (index-configuration-functions configuration)
-           (multiple-value-bind (function bridge)
-               (compile-configured-entry
+           (let ((function (compile-configured-entry
                 configuration (configuration-entry-name unit (configured-binding-entry binding))
-                (configured-binding-arguments binding)
-                (unless (configured-binding-generation binding) (configured-binding-name binding)))
+                (configured-binding-arguments binding))))
              (prog1 (make-configured-generation
-                     :package package :function function :bridge bridge
+                     :package package :function function
                      :mutations (configuration-mutations configuration))
                (setf success t))))
       (unless success (discard-configuration-package package)))))
@@ -82,7 +98,27 @@
 (defun configuration-generation-affected-p (binding changed)
   (loop for field being the hash-keys of
           (configured-generation-mutations (configured-binding-generation binding))
-        thereis (gethash field changed)))
+          using (hash-value dependency)
+        for owners = (gethash field changed)
+        thereis (and owners
+                     (or (mutation-dependency-unknown dependency)
+                         (some (lambda (owner) (member owner (mutation-dependency-owners dependency) :test #'eq))
+                               owners)))))
+
+(defun same-configured-recipe-p (left right)
+  (let ((a (configured-binding-arguments left)) (b (configured-binding-arguments right)))
+    (and (equal (configured-binding-entry left) (configured-binding-entry right))
+         (= (length a) (length b)) (every #'eq a b)
+         (same-configuration-roles-p (configured-binding-roles left) (configured-binding-roles right)))))
+
+(defun reusable-configuration-generation (unit binding changed)
+  ;; Live implementations already reflect every published seal affecting them.
+  ;; Only an unchanged implementation with exactly the same facts is reusable.
+  (let ((match (find-if (lambda (other)
+                          (and (same-configured-recipe-p binding other)
+                               (not (configuration-generation-affected-p other changed))))
+                        (closed-unit-configured-bindings unit))))
+    (when match (configured-binding-generation match))))
 
 (defun publish-configured-bindings (unit binding registry generations wrappers)
   "Install only compiled definitions; restore all live state if commit fails."
@@ -124,13 +160,14 @@
               (closed-unit-configured-bindings unit) old-bindings)))
     old-generations))
 
-(defun retire-configuration-generations (generations)
+(defun retire-configuration-generations (unit generations)
   ;; Code publication already succeeded. Housekeeping cannot revoke its result.
-  (dolist (row generations)
-    (when (second row)
-      (handler-case
-          (discard-configuration-package (configured-generation-package (second row)))
-        (error (condition) (warn "Could not retire a replaced configuration package: ~A" condition))))))
+  (let ((live (mapcar #'configured-binding-generation (closed-unit-configured-bindings unit))))
+    (dolist (generation (remove-duplicates (mapcar #'second generations) :test #'eq))
+      (when (and generation (not (member generation live :test #'eq)))
+        (handler-case
+            (discard-configuration-package (configured-generation-package generation))
+          (error (condition) (warn "Could not retire a replaced configuration package: ~A" condition)))))))
 
 (defun bind-entry (unit entry arguments &key roles)
   "Return a zero-argument function specialized for a fixed component graph.
@@ -150,7 +187,7 @@ function is host-local and has no independent configured-image export."
          (binding (make-configured-binding
                    :name (intern "%BOUND-ENTRY" package) :entry entry :arguments (copy-list arguments)
                    :roles (configuration-roles configuration) :fields (configuration-fields configuration)))
-         (generations nil) (success nil))
+         (generations nil) (compiled nil) (staged nil) (success nil))
     (unwind-protect
          (progn
            (check-configuration-seals configuration)
@@ -159,7 +196,13 @@ function is host-local and has no independent configured-image export."
                (dolist (recipe (if (zerop (hash-table-count changed)) (list binding)
                                   (cons binding (closed-unit-configured-bindings unit))))
                  (when (or (eq recipe binding) (configuration-generation-affected-p recipe changed))
-                   (push (list recipe (compile-configuration-generation unit recipe write-fields)) generations))))
+                   (let* ((shared (find recipe compiled :key #'first :test #'same-configured-recipe-p))
+                          (generation
+                            (or (second shared) (reusable-configuration-generation unit recipe changed)
+                                (let ((new (compile-configuration-generation unit recipe write-fields)))
+                                  (push new staged) new))))
+                     (unless shared (push (list recipe generation) compiled))
+                     (push (list recipe generation) generations)))))
              (let* ((initial (second (assoc binding generations)))
                     (wrappers
                       (when (plusp (hash-table-count changed))
@@ -167,13 +210,14 @@ function is host-local and has no independent configured-image export."
                               when (member (slot-plan-operation plan) '(:write :unbind))
                                 append (let ((wrapper (compile-sealed-writer configuration plan registry)))
                                          (when wrapper (list wrapper)))))))
-               (let ((retired (publish-configured-bindings unit binding registry generations wrappers)))
+               (let* ((bridge (compile-configuration-bridge configuration binding initial))
+                      (retired (publish-configured-bindings unit binding registry generations wrappers)))
                  ;; Retirement is post-commit housekeeping. Its failure must
                  ;; never trigger rollback cleanup of the published code.
                  (setf success t)
-                 (retire-configuration-generations retired))
-               (configured-generation-bridge initial))))
+                 (retire-configuration-generations unit retired)
+                 bridge))))
       (unless success
-        (dolist (row generations)
-          (discard-configuration-package (configured-generation-package (second row))))
+        (dolist (generation staged)
+          (discard-configuration-package (configured-generation-package generation)))
         (discard-configuration-package package)))))
