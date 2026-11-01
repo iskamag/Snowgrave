@@ -72,6 +72,51 @@
       (let ((bytes (window)))
         (check (zerop bytes) "~A allocates ~D bytes during warmed bounded calls" description bytes)))))
 
+(defun configured-accessor-tests ()
+  (multiple-value-bind (unit package)
+      (make-fixture
+       :configured-accessors
+       "((defclass cell () ((value :type double-float :initarg :value :accessor value)))
+          (defclass child (cell) ())
+          (defun construct () (make-instance 'child :value 0d0))
+          (defun empty () (make-instance 'child))
+          (defun read-value (c) (value c))
+          (defun reset (c) (setf (value c) 0d0))
+          (defun run (c n)
+            (declare (type cell c) (type fixnum n) (optimize (speed 3) (safety 1)))
+            (dotimes (i n)
+              (setf (value c) (+ (the double-float (value c)) 0.125d0)))
+            (value c))
+          (defun entry (n) (run (construct) n)))"
+       "(construct empty read-value reset run entry)"
+       "((construct ()) (empty ()) (read-value (cell)) (reset (cell)) (run (cell fixnum)) (entry (fixnum)))"
+       "(value (setf value))")
+    (compare-entry unit package "ENTRY" '(100) '((12.5d0) nil))
+    (let* ((object (funcall (snowgrave:unit-function unit (find-symbol "CONSTRUCT" package))))
+           (run (snowgrave:bind-entry unit (find-symbol "RUN" package) (list object 100000))))
+      (check (= 12500d0 (funcall run)) "Configured accessor update differs")
+      #+sbcl
+      (progn
+        ;; Expansion removes the box crossing the writer call. SBCL still
+        ;; boxes the read at the join with the unbound restart path: allow one
+        ;; 16-byte box per iteration, with headroom for TLAB granularity, but
+        ;; reject the old two-box path. A compiler eliminating both also passes.
+        (dotimes (i 2) (funcall run))
+        (let ((before (test-bytes-consed)))
+          (dotimes (i 128) (funcall run))
+          (let ((bytes (- (test-bytes-consed) before)))
+            (check (< bytes (* 20 128 100000))
+                   "Configured numeric accessor loop allocated ~D bytes" bytes)))))
+    (let* ((object (funcall (snowgrave:unit-function unit (find-symbol "EMPTY" package))))
+           (read (snowgrave:bind-entry unit (find-symbol "READ-VALUE" package) (list object))))
+      ;; A slot declaration constrains bound storage, not a USE-VALUE result.
+      (check (eq :not-a-double
+                 (handler-bind ((unbound-slot (lambda (condition)
+                                                (declare (ignore condition))
+                                                (invoke-restart 'use-value :not-a-double))))
+                   (funcall read)))
+             "Configured accessor expansion narrowed an unbound restart result"))))
+
 (defun slot-helper-tests ()
   (multiple-value-bind (unit package)
       (make-fixture

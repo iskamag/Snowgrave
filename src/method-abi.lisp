@@ -36,9 +36,15 @@
                        collect `(,supplied (list ,@(subseq arguments 0 (+ (method-call-abi-required abi) supplied))))))
             `(list ,@arguments)))))
 
-(defun call-abi-lambda (abi lambda-form)
+(defun call-abi-lambda (abi lambda-form &optional required-types)
   (cond ((method-call-abi-list-parameter abi)
-         `(apply (function ,lambda-form) ,(method-call-abi-list-parameter abi)))
+         (let ((arguments (method-call-abi-list-parameter abi)))
+           ;; Expose each incoming specializer to the compiler before method
+           ;; defaults or assignments can change the source parameters.
+           `(apply (function ,lambda-form)
+                   ,@(loop for type in required-types for index from 0
+                           collect `(the ,type (nth ,index ,arguments)))
+                   ,(if required-types `(nthcdr ,(length required-types) ,arguments) arguments))))
         ((method-call-abi-optional-count abi)
          (let ((body (gensym "METHOD-BODY")) (arguments (method-call-abi-arguments abi)))
            ;; Define the method body once. Each arm supplies exactly the

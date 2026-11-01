@@ -4,7 +4,9 @@
   (multiple-value-bind (unit package)
       (make-fixture
        :artifact
-       "((defclass cell () ((value :initarg :value :reader value)))
+       "((defclass cell () ((value :initarg :value :reader value :type fixnum)
+                            (scale :initform 0d0 :type double-float)
+                            (next :initform nil :type (or null cell))))
           (defgeneric next-value (object))
           (defmethod next-value ((object cell)) (+ 1 (value object)))
           (defun helper (object) (next-value object))

@@ -49,6 +49,7 @@
                (:file "tests/host")
                (:file "tests/methods")
                (:file "tests/records")
+               (:file "tests/typed-storage")
                (:file "tests/source")
                (:file "tests/artifacts")
                (:file "tests/rejections")

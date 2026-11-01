@@ -17,7 +17,9 @@
               (dolist (name (cddr spec))
                 (let* ((old (cdr (assoc name (env-variables environment))))
                        (new (if old (copy-fact old) (make-fact))))
-                  (setf (fact-type new) (second spec))
+                  ;; A method specializer is an upper bound, not a reason to
+                  ;; forget a more precise configured receiver or role type.
+                  (setf (fact-type new) (refined-fact-type new (second spec)))
                   (push (cons name new) (env-variables environment))))))))
       (dolist (form forms)
         (multiple-value-bind (new value) (specialize-form configuration form environment)

@@ -41,6 +41,7 @@
    :entries (loop for (name domains) in (getf (build-declaration build) :external-domains)
                   collect (list name (mapcar (lambda (type) (rewrite-type build type :closed)) domains)))
    :slots (build-slot-plans build)
+   :accessor-functions (build-accessor-functions build)
    :slow-paths (mapcar (lambda (name) (closed-name build name))
                        '(%record-invalid-slot %record-unbound))
    :construction-functions (when (build-layouts build)

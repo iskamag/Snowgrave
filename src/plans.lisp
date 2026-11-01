@@ -3,7 +3,7 @@
 ;;; Internal compiler contracts. Only DISPATCH-CUT contains live MOP objects;
 ;;; retained unit plans contain source, names, types, and ordinary layout data.
 (defstruct unit-plan
-  package generics special-variables entries slots slow-paths construction-functions layouts)
+  package generics special-variables entries slots accessor-functions slow-paths construction-functions layouts)
 (defstruct generic-plan
   name source required optional variable-tail arguments optional-count overflow axes clauses)
 (defstruct generic-clause indices body)

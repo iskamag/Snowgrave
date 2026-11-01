@@ -145,7 +145,7 @@
     (the
      (multiple-value-bind (new fact) (specialize-form configuration (third form) environment)
        (let ((result (copy-fact fact)))
-         (setf (fact-type result) (second form))
+         (setf (fact-type result) (refined-fact-type result (second form)))
          (values `(the ,(second form) ,new) result))))
     ;; Only generated captures reach this traversal; authored load-time code is refused earlier.
     (load-time-value (values form (make-fact)))

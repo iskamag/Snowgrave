@@ -14,6 +14,12 @@
 
 (defstruct local-scope (definitions nil) (cache (make-hash-table :test #'equal)))
 
+(defun refined-fact-type (fact type)
+  (let ((previous (fact-type fact)))
+    (cond ((subtypep previous type) previous)
+          ((subtypep type previous) type)
+          (t `(and ,previous ,type)))))
+
 (defun configuration-plan (configuration)
   (closed-unit-plan (configuration-unit configuration)))
 

@@ -3,7 +3,8 @@
 ;;; The MOP supplies effective slots and precedence. Runtime instances are
 ;;; ordinary structures; the compiler descriptions below never enter them.
 
-(defstruct slot-description name field index type initargs initform initform-p)
+(defstruct slot-description
+  name field index type storage-type storage-initform initargs initform initform-p)
 (defstruct class-description
   name type allocator constructor predicate bound-accessor slots cpl defaults)
 
@@ -144,9 +145,46 @@
        :slots (loop for slot in (closer-mop:class-slots class) for index from 0
                     collect (prepare-slot-description build name precedence slot index))))))
 
+(defun record-float-format (type)
+  ;; Retain the declared spelling when this host aliases float formats that
+  ;; the receiving compiler distinguishes (notably Mezzano's SHORT-FLOAT).
+  (cond ((member type '(short-float single-float double-float long-float)) type)
+        ((consp type) (some #'record-float-format type))))
+
+(defun record-storage-initializer (type)
+  "Return an inert unbound initializer and its portable storage type."
+  (let ((format (or (record-float-format type) 'single-float)))
+    (cond ((or (typep nil type) (subtypep type nil)) (values nil 'null))
+          ((subtypep type `(complex ,format))
+           (values `(complex (coerce 0 ',format) (coerce 0 ',format))
+                   `(complex ,format)))
+          ((subtypep type 'float)
+           (values `(coerce 0 ',format) format))
+          ((subtypep type 'number) (values 0 '(eql 0)))
+          (t (values nil 'null)))))
+
+(defun prepare-record-storage (build slot)
+  ;; The logical declaration constrains bound values. Physical storage also
+  ;; holds an inert value while unbound: numeric zero preserves raw storage,
+  ;; whereas a reference slot can use NIL without constructing a dummy object.
+  ;; Never evaluate an authored initform to obtain that private placeholder.
+  (let* ((type (slot-description-type slot))
+         (open-type (rewrite-type build type :open))
+         (closed-type (rewrite-type build type :closed)))
+    (multiple-value-bind (initform placeholder-type) (record-storage-initializer open-type)
+      (setf (slot-description-storage-initform slot) initform
+            (slot-description-storage-type slot)
+            (if (subtypep placeholder-type open-type) closed-type
+                `(or ,closed-type ,placeholder-type))))))
+
 (defun prepare-records (build)
   (setf (build-layouts build)
-        (mapcar (lambda (name) (prepare-class-description build name)) (build-classes build))))
+        (mapcar (lambda (name) (prepare-class-description build name)) (build-classes build)))
+  ;; All class descriptions must exist before translating logical class types
+  ;; into unions of the corresponding physical records.
+  (dolist (description (build-layouts build))
+    (dolist (slot (class-description-slots description))
+      (prepare-record-storage build slot))))
 
 (defun closed-exact-class-test (build source-class object-form)
   (let ((description (find-record-class build source-class)))
@@ -201,12 +239,22 @@
     `(let* ((,object ,object-form) (,value ,value-form))
        (setf (,(record-slot-function build :read slot) ,object) ,value))))
 
+(defun record-bound-read-form (build slot access)
+  (let ((type (slot-description-type slot)))
+    (cond ((trivial-slot-type-p type) access)
+          ;; Empty logical types can never be bound through a checked store.
+          ;; Avoid THE NIL, which some compilers reject even on a dead branch.
+          ((subtypep (rewrite-type build type :open) nil)
+           `(error 'type-error :datum ,access :expected-type ',type))
+          (t `(the ,(rewrite-type build type :closed) ,access)))))
+
 (defun record-slot-body (build description slot operation object value)
   (let* ((index (slot-description-index slot))
          (bound `(,(class-description-bound-accessor description) ,object))
          (access `(,(slot-description-field slot) ,object)))
     (ecase operation
-      (:read `(if (logbitp ,index ,bound) ,access
+      (:read `(if (logbitp ,index ,bound)
+                  ,(record-bound-read-form build slot access)
                   (,(closed-name build '%record-unbound)
                    ,object ',(slot-description-name slot))))
       (:write
@@ -218,7 +266,8 @@
             (setf ,access ,value ,bound (logior ,bound ,(ash 1 index)))
             ,value)))
       (:boundp `(logbitp ,index ,bound))
-      (:unbind `(progn (setf ,access nil ,bound (logandc2 ,bound ,(ash 1 index))) ,object)))))
+      (:unbind `(progn (setf ,access ,(slot-description-storage-initform slot)
+                            ,bound (logandc2 ,bound ,(ash 1 index))) ,object)))))
 
 (defun emit-record-slot-errors (build)
   ;; One slow path retains the complete condition/restart behavior. Repeating
@@ -351,8 +400,11 @@
                    (:constructor ,(class-description-allocator description) ())
                    (:predicate ,(class-description-predicate description))
                    (:copier nil) (:conc-name nil))
-        (,(class-description-bound-accessor description) 0 :type integer)
-        ,@(mapcar (lambda (slot) `(,(slot-description-field slot) nil))
+        (,(class-description-bound-accessor description) 0
+         :type (unsigned-byte ,(max 1 (length (class-description-slots description)))))
+        ,@(mapcar (lambda (slot)
+                    `(,(slot-description-field slot) ,(slot-description-storage-initform slot)
+                      :type ,(slot-description-storage-type slot)))
                   (class-description-slots description)))))
   (emit-form build
              `(defun ,(closed-name build '%find-initarg) (arguments keys)

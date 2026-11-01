@@ -6,6 +6,14 @@
   (when (some (lambda (fact) (let ((callable (fact-callable fact)))
                                (and callable (not (function-name-p callable))))) facts)
     (unsupported :configuration-indirect-call "A lexical closure needs explicit capture conversion before crossing an owned helper."))
+  (when (member name (unit-plan-accessor-functions (configuration-plan configuration)))
+    ;; Expose the selected field operation to its caller so the host can keep
+    ;; numeric values unboxed across reads, arithmetic and stores. Only stock
+    ;; accessor leaves expand; ordinary helpers keep their shared call graph.
+    (let ((definition (gethash name (configuration-functions configuration))))
+      (return-from specialize-owned-call
+        (specialize-lambda-call configuration (cddr definition) arguments facts
+                                (make-lexical-facts) name))))
   (let* ((key (list name (mapcar (lambda (fact) (fact-key configuration fact)) facts)))
          (table (configuration-specializations configuration))
          (existing (gethash key table)))

@@ -133,6 +133,20 @@
       (mapc #'visit (list* lambda-list declarations executable)))
     uses))
 
+(defun method-argument-types (build method)
+  (loop for specializer in (closer-mop:method-specializers method)
+        for source = (or (source-class-for-metaobject build specializer)
+                         (cl:class-name specializer))
+        collect (rewrite-type build source :closed)))
+
+(defun method-argument-declarations (abi types)
+  ;; Only fresh ABI parameters carry the entry specializers. A method's own
+  ;; parameter bindings remain separate and can still be assigned by its body.
+  (let ((specs (loop for argument in (method-call-abi-arguments abi)
+                     for type in types unless (eq type t)
+                     collect `(type ,type ,argument))))
+    (when specs (list (cons 'declare specs)))))
+
 (defun emitted-method-function (build generic method next-methods abi)
   (let* ((key (list method next-methods))
          (existing (gethash key *method-source-cache*)))
@@ -144,14 +158,20 @@
                    (emit-effective-source build generic
                                           `(call-method ,(first next-methods) ,(rest next-methods))
                                           abi)))
-           (source (owned-method-source build generic method)))
+           (source (owned-method-source build generic method))
+           (types (method-argument-types build method))
+           (declarations (method-argument-declarations abi types)))
       (setf (gethash key *method-source-cache*) name)
       (cond
         ((typep method 'closer-mop:standard-accessor-method)
+         ;; Stock accessors are terminal field operations, not shared authored
+         ;; call graphs. Retain their provenance for configured expansion.
+         (push name (build-accessor-functions build))
          (let* ((slot (closer-mop:slot-definition-name (closer-mop:accessor-method-slot-definition method)))
                 (readerp (typep method 'closer-mop:standard-reader-method)))
            (emit-form build
                       `(defun ,name ,(call-abi-parameters abi)
+                         ,@declarations
                          ,(if readerp (record-reader-form build (call-abi-argument abi 0) slot)
                               (record-writer-form build (call-abi-argument abi 1) slot
                                                   (call-abi-argument abi 0)))))))
@@ -165,6 +185,7 @@
                     (uses (method-continuation-uses lambda-list declarations executable))
                     (method-wrapper
                      `(lambda ,(call-abi-parameters abi)
+                        ,@(method-argument-declarations abi types)
                         (flet (,@(when (member :next uses)
                                    (list `(,next-name ()
                                             ,(or next (no-next-method-form generic (call-abi-list abi))))))
@@ -182,7 +203,7 @@
                                    (if (and (eq context :eval) (consp node)
                                             (member (first node) '(call-next-method next-method-p)))
                                        (cons (if (eq (first node) 'call-next-method) next-name nextp-name) (rest node))
-                                       node))))))))
+                                       node))) types)))))
                (emit-form build `(defun ,name ,@(rest (rewrite-form build method-wrapper :closed))))))))
         (t (unsupported :method-source "No owned body for a method of ~S." generic)))
       name)))
