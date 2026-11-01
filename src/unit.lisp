@@ -3,7 +3,8 @@
 (defstruct (closed-unit (:constructor %make-unit (metadata source bindings plan)))
   metadata source bindings plan
   (seals (make-hash-table :test #'eq))
-  (sealed-writers (make-hash-table :test #'equal)))
+  (sealed-writers (make-hash-table :test #'equal))
+  (configured-bindings nil))
 
 (defvar *unit-sequence* 0)
 

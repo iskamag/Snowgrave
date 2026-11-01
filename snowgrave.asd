@@ -55,6 +55,7 @@
                (:file "tests/rejections")
                (:file "tests/overhead")
                (:file "tests/configuration")
+               (:file "tests/publication")
                (:file "tests/portability")
                (:file "tests/lifecycle")
                (:file "tests/run"))

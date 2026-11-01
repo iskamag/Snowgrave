@@ -6,7 +6,10 @@
 ;;; roles and lexical facts. An unresolved selector is rejected before compilation.
 
 (defstruct configuration
-  unit roles fields entry functions specializations emitted
+  unit roles fields entry write-fields emitted
+  (functions (make-hash-table :test #'equal))
+  (specializations (make-hash-table :test #'equal))
+  (mutations (make-hash-table :test #'eq))
   (captures (make-array 0 :adjustable t :fill-pointer 0))
   (identities (make-hash-table :test #'eq)))
 (defvar *configuration-sequence* 0)
@@ -71,9 +74,7 @@
   (let ((configuration (make-configuration
                         :unit unit
                         :roles (make-hash-table :test #'eq)
-                        :fields (make-hash-table :test #'eq)
-                        :functions (make-hash-table :test #'equal)
-                        :specializations (make-hash-table :test #'equal)))
+                        :fields (make-hash-table :test #'eq)))
         (seen (make-hash-table :test #'eq)))
     (labels ((visit (object)
                (let ((layout (configuration-layout unit object)))
@@ -94,14 +95,28 @@
           unless (typep argument domain)
             do (unsupported :configuration-arguments "Argument for ~S does not satisfy ~S." entry domain))))
 
-(defun configuration-role-guard (configuration rows object &optional value writep)
+(defun configuration-role-guard (configuration rows object
+                                 &key (operation :read) value (require-owner t))
   `(cond ,@(loop for (owner . allowed) in rows
                  collect `((eq ,object ,(configured-value configuration owner))
-                           ,(if writep
-                                `(unless (member ,value ,(configured-value configuration allowed) :test #'eq)
-                                   (error "Cannot reconfigure a bound component role."))
-                                nil)))
-         (t (error "Object is outside the bound component graph."))))
+                           ,(case operation
+                              (:write
+                               `(unless (member ,value ,(configured-value configuration allowed) :test #'eq)
+                                  (error "Cannot reconfigure a bound component role.")))
+                              (:unbind `(error "Cannot unbind a sealed component role.")))))
+         ,@(when require-owner '((t (error "Object is outside the bound component graph."))))))
+
+(defun index-configuration-write-seals (unit registry)
+  "Index a cold seal snapshot by physical field, without changing read facts."
+  (let ((fields (make-hash-table :test #'eq)))
+    (maphash
+     (lambda (owner slots)
+       (let ((layout (configuration-layout unit owner)))
+         (dolist (slot slots)
+           (push (cons owner (cdr slot))
+                 (gethash (slot-description-field (configuration-slot layout (car slot))) fields)))))
+     registry)
+    fields))
 
 (defun configured-slot-body (configuration plan row)
   (let* ((field (slot-case-field row)) (body (slot-case-body row))
@@ -109,14 +124,21 @@
          (roles (gethash field (configuration-fields configuration)))
          (values (remove-duplicates (loop for row in roles append (copy-list (cdr row)))))
          (types (remove-duplicates (mapcar #'type-of values))))
-    (if (null roles) body
+    (if (null roles)
+        (let ((seals (gethash field (configuration-write-fields configuration))))
+          (if (and seals (member (slot-plan-operation plan) '(:write :unbind)))
+              `(progn ,(configuration-role-guard configuration seals object
+                         :operation (slot-plan-operation plan) :value value :require-owner nil)
+                      ,body)
+              body))
         (ecase (slot-plan-operation plan)
           (:read `(progn ,(configuration-role-guard configuration roles object)
                          ,(if (= (length values) 1) (configured-value configuration (first values))
                               `(the (or ,@types) (,field ,object)))))
           (:boundp `(progn ,(configuration-role-guard configuration roles object) t))
           (:unbind `(error "Cannot unbind a sealed component role."))
-          (:write `(progn ,(configuration-role-guard configuration roles object value t) ,body))))))
+          (:write `(progn ,(configuration-role-guard configuration roles object
+                            :operation :write :value value) ,body))))))
 
 (defun check-configuration-seals (configuration)
   (let ((previous (closed-unit-seals (configuration-unit configuration))))
@@ -129,13 +151,19 @@
      (configuration-roles configuration))))
 
 (defun merged-configuration-seals (configuration)
-  (let ((registry (make-hash-table :test #'eq)))
+  (let ((registry (make-hash-table :test #'eq)) (changed (make-hash-table :test #'eq))
+        (unit (configuration-unit configuration)))
     (maphash (lambda (object slots) (setf (gethash object registry) (copy-list slots)))
              (closed-unit-seals (configuration-unit configuration)))
     (maphash (lambda (object slots)
-               (dolist (slot slots) (pushnew slot (gethash object registry) :key #'car)))
+               (dolist (slot slots)
+                 (unless (assoc (car slot) (gethash object registry))
+                   (push slot (gethash object registry))
+                   (setf (gethash (slot-description-field
+                                  (configuration-slot (configuration-layout unit object) (car slot)))
+                                 changed) t))))
              (configuration-roles configuration))
-    registry))
+    (values registry changed)))
 
 (defun compile-sealed-writer (configuration plan registry)
   (let* ((unit (configuration-unit configuration))
@@ -149,27 +177,7 @@
       (let* ((original (or (gethash name (closed-unit-sealed-writers unit)) (fdefinition name)))
              (source
                `(lambda ,(slot-plan-arguments plan)
-                  (cond ,@(loop for (owner . allowed) in rows
-                                collect
-                                `((eq ,object ,(configured-value configuration owner))
-                                  ,(if (eq (slot-plan-operation plan) :unbind)
-                                       `(error "Cannot unbind a sealed component role.")
-                                       `(unless (member ,value ,(configured-value configuration allowed) :test #'eq)
-                                          (error "Cannot reconfigure a bound component role."))))))
+                  ,(configuration-role-guard configuration rows object
+                     :operation (slot-plan-operation plan) :value value :require-owner nil)
                   (funcall ,(configured-value configuration original) ,@(slot-plan-arguments plan)))))
         (list name original (compile-function nil source :configuration-seal))))))
-
-(defun publish-configuration-seals (configuration)
-  (let* ((unit (configuration-unit configuration))
-         (registry (merged-configuration-seals configuration))
-         (wrappers
-           (loop for plan in (unit-plan-slots (closed-unit-plan unit))
-                 when (member (slot-plan-operation plan) '(:write :unbind))
-                   append (let ((wrapper (compile-sealed-writer configuration plan registry)))
-                            (when wrapper (list wrapper))))))
-    ;; Complete compilation before publishing any changed function or seal.
-    (dolist (wrapper wrappers)
-      (destructuring-bind (name original function) wrapper
-        (setf (gethash name (closed-unit-sealed-writers unit)) original
-              (fdefinition name) function)))
-    (setf (closed-unit-seals unit) registry)))

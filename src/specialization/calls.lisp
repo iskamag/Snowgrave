@@ -98,6 +98,10 @@
     (unless (or row unique)
       (unsupported :configuration-dispatch "Unresolved physical slot ~S on ~S." (slot-plan-slot plan) type))
     (setf row (or row (first cases)))
+    ;; Raw operations still depend on future publications of this field.
+    ;; This includes mutations inside any materialized effective-method body.
+    (when (member (slot-plan-operation plan) '(:write :unbind))
+      (setf (gethash (slot-case-field row) (configuration-mutations configuration)) t))
     (let* ((body (configured-slot-body configuration plan row))
            (roles (gethash (slot-case-field row) (configuration-fields configuration)))
            (values (remove-duplicates (loop for row in roles append (copy-list (cdr row)))))

@@ -12,6 +12,7 @@
     (slot-helper-tests)
     (literal-scale-tests)
     (configuration-tests)
+    (configuration-publication-tests)
     (configuration-contour-tests)
     (configuration-shared-helper-tests)
     (configured-accessor-tests)
