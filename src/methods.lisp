@@ -96,16 +96,14 @@
   (unless (member (class-of gf) (list (find-class 'standard-generic-function)
                                     (find-class 'closer-mop:standard-generic-function)))
     (unsupported :generic-metaclass "~S is not a standard generic function." generic))
-  ;; Method-combination metaobjects need not be EQ across MOP queries (ECL
-  ;; returns fresh objects). The disposable cohort is defined from this owned
-  ;; declaration, so validate its combination contract directly.
-  (let* ((definition (find-source-definition build 'defgeneric generic))
-         (option (assoc :method-combination (cdddr definition))))
-    (when (and option (not (equal (rest option) '(standard))))
-      (unsupported :method-combination "~S needs an unsupported custom method combination." generic)))
+  ;; Validate owned declarations rather than host-specific combination identity.
+  (source-method-combination build generic)
   (validate-stock-miss-protocol gf nil)
   (dolist (method (closer-mop:generic-function-methods gf))
-    (unless (member (cl:method-qualifiers method) '(nil (:before) (:after) (:around)) :test #'equal)
+    (unless (let ((combination (source-method-combination build generic)))
+              (member (cl:method-qualifiers method)
+                      (if (eq (first combination) 'standard) '(nil (:before) (:after) (:around))
+                          (list (list (second combination)) '(:around))) :test #'equal))
       (unsupported :method-qualifiers "Unsupported qualifiers in ~S." generic))
     (dolist (specializer (closer-mop:method-specializers method))
       (when (typep specializer 'closer-mop:eql-specializer)
@@ -219,6 +217,10 @@
                     (when (typep (second form) 'closer-mop:metaobject)
                       (unsupported :effective-metaobject "A method combination quotes a builder object."))
                     form)
+                   ((eq (first form) 'macrolet)
+                    ;; NORMALIZE-EFFECTIVE-SOURCE expanded these lexical macros
+                    ;; while method leaves still had their authored syntax.
+                    (cons 'locally (mapcar #'walk (cddr form))))
                    ((eq (first form) 'call-method)
                     (let ((method (second form)) (next (third form)))
                       (if (and (consp method) (eq (first method) 'make-method))
@@ -228,4 +230,4 @@
                    (t (mapcar #'walk form)))))
     ;; Composition code and method bodies use the same closed binding rules.
     ;; Generated leaf calls already name ordinary output functions.
-    (rewrite-form build (walk effective) :closed)))
+    (rewrite-form build (walk (normalize-effective-source effective)) :closed)))

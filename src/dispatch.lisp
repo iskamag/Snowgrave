@@ -132,7 +132,7 @@
   ;; unnecessarily, especially when most cells have no applicable method.
   (loop for (applicable . indices) in (generic-method-groups build generic gf axes)
         collect
-        (multiple-value-bind (effective options) (effective-method-source gf applicable)
+        (multiple-value-bind (effective options) (effective-method-source build generic gf applicable)
           (when options
             (unsupported :effective-options
                          "~S returned unsupported effective-method options." generic))

@@ -75,6 +75,8 @@
   (when (consp form)
     (let ((operator (first form)))
       (cond
+        ((eq operator 'define-method-combination)
+         (scan-usage-form build usage `(function ,(getf (cddr form) :operator (second form)))))
         ((eq operator 'quote)
          ;; A quoted designator can still reach the general path.
          (when (member (second form) '(equalp make-instance)) (usage-mark-flag usage (second form)))

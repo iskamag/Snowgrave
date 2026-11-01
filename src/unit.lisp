@@ -91,7 +91,7 @@
          (literals (literal-definition build :open)))
     (emit-open-record-helpers build)
     (when literals (compile-definition literals))
-    (dolist (form forms) (compile-definition form))))
+    (dolist (form forms) (when form (compile-definition form)))))
 
 (defun generate-closed-source (build)
   (prepare-records build)

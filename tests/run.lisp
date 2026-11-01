@@ -3,6 +3,7 @@
 (defun run-tests ()
   (let ((*checks* 0))
     (method-linkage-tests)
+    (method-combination-tests)
     (record-tests)
     (dynamic-record-tests)
     (typed-storage-tests)

@@ -48,6 +48,7 @@
   :components ((:file "tests/framework")
                (:file "tests/host")
                (:file "tests/methods")
+               (:file "tests/combinations")
                (:file "tests/records")
                (:file "tests/typed-storage")
                (:file "tests/source")
